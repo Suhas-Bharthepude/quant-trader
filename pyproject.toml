@@ -1,0 +1,37 @@
+[project]
+name = "quant-trader"
+version = "0.1.0"
+description = "Systematic swing trading bot for US equities"
+requires-python = ">=3.11"
+dependencies = [
+    "alpaca-py",
+    "python-dotenv",
+    "pandas",
+    "numpy",
+    "duckdb",
+    "yfinance",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+    "jupyter",
+    "ipykernel",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+[tool.hatch.build.targets.wheel]
+packages = ["src"]

@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+ENV/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+MANIFEST
+
+# Environment variables
+.env
+.env.local
+.env.live
+.env.paper
+
+# Data artifacts
+*.db
+*.duckdb
+*.parquet
+*.csv
+*.feather
+*.arrow
+data/
+
+# ML artifacts
+*.pkl
+*.pickle
+*.joblib
+mlruns/
+models/
+checkpoints/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V8
+.Trashes
+Thumbs.db
+ehthumbs.db
+
+# IDE
+.idea/
+.vscode/
+!.vscode/settings.json
+*.swp
+*.swo
