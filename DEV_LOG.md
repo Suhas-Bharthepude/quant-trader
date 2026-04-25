@@ -10,5 +10,3 @@ Running log of development work. Most recent entry first.
 **Next up:** First commit. Begin Phase 1 — data ingestion layer (Alpaca bar fetch, DuckDB schema, yfinance backfill).
 **Time spent:** — 30 minutes
 
-
-
