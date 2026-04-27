@@ -33,5 +33,9 @@ select = ["E", "F", "I"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "integration: hits the live Alpaca paper API — requires a valid .env file",
+]
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
