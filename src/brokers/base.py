@@ -30,7 +30,6 @@ from enum import Enum
 # absent (e.g. limit_price on a market order, filled_qty before a fill).
 from typing import Optional
 
-
 # ---------------------------------------------------------------------------
 # Enums — constrained vocabularies for order fields
 # ---------------------------------------------------------------------------
@@ -50,7 +49,7 @@ class OrderType(str, Enum):
 class TimeInForce(str, Enum):
     """How long the order stays alive if not immediately filled."""
     DAY = "day"  # cancelled at market close if unfilled
-    GTC = "gtc"  # Good Till Cancelled — stays open across sessions until filled or cancelled manually
+    GTC = "gtc"  # Good Till Cancelled — stays open across sessions until filled or cancelled
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +92,7 @@ class OrderResult:
 
     # The fields below are None until the order is (at least partially) filled.
     filled_qty: Optional[int] = field(default=None)              # shares actually executed so far
-    filled_avg_price: Optional[float] = field(default=None)      # volume-weighted average fill price
+    filled_avg_price: Optional[float] = field(default=None)      # volume-weighted avg fill price
     limit_price: Optional[float] = field(default=None)           # echoed back for limit orders
 
 
@@ -226,6 +225,23 @@ class Broker(ABC):
         bool
             True if orders can be routed immediately; False during pre/post
             market or weekends/holidays.
+        """
+        ...
+
+    @abstractmethod
+    def get_latest_price(self, symbol: str) -> float:
+        """
+        Fetch the most recent traded price for a symbol.
+
+        Parameters
+        ----------
+        symbol : str
+            Ticker to look up, e.g. "SPY" or "AAPL".
+
+        Returns
+        -------
+        float
+            Most recent transaction price from the last recorded trade.
         """
         ...
 

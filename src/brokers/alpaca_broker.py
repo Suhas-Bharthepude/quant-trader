@@ -17,53 +17,49 @@ import os
 # standard Python datetime objects for OrderResult.submitted_at.
 from datetime import datetime
 
+# ---------------------------------------------------------------------------
+# Alpaca SDK imports — everything from alpaca stays inside this file.
+# ---------------------------------------------------------------------------
+# StockHistoricalDataClient drives the market data methods (get_latest_price, etc.).
+from alpaca.data.historical import StockHistoricalDataClient
+
+# StockLatestTradeRequest wraps the symbol argument for get_stock_latest_trade().
+from alpaca.data.requests import StockLatestTradeRequest
+
+# TradingClient handles all order management and account operations.
+from alpaca.trading.client import TradingClient
+
+# Alpaca's own enums.  We import them under aliased names (AlpacaOrderSide, etc.)
+# to avoid shadowing the identically-named enums from our own base module.
+from alpaca.trading.enums import OrderSide as AlpacaOrderSide  # "buy" / "sell"
+from alpaca.trading.enums import QueryOrderStatus  # ALL / OPEN / CLOSED — used in GetOrdersRequest
+from alpaca.trading.enums import TimeInForce as AlpacaTimeInForce  # "day" / "gtc"
+
+# GetOrdersRequest   — filter object for list_recent_orders().
+# LimitOrderRequest  — execute only at the specified price or better.
+# MarketOrderRequest — execute immediately at best available price.
+from alpaca.trading.requests import (
+    GetOrdersRequest,
+    LimitOrderRequest,
+    MarketOrderRequest,
+)
+
 # load_dotenv() reads a .env file from the working directory into os.environ,
 # so we don't have to export keys manually in every terminal session.
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
-# Alpaca SDK imports — everything from alpaca stays inside this file.
-# ---------------------------------------------------------------------------
-
-# TradingClient handles all order management and account operations.
-from alpaca.trading.client import TradingClient
-
-# These two request objects map to the two order types we support.
-# MarketOrderRequest — execute immediately at best available price.
-# LimitOrderRequest  — execute only at the specified price or better.
-# GetOrdersRequest   — filter object for list_recent_orders().
-from alpaca.trading.requests import (
-    MarketOrderRequest,
-    LimitOrderRequest,
-    GetOrdersRequest,
-)
-
-# Alpaca's own enums.  We import them under aliased names (AlpacaOrderSide, etc.)
-# to avoid shadowing the identically-named enums from our own base module.
-from alpaca.trading.enums import (
-    OrderSide as AlpacaOrderSide,        # "buy" / "sell"
-    TimeInForce as AlpacaTimeInForce,    # "day" / "gtc"
-    QueryOrderStatus,                    # ALL / OPEN / CLOSED — used in GetOrdersRequest
-)
-
-# StockHistoricalDataClient is kept as an instance attribute for future use
-# (e.g. fetching latest prices for risk checks).  Not used in this file yet.
-from alpaca.data.historical import StockHistoricalDataClient
-
-# ---------------------------------------------------------------------------
 # Our own interface — the only import from base.py allowed in this file.
 # ---------------------------------------------------------------------------
-
 # Broker is the abstract class we are implementing.
 # All the dataclasses and enums below are from the interface layer.
 from src.brokers.base import (
+    AccountSnapshot,
     Broker,
     OrderRequest,
     OrderResult,
-    AccountSnapshot,
-    OrderSide,    # our enum — values "buy" / "sell"
-    OrderType,    # our enum — values "market" / "limit"
-    TimeInForce,  # our enum — values "day" / "gtc"
+    OrderSide,  # our enum — values "buy" / "sell"
+    OrderType,  # our enum — values "market" / "limit"
 )
 
 
@@ -360,3 +356,21 @@ class AlpacaBroker(Broker):
 
         # clock.is_open is already a bool from alpaca-py's model.
         return bool(clock.is_open)
+
+    def get_latest_price(self, symbol: str) -> float:
+        """
+        Fetch the most recent traded price for the given symbol.
+
+        Uses the data client (self._data) rather than the trading client,
+        because latest trade data lives on a separate Alpaca endpoint.
+        """
+        # StockLatestTradeRequest wraps the symbol in the structure the SDK expects.
+        # symbol_or_symbols accepts a single string or a list — we always pass one.
+        request = StockLatestTradeRequest(symbol_or_symbols=symbol)
+
+        # API call: GET /v2/stocks/{symbol}/trades/latest via the data client.
+        # Returns a dict keyed by symbol; we extract the entry for our symbol.
+        latest_trade = self._data.get_stock_latest_trade(request)
+
+        # .price is a Decimal-like string in alpaca-py; float() gives a usable number.
+        return float(latest_trade[symbol].price)
