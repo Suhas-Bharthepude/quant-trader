@@ -34,7 +34,7 @@ MANIFEST
 *.csv
 *.feather
 *.arrow
-data/
+/data/
 
 # ML artifacts
 *.pkl
