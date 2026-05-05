@@ -10,6 +10,9 @@ dependencies = [
     "numpy",
     "duckdb",
     "yfinance",
+    "pyyaml>=6.0.3",
+    "tqdm>=4.67.3",
+    "lxml>=6.1.0",
 ]
 
 [dependency-groups]

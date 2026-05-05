@@ -12,7 +12,19 @@ It does NOT write to DuckDB, cache to disk, or do anything stateful.
 Caching and persistence are the responsibility of the layer above this one.
 Any code that needs historical bars should call the store layer, which calls
 this fetcher only on a cache miss.
+
+Public methods
+--------------
+fetch_daily(symbol, start, end) -> list[OHLCVBar]
+    Fetch bars for a single symbol.  Raises ValueError on empty response.
+
+fetch_daily_batch(symbols, start, end, on_error) -> dict[str, list[OHLCVBar]]
+    Fetch bars for many symbols.  Calls fetch_daily() per symbol so each
+    failure is isolated.  Failed symbols are skipped (default) or re-raised.
 """
+
+# logging gives us per-symbol warnings without crashing the whole batch run.
+import logging
 
 # timezone.utc is the sentinel we attach to naive timestamps and the target
 # we convert timezone-aware timestamps into.  Every datetime in this project
@@ -26,6 +38,10 @@ import yfinance
 # OHLCVBar is the project-wide schema contract.  This fetcher's only job is
 # to convert yfinance rows into OHLCVBar instances — nothing else.
 from src.data.schema import OHLCVBar
+
+# Module-level logger — warnings from fetch_daily_batch are scoped here so
+# callers can filter them by logger name ("src.data.yfinance_fetcher").
+log = logging.getLogger(__name__)
 
 
 class YFinanceFetcher:
@@ -102,6 +118,46 @@ class YFinanceFetcher:
         # regardless of what yfinance returns (usually already sorted, but
         # defensive sorting is cheap and makes the contract explicit).
         return sorted(bars, key=lambda b: b.timestamp)
+
+    def fetch_daily_batch(
+        self,
+        symbols: list[str],
+        start: str,
+        end: str,
+        on_error: str = "skip",
+    ) -> dict[str, list[OHLCVBar]]:
+        """Fetch daily bars for many symbols. Returns {symbol: list[OHLCVBar]}.
+
+        Symbols that fail to fetch are handled per on_error:
+          - "skip": log a warning and exclude from the returned dict (default)
+          - "raise": re-raise the underlying exception
+
+        This method calls fetch_daily() per symbol — yfinance's bulk API is
+        inconsistent, so per-symbol with isolated error handling is more robust.
+        """
+        # Accumulate successful results here; failed symbols are omitted (skip)
+        # or cause an early exit (raise).
+        result: dict[str, list[OHLCVBar]] = {}
+
+        # Process one symbol at a time so a single bad ticker cannot abort
+        # the entire batch when on_error="skip".
+        for symbol in symbols:
+            try:
+                # Delegate to fetch_daily — all conversion and validation live there.
+                bars: list[OHLCVBar] = self.fetch_daily(symbol, start, end)
+                # Only store the symbol if fetch_daily succeeded without raising.
+                result[symbol] = bars
+            except Exception as exc:  # noqa: BLE001 — intentional broad catch per symbol
+                if on_error == "skip":
+                    # Log and move on — the symbol is simply absent from the result dict.
+                    log.warning("Skipping %s: %s", symbol, exc)
+                    continue
+                if on_error == "raise":
+                    # Caller wants hard failure — re-raise with full traceback intact.
+                    raise
+
+        # Return whatever succeeded; empty dict is valid if every symbol failed.
+        return result
 
     # ------------------------------------------------------------------
     # Private helpers
