@@ -14,6 +14,10 @@ Run everything with:
     uv run pytest tests/test_data_layer.py -v
 """
 
+# datetime + timezone + date — needed to construct synthetic UTC-aware
+# timestamps for unit tests that do not hit the network.
+from datetime import date, datetime, timezone
+
 # pytest is the test runner.  tmp_path is a built-in pytest fixture that
 # provides a temporary directory unique to each test invocation; pytest
 # cleans it up automatically when the test session ends.
@@ -161,10 +165,11 @@ def test_duckdb_store_roundtrip(tmp_path) -> None:
         )
 
         # Compare calendar dates, not exact datetimes.  DuckDB's TIMESTAMP type
-        # is timezone-naive: it strips timezone info on write, so a yfinance
-        # timestamp at 05:00+00:00 (midnight New York) round-trips as
-        # 00:00+00:00.  The calendar date — what daily bars actually identify —
-        # is preserved correctly, so .date() is the right comparison target.
+        # is timezone-naive, but our store layer normalizes to UTC on write
+        # (see _bar_to_tuple) and re-attaches UTC on read (see _tuple_to_bar),
+        # so the round-trip preserves the wall-clock UTC time.  We still
+        # compare with .date() because that is what a daily bar fundamentally
+        # identifies — the time-of-day component is a source-specific detail.
         assert result[0].timestamp.date() == bars[0].timestamp.date(), (
             f"First date mismatch: wrote {bars[0].timestamp.date()}, "
             f"read back {result[0].timestamp.date()}"
@@ -223,4 +228,78 @@ def test_duckdb_store_is_idempotent(tmp_path) -> None:
         assert len(result) == expected_count, (
             f"After two writes expected {expected_count} bars, "
             f"got {len(result)} (possible duplicates)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test 4 — DuckDBStore.last_timestamp (unit test, no network)
+# ---------------------------------------------------------------------------
+# Deliberately NOT marked @pytest.mark.integration: this test constructs its
+# OHLCVBars in-memory and writes them to a tmp_path DuckDB file, so it runs
+# fast and works in CI environments with no internet access.
+
+def test_last_timestamp_returns_max(tmp_path) -> None:
+    """last_timestamp returns the most recent timestamp for a symbol or None if absent."""
+    # Isolated temp DuckDB file — same tmp_path pattern as the round-trip tests
+    # above, so this test has no dependency on the project's real data file.
+    db_file: str = str(tmp_path / "test.duckdb")
+
+    # Build three synthetic bars for symbol "TEST" with timestamps in
+    # deliberately non-chronological insert order (Jan 2, then Jan 5, then Jan 3).
+    # If last_timestamp ever regressed to "the most recently inserted row" it
+    # would return Jan 3; the assertion below catches that by requiring Jan 5
+    # (the true MAX).
+    bars = [
+        # First bar — earliest date (Jan 2).  All non-key fields are dummy
+        # values; this test only exercises the timestamp-aggregation logic.
+        OHLCVBar(
+            symbol="TEST",
+            timestamp=datetime(2024, 1, 2, tzinfo=timezone.utc),
+            open=100.0, high=101.0, low=99.0, close=100.5, adj_close=100.5,
+            volume=1000, timeframe="1d", source="test",
+        ),
+        # Second bar — the latest date (Jan 5), inserted in the middle of the
+        # sequence so MAX-vs-LAST distinguishes between correct and broken impls.
+        OHLCVBar(
+            symbol="TEST",
+            timestamp=datetime(2024, 1, 5, tzinfo=timezone.utc),
+            open=100.0, high=101.0, low=99.0, close=100.5, adj_close=100.5,
+            volume=1000, timeframe="1d", source="test",
+        ),
+        # Third bar — Jan 3, inserted last but NOT the MAX timestamp.
+        OHLCVBar(
+            symbol="TEST",
+            timestamp=datetime(2024, 1, 3, tzinfo=timezone.utc),
+            open=100.0, high=101.0, low=99.0, close=100.5, adj_close=100.5,
+            volume=1000, timeframe="1d", source="test",
+        ),
+    ]
+
+    # Open the store as a context manager so the file lock is always released,
+    # even if an assertion fails mid-test.
+    with DuckDBStore(db_file) as store:
+        # Persist all three bars in one batched write.  The return value is
+        # not asserted here — the round-trip test already covers write counts.
+        store.write_bars(bars)
+
+        # Assertion 1: last_timestamp must return the MAX (Jan 5), not the
+        # most-recently-inserted row (Jan 3).  Comparing .date() sidesteps
+        # any timezone-fuzziness in the driver's TIMESTAMP round-trip.
+        assert store.last_timestamp("TEST").date() == date(2024, 1, 5), (
+            "last_timestamp should return MAX(timestamp), not most-recent insert"
+        )
+
+        # Assertion 2: a symbol that has no rows in the table must yield None,
+        # not an error or a sentinel datetime — callers depend on the None
+        # branch to decide between backfill and update.
+        assert store.last_timestamp("UNKNOWN_SYMBOL") is None, (
+            "last_timestamp must return None for symbols not present in the DB"
+        )
+
+        # Assertion 3: the same symbol but a different timeframe must also
+        # yield None — the WHERE clause filters on (symbol, timeframe), and a
+        # leak across timeframes would corrupt incremental updates that mix
+        # daily and intraday bars in the same table.
+        assert store.last_timestamp("TEST", timeframe="1h") is None, (
+            "last_timestamp must filter by timeframe, not symbol alone"
         )

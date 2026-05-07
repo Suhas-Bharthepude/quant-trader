@@ -29,7 +29,7 @@ released even if an exception occurs mid-ingest):
 
 # timezone.utc is used when re-attaching timezone info to timestamps that
 # DuckDB may return as naive datetimes depending on the driver version.
-from datetime import timezone
+from datetime import datetime, timezone
 
 # Path makes cross-platform directory creation one concise call.
 from pathlib import Path
@@ -196,6 +196,40 @@ class DuckDBStore:
         # Convert each raw tuple back to an OHLCVBar using the helper below.
         return [self._tuple_to_bar(row) for row in rows]
 
+    def last_timestamp(self, symbol: str, timeframe: str = "1d") -> datetime | None:
+        """Return the timestamp of the most recent stored bar for symbol, or None if no bars exist.
+
+        Used by the incremental updater to compute the start date for the next fetch.
+        """
+        # Aggregate query: MAX(timestamp) returns the single latest timestamp for
+        # this symbol+timeframe pair, or SQL NULL when no matching rows exist.
+        sql = (
+            f"SELECT MAX(timestamp) FROM {DUCKDB_TABLE_NAME} "
+            "WHERE symbol = ? AND timeframe = ?"
+        )
+
+        # Bind symbol and timeframe as parameters — never interpolate user data
+        # into SQL strings.  fetchone() always returns a one-element tuple even
+        # for scalar aggregates.
+        result = self._conn.execute(sql, [symbol, timeframe]).fetchone()
+
+        # result[0] is None when no rows matched (MAX of an empty set is SQL NULL).
+        if result[0] is None:
+            # No bars stored for this symbol+timeframe yet; caller interprets as
+            # "fetch from the beginning of history".
+            return None
+
+        # Pull the datetime value out of the single-element tuple.
+        ts = result[0]
+
+        # Re-attach UTC if the driver returns a naive datetime — same guard used
+        # in _tuple_to_bar(); our contract requires all timestamps to be UTC-aware.
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+
+        # Return the timezone-aware datetime of the most recent stored bar.
+        return ts
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -231,10 +265,25 @@ class DuckDBStore:
         Column order mirrors CREATE_TABLE_SQL:
         symbol, timestamp, open, high, low, close,
         adj_close, volume, timeframe, source.
+
+        Timezone normalization: DuckDB's TIMESTAMP column is timezone-naive,
+        and the Python driver implicitly converts a tz-aware datetime to the
+        host machine's LOCAL time before stripping the tzinfo.  That means a
+        bar at 2024-01-05 00:00 UTC written from a US/Eastern machine would
+        be stored as 2024-01-04 19:00 — silently shifting the calendar date.
+        We defend against that by converting to UTC and dropping tzinfo
+        ourselves, so the value DuckDB stores is always the UTC wall-clock
+        time regardless of the host's local timezone.
         """
+        # Normalize to UTC wall-clock time, then strip tzinfo so the driver
+        # treats the value as already-naive and skips its local-time conversion.
+        # astimezone() on an aware datetime is a pure timezone shift; replace()
+        # then drops the tzinfo without further altering the wall-clock time.
+        ts = bar.timestamp.astimezone(timezone.utc).replace(tzinfo=None)
+
         return (
             bar.symbol,
-            bar.timestamp,    # Python datetime — DuckDB accepts it directly
+            ts,               # UTC-normalized naive datetime — see docstring above
             bar.open,
             bar.high,
             bar.low,
