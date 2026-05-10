@@ -4,6 +4,21 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 13 — 2026-05-10
+
+**Worked on:** First technical indicators. Created src/features/ package with src/features/indicators.py containing three vectorized functions: sma (simple moving average via pandas.rolling), log_returns (np.log of close ratio), and rsi (Wilder's RSI with explicit two-phase implementation — simple-mean seed at index period, then the recursive smoothing). All three operate on lists of OHLCVBar and return numpy arrays aligned 1:1 with input — NaN values where lookback is insufficient, never silently dropped. Single private helper _bars_to_close_series centralizes the OHLCVBar → pandas conversion. Added 10 unit tests in tests/test_indicators.py covering known values, edge cases (all-gains → 100, all-losses → 0), input validation (empty bars, invalid window/period), and length-alignment guarantees. Smoke-tested against real SPY data from DuckDB — SMA-50, RSI-14, and log returns all compute in milliseconds for 252 bars. Smoke-tested current SPY (2025-01-01 to today): RSI-14 = 75.47 (overbought), SMA-50 = 682.55.
+
+**Why it matters:** Every strategy and every ML feature in Phase 2+ ultimately reduces to numerical arrays computed from OHLCV bars. Today's three functions are the simplest examples of the pattern — input contract (list of OHLCVBar), output contract (np.ndarray of len(bars) with NaN-padded prefix), implementation strategy (pandas internals, numpy boundary). Every future indicator follows the same shape.
+
+**Blocked on / Bugs:** One subtle issue caught and fixed during development. The first RSI implementation used pandas.ewm(alpha=1/period, adjust=False), which runs the Wilder recursion from the first observation rather than seeding with a simple mean of the first `period` deltas. The two methods converge after ~3× period bars but diverge noticeably on the very first emitted RSI values — meaning values would not match TradingView, ta-lib, Bloomberg, or StockCharts on short series. Replaced with explicit two-phase implementation: simple arithmetic mean of first `period` gain/loss values at index `period`, then Wilder recursion for all subsequent indices. Verified against canonical Wilder reference series — agreement within 0.006 of published values [70.46, 66.25, 66.48, 69.35, 66.30, 57.92]. Test suite expanded from 8 to 18 tests.
+
+**Next up:** Day 14 — first signal generation. Build src/strategies/ with a crossover strategy (e.g. SMA(50) vs SMA(200)) that takes bars, runs indicators, and emits buy/sell/hold signals as a numpy array aligned to the input bars.
+
+**Time spent:** — 1 hour
+
+---
+
+
 ## Day 12 — 2026-05-07
 
 **Worked on:** Made the data layer production-ready for daily operations. Three major additions: (1) DuckDBStore.last_timestamp(symbol, timeframe="1d") — returns the most recent bar timestamp via SELECT MAX, with the same UTC re-attach guard as _tuple_to_bar. Powers incremental updates. (2) scripts/update_universe.py — daily incremental update CLI with --universe and --lookback-days flags. Per-symbol logic: if no stored data, skip with a hint to run backfill; otherwise compute start = max(last_ts.date() - lookback_days, 2010-01-01) and fetch only the tail. Tested on test universe (5/5 already current after re-runs proving double idempotency) and sp500 (503/503 in 68 seconds, 1500 new bars — ~17x speedup vs the 20-minute backfill). (3) scripts/data_health.py — read-only diagnostic that opens DuckDB with read_only=True, reports total bars, distinct symbols, date range, file size, stale symbols (sorted by most-stale-first, capped at 20 unless --verbose), short-history symbols (<252 bars, capped at 10), and (with --universe filter) symbols missing from DB. Exit 0 if clean, exit 1 if stale or missing — cron-friendly. Verified all four code paths via smoke tests. (4) Added 1 unit test (test_last_timestamp_returns_max) — pure unit, no network, uses tmp_path.
@@ -16,7 +31,7 @@ Running log of development work. Most recent entry first.
 
 **Next up:** Day 13 — first technical indicators (SMA, RSI, returns). Build src/features/ with vectorized pandas/numpy implementations operating on lists of OHLCVBar.
 
-**Time spent:** —
+**Time spent:** — 1 hour
 
 ---
 
