@@ -4,6 +4,21 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 14 — 2026-05-10
+
+**Worked on:** First strategy. Created src/strategies/ package with two new files: src/strategies/base.py defining the Strategy abstract base class (mirrors the architectural pattern of src/brokers/base.py) and three module-level signal constants SIGNAL_LONG (+1), SIGNAL_FLAT (0), SIGNAL_SHORT (-1). Created src/strategies/sma_crossover.py with SMACrossoverStrategy(fast_window=50, slow_window=200) implementing the canonical Golden Cross / Death Cross rule. The strategy returns a numpy int8 array aligned 1:1 with input bars — SIGNAL_FLAT during warmup (positions where either SMA is NaN), SIGNAL_LONG when fast > slow, SIGNAL_SHORT when fast < slow. Smoke-tested on 5 years of SPY data (1848 bars, 2021-01-04 to 2026-05-08): 69.8% LONG, 19.5% SHORT, 10.8% FLAT, 7 regime transitions matching real market history (2022 bear market, recent April 2026 selloff). Added 11 unit tests in tests/test_strategies.py covering ABC enforcement, parameter validation, name property, length and dtype contracts, warmup behavior, uptrend/downtrend signals, qualitative crossover detection, and input validation. Test count grew from 18 to 29.
+
+**Why it matters:** this is the conceptual transition from features to decisions. Up to today the code summarized prices into numbers; now it emits opinions about them. The Strategy ABC is what every future strategy will subclass — RSI mean reversion, momentum, pairs trading, ML-based — so getting the contract right today (numpy int8 output, length alignment, warmup-as-FLAT, pure-function semantics) saves the entire Phase 2+ refactor. The signal-as-position (not signal-as-trade) design lets the same strategy work for backtest and live execution without special cases — the backtester will derive trades by diffing consecutive positions.
+
+**Blocked on / Bugs:** None. One discovery during smoke testing: the initial SPY data in DuckDB only had ~2 years of history because the Day 11 backfill skipped pre-existing 2024 data via INSERT OR IGNORE. Re-fetched explicitly with fetch_daily('SPY', '2021-01-01', '2026-05-10') to get the full 1343 bars (1848 with overlap from neighboring stocks). This is a documented limitation of the idempotent backfill approach — fresh universes get full history, but symbols pre-seeded with partial history don't get backfilled to the requested years. Acceptable trade-off; the explicit re-fetch is a clean workaround.
+
+**Next up:** Day 15 — first backtester. Build src/backtest/ that takes (bars, signals) and simulates what the strategy would have earned over the historical period. Compute realistic metrics: total return, Sharpe ratio, max drawdown, win rate. This is where strategies prove (or disprove) edge.
+
+**Time spent:** — 30 minutes
+
+---
+
+
 ## Day 13 — 2026-05-10
 
 **Worked on:** First technical indicators. Created src/features/ package with src/features/indicators.py containing three vectorized functions: sma (simple moving average via pandas.rolling), log_returns (np.log of close ratio), and rsi (Wilder's RSI with explicit two-phase implementation — simple-mean seed at index period, then the recursive smoothing). All three operate on lists of OHLCVBar and return numpy arrays aligned 1:1 with input — NaN values where lookback is insufficient, never silently dropped. Single private helper _bars_to_close_series centralizes the OHLCVBar → pandas conversion. Added 10 unit tests in tests/test_indicators.py covering known values, edge cases (all-gains → 100, all-losses → 0), input validation (empty bars, invalid window/period), and length-alignment guarantees. Smoke-tested against real SPY data from DuckDB — SMA-50, RSI-14, and log returns all compute in milliseconds for 252 bars. Smoke-tested current SPY (2025-01-01 to today): RSI-14 = 75.47 (overbought), SMA-50 = 682.55.
