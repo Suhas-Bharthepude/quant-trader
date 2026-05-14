@@ -4,6 +4,21 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 15 — 2026-05-14
+
+**Worked on:** First backtester. Built src/backtest/ package with two new files: src/backtest/result.py defining frozen dataclasses Trade (single round-trip record) and BacktestResult (equity curve, trades list, and precomputed metrics), and src/backtest/engine.py defining the Backtester class. The engine implements vectorized next-bar-execution simulation: signals[i-1] earns the return from bar i-1 to bar i, which makes lookahead bias structurally impossible. Computes equity curve via cumsum of log returns then exp, extracts trades from signal transitions (handling 0→nonzero entries, nonzero→0 exits, sign flips, and end-of-data force-close via a factored _make_trade helper), and pre-computes total return, annualized Sharpe ratio (252 trading days, ddof=1), max drawdown, win rate, and trade count. No transaction costs or position sizing — that's Phase 3 work; this measures raw strategy edge. Smoke-tested on 5 years of SPY SMA(50,200) signals from Day 14: +25.22% total return, 0.22 Sharpe, 21.13% max drawdown, 57.1% win rate, 7 trades. Underperforms SPY buy-and-hold (~+70%) as trend-followers do in choppy bull markets — this is the truth-telling layer working correctly. Added 15 unit tests including the critical test_no_lookahead_bias guard. Test count grew from 29 to 44.
+
+**Why it matters:** this is the layer that judges strategies. Before today, the codebase could only produce strategies that LOOKED sensible. The backtester is what tells you whether they would actually make money — and in this case, told you that the canonical SMA crossover on SPY alone is mediocre. That's a useful finding: it sets the realistic baseline against which future strategies (RSI mean reversion, multi-factor ensembles, ML-based) will be compared. The result dataclasses being frozen means historical backtest results can't be silently mutated. The next-bar execution model means accidentally writing a lookahead-biased strategy is now structurally hard.
+
+**Blocked on / Bugs:** One sharp edge caught and fixed during testing: numpy's std(ddof=1) is undefined for samples of size <= 1 and produces NaN, which the original `if std_return == 0.0` guard didn't catch. This surfaced as 8 RuntimeWarnings when running the 2-bar unit tests. Fixed by short-circuiting on len(active_returns) < 2 before computing std. Lesson: sample-size guards belong before the math, not after.
+
+**Next up:** Day 16 — strategy comparison and reporting. Build a small CLI that runs multiple strategies (or one strategy across multiple parameter combos) and produces a comparison table. Foundation for the parameter optimization work in Phase 2.
+
+**Time spent:** —
+
+---
+
+
 ## Day 14 — 2026-05-10
 
 **Worked on:** First strategy. Created src/strategies/ package with two new files: src/strategies/base.py defining the Strategy abstract base class (mirrors the architectural pattern of src/brokers/base.py) and three module-level signal constants SIGNAL_LONG (+1), SIGNAL_FLAT (0), SIGNAL_SHORT (-1). Created src/strategies/sma_crossover.py with SMACrossoverStrategy(fast_window=50, slow_window=200) implementing the canonical Golden Cross / Death Cross rule. The strategy returns a numpy int8 array aligned 1:1 with input bars — SIGNAL_FLAT during warmup (positions where either SMA is NaN), SIGNAL_LONG when fast > slow, SIGNAL_SHORT when fast < slow. Smoke-tested on 5 years of SPY data (1848 bars, 2021-01-04 to 2026-05-08): 69.8% LONG, 19.5% SHORT, 10.8% FLAT, 7 regime transitions matching real market history (2022 bear market, recent April 2026 selloff). Added 11 unit tests in tests/test_strategies.py covering ABC enforcement, parameter validation, name property, length and dtype contracts, warmup behavior, uptrend/downtrend signals, qualitative crossover detection, and input validation. Test count grew from 18 to 29.
