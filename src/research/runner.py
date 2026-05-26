@@ -6,6 +6,10 @@ Backtest orchestration layer.
 BacktestRunner takes a list of strategies and one symbol's bars, runs each
 strategy through the Backtester, and returns a list of BacktestResult.
 
+Two iteration axes are supported:
+  * run_many()     — one symbol, many strategies  (strategy sweep)
+  * run_universe() — one strategy, many symbols   (universe scan)
+
 compare() aggregates a list of BacktestResult into a pandas DataFrame with
 one row per backtest and columns for the key metrics, sorted by Sharpe
 descending by default.
@@ -146,6 +150,131 @@ class BacktestRunner:
         # Return the full list.  Callers typically feed this straight into
         # compare(), but the raw list is also useful for per-strategy
         # plotting or trade-level inspection.
+        return results
+
+    def run_universe(
+        self,
+        bars_by_symbol: dict[str, list[OHLCVBar]],
+        strategy: Strategy,
+        min_bars: int | None = None,
+    ) -> list[BacktestResult]:
+        """
+        Run one strategy against many symbols.
+
+        Args:
+            bars_by_symbol: maps symbol → that symbol's bars (ascending time).
+            strategy: a Strategy instance to evaluate on each symbol.
+            min_bars: if set, skip any symbol whose len(bars) < min_bars.
+                      Used to skip symbols too short for the strategy's slow window.
+                      If None, no symbol is skipped at this layer.
+
+        Returns:
+            A list of BacktestResult. Each result's strategy_name is set to
+            f"{strategy.name} on {symbol}" so the symbol is visible in compare().
+            Results are returned in the iteration order of bars_by_symbol
+            (dict insertion order, guaranteed in Python 3.7+).
+
+        Raises:
+            ValueError: if bars_by_symbol is empty, if any bars list is empty,
+                        or if every symbol is skipped by min_bars.
+            TypeError:  if strategy is not a Strategy instance.
+        """
+
+        # ------------------------------------------------------------------
+        # 1. Validate inputs.  Same defensive boundary pattern as run_many().
+        # ------------------------------------------------------------------
+
+        # An empty dict means no symbols to run — almost certainly a caller
+        # bug (e.g. a failed data fetch returned {}).  Reject loudly rather
+        # than returning a silently-empty list that masks the problem upstream.
+        if len(bars_by_symbol) == 0:
+            raise ValueError("bars_by_symbol must be non-empty")
+
+        # isinstance check against the abstract base — same guard as run_many().
+        # Catches stray functions or duck-typed objects at the boundary before
+        # any symbol-level work begins, keeping the error message simple.
+        if not isinstance(strategy, Strategy):
+            raise TypeError(
+                f"strategy must be a Strategy instance, got {type(strategy).__name__}"
+            )
+
+        # Validate every symbol's bar list up front.  Checking here (rather
+        # than lazily inside the loop) means we surface all empty-bar problems
+        # before any backtest runs — partial progress followed by a crash is
+        # harder to debug than an upfront validation failure.
+        for symbol, bars in bars_by_symbol.items():
+            if len(bars) == 0:
+                raise ValueError(
+                    f"bars for symbol {symbol!r} must be non-empty"
+                )
+
+        # ------------------------------------------------------------------
+        # 2. Run the strategy against each symbol in insertion order.
+        # ------------------------------------------------------------------
+
+        # Pre-allocate results list; we append inside the loop because the
+        # loop body has named intermediates (signals, result) that read more
+        # clearly as discrete steps than as a nested comprehension.
+        results: list[BacktestResult] = []
+
+        # dict.items() gives (symbol, bars) pairs in insertion order so both
+        # the symbol label and its bars are in scope on every iteration.
+        for symbol, bars in bars_by_symbol.items():
+
+            # Skip symbols that don't have enough history for the strategy's
+            # indicator warm-up period (e.g. a 200-bar SMA needs ≥ 200 bars).
+            # We SKIP rather than RAISE here because having a short symbol in
+            # a universe is normal — not every ticker has the same history —
+            # and the caller uses min_bars as a filter knob, not a hard error.
+            # A per-symbol TypeError/ValueError would prevent all other symbols
+            # from running, which defeats the purpose of a universe scan.
+            if min_bars is not None and len(bars) < min_bars:
+                continue  # not enough history for this symbol; move on
+
+            # Strategy is stateless (pure): generate_signals() reads only the
+            # bars it is passed and produces a new signal array each time.
+            # There is no internal state to reset between symbols, so we can
+            # safely reuse the same instance across the entire universe without
+            # cloning or re-instantiating it — which keeps memory and setup
+            # cost constant regardless of universe size.
+            signals = strategy.generate_signals(bars)
+
+            # Compose the per-symbol label inside the loop because the label
+            # is inherently per-iteration: the strategy name is shared across
+            # all symbols, but the symbol string changes on every pass.
+            # We must NOT mutate strategy.name — the strategy is reused across
+            # calls (and potentially across concurrent runners), so mutating
+            # it would corrupt labels for other symbols.  The strategy_name
+            # kwarg on run() is the correct injection point: it overrides the
+            # label in the result without touching the strategy object.
+            result = self.backtester.run(
+                bars,
+                signals,
+                strategy_name=f"{strategy.name} on {symbol}",
+            )
+
+            # Append preserves insertion order of bars_by_symbol so callers
+            # can zip(bars_by_symbol.keys(), results) if needed.
+            results.append(result)
+
+        # ------------------------------------------------------------------
+        # 3. Guard against the degenerate case where every symbol was skipped.
+        # ------------------------------------------------------------------
+
+        # Silently returning [] here would be a silent misconfiguration: the
+        # caller set min_bars too high (or provided a universe that's entirely
+        # too short for the strategy) and would receive an empty list with no
+        # indication that something went wrong.  Raising forces the caller to
+        # either lower min_bars, use a faster strategy, or supply longer data —
+        # all of which are intentional corrective actions, not silent failures.
+        if len(results) == 0:
+            raise ValueError(
+                "all symbols were skipped because their bar counts are below "
+                f"min_bars={min_bars}; supply symbols with more history or "
+                "lower min_bars"
+            )
+
+        # Return results in the same order as bars_by_symbol was iterated.
         return results
 
     # ------------------------------------------------------------------

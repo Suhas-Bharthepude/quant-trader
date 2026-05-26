@@ -288,3 +288,167 @@ def test_compare_validates_empty_results():
     # mask a caller bug (e.g. forgetting to capture run_many's output).
     with pytest.raises(ValueError):
         BacktestRunner.compare([])
+
+
+# ---------------------------------------------------------------------------
+# Tests for run_universe — validation, ordering, and min_bars filtering
+# ---------------------------------------------------------------------------
+
+
+def test_run_universe_validates_empty_bars_dict():
+    """run_universe rejects an empty bars_by_symbol dict before doing any work."""
+
+    # An empty dict means no symbols to run — almost certainly a caller bug
+    # (e.g. a failed data fetch returned {}).  We verify the runner raises
+    # rather than silently returning [] which would mask the problem upstream.
+    # SMACrossoverStrategy(5, 10) is a legal strategy so the failure must come
+    # from the empty dict guard, not from the strategy isinstance check.
+    with pytest.raises(ValueError):
+        BacktestRunner().run_universe({}, SMACrossoverStrategy(5, 10))
+
+
+def test_run_universe_validates_strategy_instance():
+    """run_universe rejects a non-Strategy value as the strategy argument."""
+
+    # 50 bars — enough to warm up any SMA window used in this file.  The
+    # bars are legal so the failure must be the isinstance guard on the
+    # strategy argument, not an upstream empty-dict check.
+    bars_dict = {"TEST": make_bars([100.0 + i for i in range(50)])}
+
+    # A plain string is not a Strategy; the runner must surface TypeError
+    # before calling generate_signals on any symbol.
+    with pytest.raises(TypeError):
+        BacktestRunner().run_universe(bars_dict, "not_a_strategy")
+
+
+def test_run_universe_validates_empty_bars_value():
+    """run_universe rejects a symbol whose bars list is empty."""
+
+    # An empty bars list would cause the backtester to fail later with a
+    # cryptic message from inside the engine.  The runner validates all
+    # symbols up front so the error names the offending symbol rather than
+    # surfacing from deep in the call stack.
+    bars_dict = {"TEST": []}
+
+    with pytest.raises(ValueError):
+        BacktestRunner().run_universe(bars_dict, SMACrossoverStrategy(5, 10))
+
+
+def test_run_universe_returns_result_per_symbol():
+    """run_universe returns exactly one BacktestResult per non-skipped symbol."""
+
+    # Three symbols, each with 50 monotonically-increasing bars — enough to
+    # warm up the (5, 10) SMA crossover without triggering any min_bars skip.
+    # The dict keys ("AAA", "BBB", "CCC") are the per-symbol labels the
+    # runner injects into each result's strategy_name field.
+    bars_dict = {
+        "AAA": make_bars([100.0 + i for i in range(50)]),
+        "BBB": make_bars([100.0 + i for i in range(50)]),
+        "CCC": make_bars([100.0 + i for i in range(50)]),
+    }
+
+    results = BacktestRunner().run_universe(bars_dict, SMACrossoverStrategy(5, 10))
+
+    # One result per symbol — any other count means the runner silently
+    # dropped, duplicated, or merged work.
+    assert len(results) == 3
+
+    # We use 'in' substring checks rather than exact equality because the
+    # label format (currently f"{strategy.name} on {symbol}") might gain a
+    # prefix or suffix in a future refactor.  What matters is that BOTH the
+    # strategy identifier AND the symbol key are visible in the label — the
+    # label is the only place the symbol name is recorded in the result, so
+    # it must survive format changes.
+    assert "AAA" in results[0].strategy_name
+    assert "BBB" in results[1].strategy_name
+    assert "CCC" in results[2].strategy_name
+
+    # Also verify the strategy's own name is embedded in every label so the
+    # compare() table shows which strategy produced the result (not just
+    # which symbol was tested).
+    strategy_fragment = SMACrossoverStrategy(5, 10).name  # "SMA(5, 10)"
+    for r in results:
+        assert strategy_fragment in r.strategy_name
+
+
+def test_run_universe_preserves_insertion_order():
+    """Results are returned in bars_by_symbol insertion order (Python 3.7+ dicts)."""
+
+    # Same three symbols as the previous test.  Python dicts preserve
+    # insertion order since 3.7; this test ensures the runner iterates
+    # dict.items() in that order and appends without reordering.  Separating
+    # this from the count/labelling test means a sorting regression would
+    # fail here specifically, making the root cause obvious.
+    bars_dict = {
+        "AAA": make_bars([100.0 + i for i in range(50)]),
+        "BBB": make_bars([100.0 + i for i in range(50)]),
+        "CCC": make_bars([100.0 + i for i in range(50)]),
+    }
+
+    results = BacktestRunner().run_universe(bars_dict, SMACrossoverStrategy(5, 10))
+
+    # Positional checks mirror the insertion order of the dict literal above.
+    # Substring check — same rationale as test_run_universe_returns_result_per_symbol:
+    # robust to minor label-format changes that don't affect the semantic content.
+    assert "AAA" in results[0].strategy_name
+    assert "BBB" in results[1].strategy_name
+    assert "CCC" in results[2].strategy_name
+
+
+def test_run_universe_skips_short_symbols_when_min_bars_set():
+    """run_universe omits symbols whose bar count falls below min_bars."""
+
+    # "LONG" has 50 bars (≥ 30 threshold) and must appear in results.
+    # "SHORT" has 20 bars (< 30 threshold) and must be silently skipped.
+    # This mirrors the real use-case: a universe where some tickers have
+    # shorter history than the strategy's slow-window warm-up period.
+    bars_dict = {
+        "LONG": make_bars([100.0 + i for i in range(50)]),
+        "SHORT": make_bars([100.0 + i for i in range(20)]),
+    }
+
+    results = BacktestRunner().run_universe(
+        bars_dict, SMACrossoverStrategy(5, 10), min_bars=30
+    )
+
+    # Only "LONG" should have produced a result; "SHORT" was skipped.
+    assert len(results) == 1
+
+    # Confirm the surviving result belongs to "LONG", not "SHORT".
+    # Substring check — same rationale as the labelling tests above.
+    assert "LONG" in results[0].strategy_name
+
+
+def test_run_universe_raises_when_all_skipped():
+    """run_universe raises ValueError when min_bars causes every symbol to be skipped."""
+
+    # Both symbols have 10 bars, well below the min_bars=30 threshold.
+    # Silently returning [] would mask a misconfigured min_bars — the caller
+    # would receive no results and have no indication why.  Raising forces
+    # the caller to either lower min_bars, choose a faster strategy, or
+    # supply longer data — all intentional corrective actions.
+    bars_dict = {
+        "A": make_bars([100.0 + i for i in range(10)]),
+        "B": make_bars([100.0 + i for i in range(10)]),
+    }
+
+    with pytest.raises(ValueError):
+        BacktestRunner().run_universe(
+            bars_dict, SMACrossoverStrategy(5, 10), min_bars=30
+        )
+
+
+def test_run_universe_results_are_backtest_results():
+    """Every element returned by run_universe is a BacktestResult instance."""
+
+    # Single symbol — sufficient to verify the engine integration path without
+    # duplicating the multi-symbol coverage already in the labelling tests.
+    bars_dict = {"SPY": make_bars([100.0 + i for i in range(50)])}
+
+    results = BacktestRunner().run_universe(bars_dict, SMACrossoverStrategy(5, 10))
+
+    # isinstance over every element so a partial corruption (e.g. one stray
+    # None or raw tuple) would still fail.  all() short-circuits on the first
+    # mismatch.  This is a cheap sanity check that the engine integration path
+    # wasn't accidentally bypassed (e.g. by returning raw dicts).
+    assert all(isinstance(r, BacktestResult) for r in results)
