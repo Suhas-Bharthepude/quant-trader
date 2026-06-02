@@ -452,3 +452,144 @@ def test_run_universe_results_are_backtest_results():
     # mismatch.  This is a cheap sanity check that the engine integration path
     # wasn't accidentally bypassed (e.g. by returning raw dicts).
     assert all(isinstance(r, BacktestResult) for r in results)
+
+
+# ---------------------------------------------------------------------------
+# Tests for run_matrix — validation, cross-product ordering, and min_bars
+# ---------------------------------------------------------------------------
+
+
+def test_run_matrix_validates_empty_dict():
+    """run_matrix rejects an empty bars_by_symbol dict before doing any work."""
+
+    # SMACrossoverStrategy(5, 10) is a legal strategy so the failure must come
+    # from the empty-dict guard, not from any downstream strategy type check.
+    # Silently returning [] would mask a caller bug (e.g. a failed data fetch).
+    with pytest.raises(ValueError):
+        BacktestRunner().run_matrix({}, [SMACrossoverStrategy(5, 10)])
+
+
+def test_run_matrix_validates_empty_strategies():
+    """run_matrix rejects an empty strategies list — there'd be nothing to run."""
+
+    # 50 bars — enough to warm up any SMA window used in this file.  The bars
+    # dict is legal so the failure must come from the empty strategies guard,
+    # not from any upstream dict check.
+    bars_dict = {"TEST": make_bars([100.0 + i for i in range(50)])}
+
+    # Returning a silently-empty list would mask a caller bug; raise instead.
+    with pytest.raises(ValueError):
+        BacktestRunner().run_matrix(bars_dict, [])
+
+
+def test_run_matrix_validates_strategy_type():
+    """run_matrix rejects non-Strategy entries in the strategies list."""
+
+    # 50 bars — same rationale as the previous test: bars are legal so the
+    # failure must be the isinstance check on the strategies list element.
+    bars_dict = {"TEST": make_bars([100.0 + i for i in range(50)])}
+
+    # A plain string is not a Strategy; the runner must surface TypeError before
+    # calling generate_signals on any (symbol, strategy) cell.
+    with pytest.raises(TypeError):
+        BacktestRunner().run_matrix(bars_dict, ["not_a_strategy"])
+
+
+def test_run_matrix_validates_empty_bars_value():
+    """run_matrix rejects a symbol whose bars list is empty."""
+
+    # An empty bars list would cause the backtester to fail later with a
+    # cryptic message from inside the engine.  The runner validates all symbol
+    # bar lists up front so the error names the offending symbol rather than
+    # surfacing from deep in the call stack.
+    bars_dict = {"TEST": []}
+
+    with pytest.raises(ValueError):
+        BacktestRunner().run_matrix(bars_dict, [SMACrossoverStrategy(5, 10)])
+
+
+def test_run_matrix_returns_cross_product_size():
+    """run_matrix returns len(symbols) × len(strategies) results."""
+
+    # Three symbols × two strategies = six cells in the matrix.  Each cell
+    # is an independent backtest, so the result count must be exactly 6.
+    bars_dict = {
+        "AAA": make_bars([100.0 + i for i in range(50)]),
+        "BBB": make_bars([100.0 + i for i in range(50)]),
+        "CCC": make_bars([100.0 + i for i in range(50)]),
+    }
+    strategies = [SMACrossoverStrategy(5, 10), SMACrossoverStrategy(5, 20)]
+
+    results = BacktestRunner().run_matrix(bars_dict, strategies)
+
+    # Any count other than 6 would mean the runner silently dropped, duplicated,
+    # or merged cells — the cross-product property must hold exactly.
+    assert len(results) == 6
+
+
+def test_run_matrix_iterates_symbol_major():
+    """Results appear in symbol-major, strategy-minor order."""
+
+    # Three symbols × two strategies.  Symbol-major order means all strategies
+    # for AAA come first (indices 0-1), then all for BBB (2-3), then CCC (4-5).
+    # Within each symbol block the strategies appear in input order.
+    bars_dict = {
+        "AAA": make_bars([100.0 + i for i in range(50)]),
+        "BBB": make_bars([100.0 + i for i in range(50)]),
+        "CCC": make_bars([100.0 + i for i in range(50)]),
+    }
+    strategies = [SMACrossoverStrategy(5, 10), SMACrossoverStrategy(5, 20)]
+
+    results = BacktestRunner().run_matrix(bars_dict, strategies)
+
+    # We use 'in' substring checks — same rationale as run_universe tests:
+    # robust to minor label-format changes that don't affect the semantic
+    # content.  Both the strategy identifier AND the symbol key must be present.
+    assert "SMA(5, 10)" in results[0].strategy_name and "AAA" in results[0].strategy_name
+    assert "SMA(5, 20)" in results[1].strategy_name and "AAA" in results[1].strategy_name
+    assert "SMA(5, 10)" in results[2].strategy_name and "BBB" in results[2].strategy_name
+    assert "SMA(5, 20)" in results[3].strategy_name and "BBB" in results[3].strategy_name
+    assert "SMA(5, 10)" in results[4].strategy_name and "CCC" in results[4].strategy_name
+    assert "SMA(5, 20)" in results[5].strategy_name and "CCC" in results[5].strategy_name
+
+
+def test_run_matrix_skips_short_symbols():
+    """run_matrix skips all strategies for symbols below min_bars (symbol-level filter)."""
+
+    # "LONG" has 50 bars (≥ 30 threshold) — both strategies must run on it.
+    # "SHORT" has 20 bars (< 30 threshold) — neither strategy should run on it.
+    # The filter is at the symbol level: either all strategies run on a symbol
+    # or none do.  The surviving results must all belong to "LONG".
+    bars_dict = {
+        "LONG": make_bars([100.0 + i for i in range(50)]),
+        "SHORT": make_bars([100.0 + i for i in range(20)]),
+    }
+    strategies = [SMACrossoverStrategy(5, 10), SMACrossoverStrategy(5, 20)]
+
+    results = BacktestRunner().run_matrix(bars_dict, strategies, min_bars=30)
+
+    # Two strategies × one surviving symbol = 2 results.  Any other count
+    # would mean SHORT was not skipped entirely, or LONG's strategies were
+    # partially dropped.
+    assert len(results) == 2
+
+    # Both surviving results must belong to "LONG", confirming the symbol-level
+    # filter: SHORT was skipped for ALL strategies, not per-cell.
+    assert all("LONG" in r.strategy_name for r in results)
+
+
+def test_run_matrix_raises_when_all_skipped():
+    """run_matrix raises ValueError when min_bars causes every symbol to be skipped."""
+
+    # Both symbols have 10 bars, well below the min_bars=30 threshold.
+    # Silently returning [] would mask a misconfigured min_bars — the caller
+    # would receive no results with no indication why.  Raising forces
+    # the caller to lower min_bars, use a faster strategy, or supply longer data.
+    bars_dict = {
+        "A": make_bars([100.0 + i for i in range(10)]),
+        "B": make_bars([100.0 + i for i in range(10)]),
+    }
+    strategies = [SMACrossoverStrategy(5, 10), SMACrossoverStrategy(5, 20)]
+
+    with pytest.raises(ValueError):
+        BacktestRunner().run_matrix(bars_dict, strategies, min_bars=30)

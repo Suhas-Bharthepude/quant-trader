@@ -277,6 +277,185 @@ class BacktestRunner:
         # Return results in the same order as bars_by_symbol was iterated.
         return results
 
+    def run_matrix(
+        self,
+        bars_by_symbol: dict[str, list[OHLCVBar]],
+        strategies: list[Strategy],
+        min_bars: int | None = None,
+    ) -> list[BacktestResult]:
+        """
+        Run every (symbol, strategy) combination and return results in
+        symbol-major, strategy-minor order.
+
+        This is the cross-product of run_many and run_universe:
+          * len(strategies) == 1  → degenerates to run_universe behaviour
+            (one strategy swept across every symbol).
+          * len(bars_by_symbol) == 1 → degenerates to run_many behaviour
+            (many strategies on one symbol's bars).
+        Neither degenerate case is special-cased in the code; both fall out
+        naturally from the nested loop structure.
+
+        Args:
+            bars_by_symbol: maps symbol → that symbol's bars (ascending time).
+            strategies: one or more Strategy instances to evaluate on every symbol.
+            min_bars: if set, skip every strategy for any symbol whose
+                      len(bars) < min_bars.  Bar count is a property of the
+                      symbol, not the strategy, so the filter applies at the
+                      symbol level — either all strategies run on a symbol or
+                      none do.  If None, no symbol is skipped at this layer.
+
+        Returns:
+            A list of BacktestResult in symbol-major, strategy-minor order:
+            all strategies for symbol 1, then all strategies for symbol 2, etc.
+            Each result's strategy_name is f"{strategy.name} on {symbol}" —
+            identical to run_universe — so the CLI column-split logic that
+            parses "X on Y" works uniformly across both methods.
+
+        Raises:
+            ValueError: if bars_by_symbol is empty, if strategies is empty,
+                        if any bars list is empty, if min_bars < 1, or if
+                        every symbol is skipped by min_bars.
+            TypeError:  if any element of strategies is not a Strategy instance.
+        """
+
+        # ------------------------------------------------------------------
+        # 1. Validate inputs.  All checks run before any backtest starts so
+        #    that a misconfigured call fails atomically — no partial progress
+        #    followed by a mid-run crash.
+        # ------------------------------------------------------------------
+
+        # An empty dict means no symbols to run.  Almost certainly a caller
+        # bug (e.g. a failed data fetch returned {}).  Reject loudly rather
+        # than returning a silently-empty list that masks the problem upstream.
+        if len(bars_by_symbol) == 0:
+            raise ValueError("bars_by_symbol must be non-empty")
+
+        # Empty strategies → the inner loop produces nothing; the result list
+        # would be empty and silently misleading.  Same reasoning as run_many:
+        # reject at the boundary rather than returning a vacuously empty result.
+        if len(strategies) == 0:
+            raise ValueError("strategies must be non-empty")
+
+        # isinstance check against the abstract base — same guard as run_many().
+        # Checking the entire list up front (rather than lazily inside the
+        # loop) means the error names the bad index before any symbol-level
+        # work begins.  This is strictly better than raising on the first
+        # iteration of some symbol halfway through the matrix.
+        for i, strategy in enumerate(strategies):
+            if not isinstance(strategy, Strategy):
+                raise TypeError(
+                    f"strategies[{i}] must be a Strategy instance, "
+                    f"got {type(strategy).__name__}"
+                )
+
+        # Validate every symbol's bar list up front, for the same reason as
+        # run_universe: surface all empty-bar problems before any backtest
+        # runs rather than crashing partway through the matrix.
+        for symbol, bars in bars_by_symbol.items():
+            if len(bars) == 0:
+                raise ValueError(
+                    f"bars for symbol {symbol!r} must be non-empty"
+                )
+
+        # min_bars must be at least 1 when provided — a value of 0 or below
+        # is logically incoherent (every symbol would be kept anyway) and
+        # almost certainly a caller arithmetic error (e.g. slow_window - 1
+        # underflowing).  Rejecting it up front prevents silent no-ops.
+        if min_bars is not None and min_bars < 1:
+            raise ValueError(
+                f"min_bars must be >= 1 when provided, got {min_bars}"
+            )
+
+        # ------------------------------------------------------------------
+        # 2. Run the full (symbol × strategy) matrix.
+        #
+        # Outer loop = symbol, inner loop = strategy.  This ordering gives
+        # deterministic, readable output: all strategies for symbol 1 appear
+        # consecutively in the results list, then all strategies for symbol 2,
+        # etc.  It also matches how Phase 2 grid sweeps naturally chunk work —
+        # load one symbol's bars once, run all parameter variants through it,
+        # then move to the next symbol — which minimises cache pressure when
+        # bar arrays are large.
+        # ------------------------------------------------------------------
+
+        # Pre-allocate the results list; we append inside the nested loop
+        # because the loop body has named intermediates (signals, result) that
+        # read more clearly as discrete steps than as a doubly-nested
+        # comprehension.
+        results: list[BacktestResult] = []
+
+        # dict.items() yields (symbol, bars) pairs in insertion order
+        # (guaranteed by CPython 3.7+ dict semantics), so result ordering is
+        # deterministic and matches the caller's input ordering.
+        for symbol, bars in bars_by_symbol.items():
+
+            # min_bars filters at the SYMBOL level, not the (symbol, strategy)
+            # cell level.  Bar count is a property of the symbol's history,
+            # not of any individual strategy, so it makes no sense to run
+            # three strategies on a 50-bar symbol when the threshold is 100:
+            # all three would operate on insufficient history and produce
+            # unreliable metrics.  Skipping the whole symbol keeps the results
+            # list consistent — either a symbol contributes a full row of
+            # strategy results or it contributes nothing.
+            if min_bars is not None and len(bars) < min_bars:
+                continue  # entire symbol skipped; no strategy runs on it
+
+            # Inner loop over strategies in input order.  The same strategy
+            # instance is reused across all symbols because Strategy.generate_signals()
+            # is stateless and pure: it reads only the bars it is passed and
+            # produces a fresh signal array each time.  There is no accumulated
+            # state to reset between symbols, so reusing the instance is both
+            # safe and efficient — no cloning or re-instantiation regardless
+            # of universe size.
+            for strategy in strategies:
+                # generate_signals() is the strategy's only computational
+                # responsibility — turn bars into an int signal array of the
+                # same length.  The Strategy contract guarantees alignment.
+                signals = strategy.generate_signals(bars)
+
+                # Compose the label inside the inner loop because it is
+                # inherently per-cell: the strategy name changes across the
+                # inner axis and the symbol changes across the outer axis.
+                # f"{strategy.name} on {symbol}" is identical to run_universe's
+                # format — the CLI column-split logic that parses "X on Y"
+                # therefore works uniformly for both methods without any
+                # special-casing.  We must NOT mutate strategy.name: the
+                # strategy is reused across every (symbol, strategy) cell, so
+                # a mutation would corrupt subsequent labels.
+                result = self.backtester.run(
+                    bars,
+                    signals,
+                    strategy_name=f"{strategy.name} on {symbol}",
+                )
+
+                # Append preserves symbol-major, strategy-minor order so
+                # callers can read results row-by-row (all strategies for
+                # symbol 1 first, etc.) without any post-sorting.
+                results.append(result)
+
+        # ------------------------------------------------------------------
+        # 3. Guard against the degenerate case where every symbol was skipped.
+        # ------------------------------------------------------------------
+
+        # Identical guard pattern to run_universe: silently returning [] here
+        # would be a silent misconfiguration — the caller set min_bars too high
+        # (or the entire universe is too short) and would receive an empty list
+        # with no indication that something went wrong.  Raising forces the
+        # caller to either lower min_bars, use a faster strategy, or supply
+        # longer data.  We report the largest available bar count so the caller
+        # immediately knows how far off they are rather than having to
+        # diagnose it from scratch.
+        if len(results) == 0:
+            largest = max(len(b) for b in bars_by_symbol.values())
+            raise ValueError(
+                "all symbols were skipped because their bar counts are below "
+                f"min_bars={min_bars}; the largest available bar count is "
+                f"{largest} — supply symbols with more history or lower min_bars"
+            )
+
+        # Return results in symbol-major, strategy-minor order.
+        return results
+
     # ------------------------------------------------------------------
     # compare() is @staticmethod because it doesn't read self.backtester
     # or any other instance state — it's a pure transformation from a
