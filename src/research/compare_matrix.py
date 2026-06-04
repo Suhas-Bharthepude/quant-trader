@@ -53,12 +53,6 @@ compare_strategies.py for direct cross-tool comparability.
 # other research CLIs in this module.
 import argparse
 
-# logging is used to warn about symbols that have no bars in DuckDB.  Using
-# log.warning() rather than print() keeps diagnostic messages separate from
-# structured output — they can be silenced by adjusting the log level without
-# touching the print statements.  Same pattern as src/data/yfinance_fetcher.py.
-import logging
-
 # sys.exit() with an integer propagates the exit code to the shell so cron /
 # CI can branch on success vs. failure via $?.
 import sys
@@ -66,15 +60,6 @@ import sys
 # pandas is the pivoting and formatting backbone.  pivot_table(), .map(), and
 # to_string() are all used in the display pipeline.
 import pandas as pd
-
-# DuckDBStore is the read side of the persistence layer.  Context manager
-# ensures the exclusive file lock is released even if an exception fires.
-from src.data.duckdb_store import DuckDBStore
-
-# load_universe returns the list of tickers for a named universe (e.g.
-# "sp500") from config/universe.yaml — single source of truth for which
-# symbols are in scope.
-from src.data.universe import load_universe
 
 # SMACrossoverStrategy is the only strategy family evaluated in this CLI.
 # The param grid sweeps six (fast, slow) pairs within this family — the same
@@ -85,11 +70,10 @@ from src.strategies.sma_crossover import SMACrossoverStrategy
 # exercise here — many strategies × many symbols simultaneously.
 from src.research.runner import BacktestRunner
 
-
-# Module-level logger.  getLogger(__name__) ties log records to this module's
-# fully-qualified name ("src.research.compare_matrix") so they are filterable
-# by the caller's log configuration without affecting other modules.
-log = logging.getLogger(__name__)
+# build_symbol_list resolves --symbols CSV or --universe/--limit to a plain
+# list[str].  load_bars_for_symbols opens DuckDB once and reads all symbols
+# in a single connection, skipping missing ones with a log.warning.
+from src.research.cli_common import build_symbol_list, load_bars_for_symbols
 
 
 # ---------------------------------------------------------------------------
@@ -214,25 +198,9 @@ def main() -> int:
     # ------------------------------------------------------------------
     # 2. Build the symbol list.
     # ------------------------------------------------------------------
-    # Two paths: explicit --symbols CSV takes priority over --universe.
-    # We normalise both to a plain list[str] so the rest of main() is
-    # agnostic to which source was used.
-
-    if args.symbols is not None:
-        # Split on commas and strip surrounding whitespace from each token
-        # so "SPY, QQQ , AAPL" parses cleanly to ["SPY", "QQQ", "AAPL"].
-        # The `if s.strip()` filter drops empty strings from trailing commas.
-        symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
-        # --limit is intentionally ignored here: the caller already controls
-        # list size by writing the explicit CSV; silently truncating it would
-        # be confusing ("I asked for five symbols but only saw three").
-    else:
-        # load_universe raises KeyError if the name isn't in the YAML —
-        # that propagates naturally as an unrecoverable configuration error.
-        symbols = load_universe(args.universe)
-        # Slice to --limit after loading so load_universe always receives the
-        # full list; slicing is a no-op when len(symbols) <= limit.
-        symbols = symbols[: args.limit]
+    # CSV overrides universe; limit is applied only on the universe path.
+    # See cli_common.build_symbol_list for the full rationale.
+    symbols = build_symbol_list(args.symbols, args.universe, args.limit)
 
     # Report the matrix dimensions so the operator knows exactly how much
     # work is about to happen before any I/O starts.
@@ -263,31 +231,7 @@ def main() -> int:
     # ------------------------------------------------------------------
     # 4. Read bars for every symbol from DuckDB.
     # ------------------------------------------------------------------
-    # Open DuckDB once and read all symbols inside a single context-manager
-    # block.  This avoids N open/close cycles (and N exclusive-lock acquires)
-    # that would each add latency and OS overhead.
-    bars_by_symbol: dict = {}
-    with DuckDBStore() as store:
-        for symbol in symbols:
-            # read_bars returns bars sorted by timestamp ascending — exactly
-            # the order strategies and the backtester expect.
-            symbol_bars = store.read_bars(symbol, args.start, args.end)
-
-            # Only include symbols that actually have data in DuckDB.  An
-            # empty list would fail the runner's upfront validation for that
-            # symbol.  Skipping silently at the I/O layer is the right call:
-            # a symbol might simply not be in the database yet (e.g. recently
-            # added to the universe before the ingest script ran), and that
-            # should not prevent the other symbols from running.  log.warning
-            # rather than print keeps this diagnostic separate from the
-            # structured output and respects the caller's log-level config.
-            if not symbol_bars:
-                log.warning(
-                    "No bars for %s in %s–%s; skipping", symbol, args.start, args.end
-                )
-                continue
-
-            bars_by_symbol[symbol] = symbol_bars
+    bars_by_symbol = load_bars_for_symbols(symbols, args.start, args.end)
 
     # Report actual coverage so the operator can see how many symbols had
     # data vs. how many were requested — the fraction signals data quality.
