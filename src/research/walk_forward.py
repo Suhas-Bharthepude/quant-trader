@@ -23,6 +23,32 @@ This function's only job is to partition a pre-fetched bar list correctly.
 # than knowing where OHLCVBar lives separately.
 from src.data.schema import OHLCVBar
 
+# numpy is needed to concatenate per-fold return arrays and compute the
+# stitched OOS equity curve via cumsum + exp.
+import numpy as np
+
+# dataclass auto-generates __init__, __repr__, and __eq__ for WalkForwardResult.
+# frozen=True makes the result immutable after construction — consistent with
+# BacktestResult and Trade in src/backtest/result.py.
+from dataclasses import dataclass
+
+# Strategy is the abstract base that walk_forward_validate accepts so the
+# validator is not coupled to any specific concrete strategy implementation.
+from src.strategies.base import Strategy
+
+# Backtester is the engine used to score each test fold.  Imported here so
+# walk_forward_validate can create a default instance when the caller passes None.
+from src.backtest.engine import Backtester
+
+# BacktestResult is the per-fold output type; Trade is used in the type
+# annotation for the stitched all_trades list before passing to metrics.win_rate.
+from src.backtest.result import BacktestResult, Trade
+
+# Pure metric functions compute the stitched OOS scalar aggregates.  Imported
+# as a module (not individual names) so call sites read metrics.sharpe_ratio(...)
+# — self-documenting and consistent with how engine.py uses them after extraction.
+from src.backtest import metrics
+
 
 def walk_forward_splits(
     bars: list[OHLCVBar],
@@ -186,3 +212,299 @@ def walk_forward_splits(
     # which means the while condition was true on the first iteration (start=0),
     # so results is always non-empty here.  No empty-list guard is needed.
     return results
+
+
+# ---------------------------------------------------------------------------
+# WalkForwardResult — aggregate output of walk_forward_validate.
+# ---------------------------------------------------------------------------
+
+# frozen=True makes the result immutable after construction — backtest results
+# are historical facts; mutating them is a bug.  Consistent with BacktestResult
+# and Trade in src/backtest/result.py.
+@dataclass(frozen=True)
+class WalkForwardResult:
+    """Aggregate result of a walk-forward validation run.
+
+    per_fold holds one BacktestResult per (train, test) fold so callers can
+    inspect fold-level metrics alongside the stitched OOS aggregates.  All
+    oos_* fields treat the concatenated test windows as one contiguous timeline.
+    """
+
+    # One BacktestResult per fold in chronological order.  Each result covers
+    # exactly the test window; the strategy was warm over the training bars that
+    # preceded it, so signals at the start of the test window are valid.
+    per_fold: list[BacktestResult]
+
+    # Stitched per-bar OOS log returns.  The structural index-0 zero from each
+    # fold's returns array has been removed so every element is a real return
+    # observation.  Length == sum(len(fr.returns) - 1 for fr in per_fold).
+    oos_returns: np.ndarray
+
+    # Stitched OOS equity curve anchored at 1.0.  Length == len(oos_returns) + 1
+    # (the +1 is the 1.0 anchor point prepended before cumsum).  A value of 1.25
+    # means the strategy grew 25% over the full out-of-sample timeline.
+    oos_equity_curve: np.ndarray
+
+    # Scalar aggregates computed over the stitched OOS timeline.
+    oos_total_return: float       # (oos_equity_curve[-1] / oos_equity_curve[0]) - 1
+    oos_sharpe: float             # annualised Sharpe over oos_returns (no structural zeros)
+    oos_max_drawdown: float       # worst peak-to-trough in oos_equity_curve, positive fraction
+    oos_win_rate: float           # fraction of all OOS trades with return_pct > 0
+
+    # Fold-level summary counts.
+    n_folds: int                  # total number of (train, test) folds run
+    n_folds_positive_sharpe: int  # folds where fold_result.sharpe_ratio > 0
+    total_trades: int             # total completed trades across all folds
+
+
+# ---------------------------------------------------------------------------
+# walk_forward_validate — pure orchestration function.
+# ---------------------------------------------------------------------------
+
+def walk_forward_validate(
+    splits: list[tuple[list[OHLCVBar], list[OHLCVBar]]],
+    strategy: Strategy,
+    backtester: Backtester | None = None,
+    annualization_factor: int = 252,
+) -> WalkForwardResult:
+    """Run a strategy over every test fold and return stitched OOS results.
+
+    Pure function: no I/O, no printing, no side effects — consistent with
+    BacktestRunner.run_many and the rest of the research layer.
+
+    The caller is responsible for producing splits via walk_forward_splits and
+    for loading bars.  This function's only job is fold-level orchestration and
+    OOS aggregation — separation of concerns mirrors the splitter's own design.
+
+    Args:
+        splits:               Output of walk_forward_splits — list of
+                              (train_bars, test_bars) tuples in chronological
+                              order.  Test windows must be disjoint (default
+                              step=None satisfies this; explicit step < test_size
+                              does not and will raise).
+        strategy:             Any concrete Strategy instance.  generate_signals
+                              is called over train+test bars per fold so that
+                              indicators are warm before the test window begins.
+        backtester:           Backtester instance for scoring each fold.  When
+                              None, defaults to Backtester(annualization_factor=
+                              annualization_factor) so fold-level and stitched
+                              Sharpe values use the same scaling factor.
+        annualization_factor: Bars per year for Sharpe annualisation.  Defaults
+                              to 252 (US trading days), matching Backtester.
+
+    Returns:
+        WalkForwardResult with per-fold BacktestResults and stitched OOS metrics.
+
+    Raises:
+        ValueError: splits is empty — no folds to evaluate.
+        ValueError: consecutive test windows overlap — stitched OOS aggregate
+                    requires disjoint test windows (use step >= test_size).
+    """
+
+    # ------------------------------------------------------------------
+    # 1. Validate inputs.
+    # ------------------------------------------------------------------
+
+    # Explicit guard before any loop: fires early with a named cause so the caller
+    # sees "splits is empty" rather than a cryptic downstream numpy error
+    # ("need at least one array to concatenate").
+    # walk_forward_splits already raises when bars are too short for one fold,
+    # so an empty list here means the caller either bypassed the splitter or
+    # constructed splits by hand with an insufficient bar window.
+    if not splits:
+        raise ValueError(
+            "splits is empty — no folds to validate. "
+            "Pass the output of walk_forward_splits(); check that "
+            "train_size + test_size does not exceed the available bar count."
+        )
+
+    # Overlap guard: the stitched OOS aggregate (concatenated returns, cumulative
+    # equity curve) is only valid when each test bar appears in exactly one fold.
+    # If step < test_size was passed to walk_forward_splits, consecutive test
+    # windows share bars; stitching them counts shared bars twice, corrupting
+    # mean return, std, and therefore Sharpe.
+    # We compare timestamps rather than bar indices because this function receives
+    # the pre-sliced lists, not the original index offsets.
+    for i in range(len(splits) - 1):
+        # Unpack only the test lists; training bars are not needed for this check.
+        _, test_bars_i    = splits[i]
+        _, test_bars_next = splits[i + 1]
+        # Bars are ascending by timestamp (guaranteed by DuckDBStore.read_bars
+        # and walk_forward_splits, which does not re-sort).  If fold i's last
+        # test bar is at the same time as or after fold i+1's first test bar,
+        # at least one bar is shared between the two test windows.
+        if test_bars_i[-1].timestamp >= test_bars_next[0].timestamp:
+            raise ValueError(
+                f"Test windows for folds {i} and {i + 1} overlap in time: "
+                f"fold {i} ends at {test_bars_i[-1].timestamp}, "
+                f"fold {i + 1} starts at {test_bars_next[0].timestamp}. "
+                "The stitched OOS aggregate requires disjoint test windows. "
+                "Use step >= test_size when calling walk_forward_splits "
+                "(the default step=None already satisfies this)."
+            )
+
+    # ------------------------------------------------------------------
+    # 2. Resolve the backtester.
+    # ------------------------------------------------------------------
+
+    # Default Backtester uses annualization_factor from this call so the
+    # fold-level sharpe_ratio values inside each BacktestResult use the same
+    # annual scaling as the stitched oos_sharpe computed in step 6.
+    # initial_capital stays at Backtester's own default (1.0) so per-fold
+    # equity curves are unit-normalised multipliers — consistent with the
+    # stitched equity curve anchored at 1.0 below.
+    if backtester is None:
+        backtester = Backtester(annualization_factor=annualization_factor)
+
+    # ------------------------------------------------------------------
+    # 3. Per-fold: generate warm signals, backtest on test window only.
+    # ------------------------------------------------------------------
+
+    # Accumulates one BacktestResult per fold in chronological (input) order.
+    per_fold: list[BacktestResult] = []
+
+    for i, (train_bars, test_bars) in enumerate(splits):
+
+        # ------------------------------------------------------------------
+        # SEAM — Day 22 parameter fitting replaces exactly this one line.
+        #
+        # TODAY:  fold_strategy = strategy
+        #   The strategy is used unchanged across every fold.  Training bars
+        #   serve only as an indicator warm-up window (a 200-bar SMA needs
+        #   ≥200 preceding bars before it emits a non-flat signal).
+        #
+        # DAY 22: replace ONLY this line with:
+        #   fold_strategy = fit_fn(train_bars)
+        #   where fit_fn optimises strategy parameters on train_bars and
+        #   returns a new Strategy instance tuned to that fold's regime.
+        #   Everything below — full_bars concat, generate_signals, slice,
+        #   backtester.run — stays unchanged; the seam is one assignment.
+        # ------------------------------------------------------------------
+        fold_strategy = strategy  # TODAY: no fitting; training window warms indicators only
+
+        # Concatenate train + test into one contiguous list so generate_signals
+        # sees the full history needed to warm the indicator.  Without training
+        # bars, a slow-window strategy (e.g. SMA-200) would emit SIGNAL_FLAT
+        # for its entire warmup period inside the test window, producing
+        # misleadingly short signal coverage and distorted metrics.
+        # Python list concat; copies references, not OHLCVBar objects.
+        full_bars = train_bars + test_bars
+
+        # Exact call pattern from BacktestRunner.run_many (runner.py line 140):
+        #   signals = strategy.generate_signals(bars)
+        # generate_signals returns an integer ndarray aligned 1:1 with full_bars.
+        # Causal indicators ensure signals[i] uses only bars[0..i], so the
+        # training prefix cannot introduce lookahead into the test suffix.
+        full_signals = fold_strategy.generate_signals(full_bars)
+
+        # Slice off the training prefix.  Indices [0, len(train_bars)) are the
+        # warm-up region; indices [len(train_bars), len(full_bars)) are the test
+        # signals aligned 1:1 with test_bars.  numpy slice is a view — no copy —
+        # and preserves integer dtype so the engine's dtype check passes.
+        test_signals = full_signals[len(train_bars):]
+
+        # Run the backtester over the test window only.  test_bars and
+        # test_signals are both len == len(test_bars), satisfying the engine's
+        # alignment contract.  The fold label embeds the index so reports and
+        # plots can identify which fold each BacktestResult came from.
+        fold_result = backtester.run(
+            test_bars,
+            test_signals,
+            strategy_name=f"{fold_strategy.name} fold {i}",
+        )
+
+        # Append in fold order; enumerate processes splits in input sequence so
+        # per_fold is chronological — required for correct OOS stitching below.
+        per_fold.append(fold_result)
+
+    # ------------------------------------------------------------------
+    # 4. Stitch per-fold returns into one OOS returns array.
+    # ------------------------------------------------------------------
+
+    # Drop returns[0] from every fold before concatenating.
+    # Why: the engine always sets strategy_returns[0] = 0.0 because bar 0 of
+    # any run has no preceding signal to act on — it is a structural zero, not
+    # a real return observation.  That zero is correct inside a single backtest
+    # but becomes spurious noise at every fold seam when stitching: it would
+    # depress mean return and inflate std, corrupting the stitched Sharpe ratio.
+    # Stripping [0] from each fold leaves only genuine OOS return observations.
+    oos_returns = np.concatenate([fr.returns[1:] for fr in per_fold])
+
+    # ------------------------------------------------------------------
+    # 5. Build the stitched OOS equity curve.
+    # ------------------------------------------------------------------
+
+    # Prepend 0.0 before cumsum so the equity curve starts at exp(0.0) = 1.0.
+    # Why 1.0: each per-fold equity curve also starts at 1.0 (Backtester uses
+    # initial_capital=1.0 by default); anchoring the stitched curve the same
+    # way makes oos_total_return a comparable multiplier from a neutral base.
+    # Log returns are additive — log(A/B) + log(B/C) = log(A/C) — so cumsum
+    # over oos_returns gives the total log return up to each bar, and exp
+    # recovers the multiplicative equity growth factor at each point in time.
+    oos_equity_curve = np.exp(np.cumsum(np.concatenate([[0.0], oos_returns])))
+
+    # ------------------------------------------------------------------
+    # 6. Compute stitched OOS scalar metrics.
+    # ------------------------------------------------------------------
+
+    # total_return: pass oos_equity_curve[0] as initial_capital so the metric
+    # measures growth from the curve's own starting value.  With the 0.0 anchor
+    # above, oos_equity_curve[0] == 1.0 always; we pass it explicitly rather
+    # than hardcoding 1.0 to respect metrics.total_return's contract that the
+    # caller supplies the reference capital.
+    oos_total_return = float(metrics.total_return(oos_equity_curve, oos_equity_curve[0]))
+
+    # sharpe: oos_returns contains no structural zeros — they were stripped in
+    # step 4.  Pass the full array with NO [1:] slice; every element is a real
+    # OOS return observation that must enter the mean/std computation.  This is
+    # the "does not skip element 0" contract documented in metrics.sharpe_ratio.
+    oos_sharpe = metrics.sharpe_ratio(oos_returns, annualization_factor)
+
+    # max_drawdown: computed over the stitched equity curve so peak-to-trough
+    # declines that span multiple fold boundaries are captured correctly.
+    oos_max_drawdown = metrics.max_drawdown(oos_equity_curve)
+
+    # ------------------------------------------------------------------
+    # 7. Aggregate trades across all folds.
+    # ------------------------------------------------------------------
+
+    # Flatten in fold order — each fold's trades are chronological, and folds
+    # are in time order, so all_trades is globally chronological.
+    all_trades: list[Trade] = [t for fr in per_fold for t in fr.trades]
+
+    # win_rate over the full OOS trade population; metrics.win_rate handles
+    # the empty-list case (no trades → 0.0) so no guard is needed here.
+    oos_win_rate = metrics.win_rate(all_trades)
+
+    # Cache the count so callers don't recompute len(); mirrors n_trades on
+    # BacktestResult.
+    total_trades = len(all_trades)
+
+    # ------------------------------------------------------------------
+    # 8. Fold-level summary counts.
+    # ------------------------------------------------------------------
+
+    # n_folds == len(splits); stored on the result so callers don't recompute.
+    n_folds = len(splits)
+
+    # n_folds_positive_sharpe is a robustness indicator: a strategy with
+    # consistently positive fold-level Sharpe ratios is more reliable than one
+    # whose high aggregate is driven by a single outlier fold.
+    n_folds_positive_sharpe = sum(1 for fr in per_fold if fr.sharpe_ratio > 0)
+
+    # ------------------------------------------------------------------
+    # 9. Assemble and return the immutable result.
+    # ------------------------------------------------------------------
+
+    return WalkForwardResult(
+        per_fold=per_fold,
+        oos_returns=oos_returns,
+        oos_equity_curve=oos_equity_curve,
+        oos_total_return=oos_total_return,
+        oos_sharpe=oos_sharpe,
+        oos_max_drawdown=oos_max_drawdown,
+        oos_win_rate=oos_win_rate,
+        n_folds=n_folds,
+        n_folds_positive_sharpe=n_folds_positive_sharpe,
+        total_trades=total_trades,
+    )
