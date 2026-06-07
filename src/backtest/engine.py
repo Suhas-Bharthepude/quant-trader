@@ -40,6 +40,10 @@ from src.backtest.result import Trade, BacktestResult
 # hard-coding ±1/0 so a future change to the signal scheme propagates here.
 from src.strategies.base import SIGNAL_LONG, SIGNAL_FLAT, SIGNAL_SHORT
 
+# Pure metric functions extracted to metrics.py so walk-forward validation
+# can call them on arbitrary slices without going through the full Backtester.
+from src.backtest import metrics
+
 
 # ---------------------------------------------------------------------------
 # Backtester — converts (bars, signals) into a BacktestResult.
@@ -246,55 +250,30 @@ class Backtester:
             )
 
         # ------------------------------------------------------------------
-        # 7. Summary metrics.
+        # 7. Summary metrics — delegated to src/backtest/metrics.py so the
+        #    same functions can be reused on walk-forward test slices without
+        #    re-running the full Backtester.
         # ------------------------------------------------------------------
 
-        # Total return as a fraction: 0.25 means the equity curve ended 25%
-        # above where it started.  Subtract 1 so a flat run reads as 0.0.
-        total_return_pct = equity_curve[-1] / self.initial_capital - 1.0
+        # total_return: initial_capital passed explicitly (not self.*) so the
+        # function can compute return for any slice with its own starting equity.
+        # float() wrapping stays at the BacktestResult call site below,
+        # matching the original assignment's type behaviour exactly.
+        total_return_pct = metrics.total_return(equity_curve, self.initial_capital)
 
-        # Sharpe ratio: per-bar mean over per-bar std, scaled to annual by
-        # sqrt(annualization_factor).  We skip strategy_returns[0] because
-        # it's a structural zero (no signal active) that would bias both
-        # mean and std downward.
-        # Sharpe needs at least 2 active return observations to compute a sample
-        # standard deviation (ddof=1). For shorter inputs, std is mathematically
-        # undefined — return 0.0 rather than NaN, which would poison downstream
-        # comparisons and sorts.
-        active_returns = strategy_returns[1:]
-        if len(active_returns) < 2:
-            sharpe_ratio = 0.0
-        else:
-            mean_return = active_returns.mean()
-            # ddof=1 → sample standard deviation (Bessel-corrected), the academic
-            # convention for empirical Sharpe estimates.
-            std_return = active_returns.std(ddof=1)
-            # Guard against the all-flat case (std == 0); also catches any residual
-            # NaN that slipped through (defensive).
-            if std_return == 0.0 or np.isnan(std_return):
-                sharpe_ratio = 0.0
-            else:
-                sharpe_ratio = float(mean_return / std_return * np.sqrt(self.annualization_factor))
+        # sharpe_ratio: strategy_returns[1:] sliced HERE, not inside the
+        # function, so the function works on any arbitrary returns array.
+        # The [1:] skips the structural index-0 zero (no signal active on
+        # bar 0) — identical to the inline active_returns = strategy_returns[1:]
+        # that preceded the old if/else block.
+        sharpe_ratio = metrics.sharpe_ratio(strategy_returns[1:], self.annualization_factor)
 
-        # Max drawdown: largest peak-to-trough decline in the equity curve.
-        # np.maximum.accumulate gives the running maximum at each bar — the
-        # "high water mark" the curve has reached so far.
-        running_max = np.maximum.accumulate(equity_curve)
-        # Drawdown at each bar is (current - peak) / peak — zero or negative.
-        # Dividing by running_max (not initial_capital) makes it the percentage
-        # decline from the most recent peak, which is what investors care about.
-        drawdown = (equity_curve - running_max) / running_max
-        # drawdown.min() is the most negative value; negate it to report
-        # the worst drawdown as a positive fraction (0.20 = 20% drawdown).
-        # A monotonically-increasing equity curve has drawdown.min() == 0.
-        max_drawdown_pct = float(-drawdown.min())
+        # max_drawdown: full equity_curve passed unchanged.
+        max_drawdown_pct = metrics.max_drawdown(equity_curve)
 
-        # Win rate: fraction of completed trades with strictly positive
-        # return.  No trades → 0.0 (defined; avoids a divide-by-zero).
-        if len(trades) == 0:
-            win_rate = 0.0
-        else:
-            win_rate = sum(1 for t in trades if t.return_pct > 0) / len(trades)
+        # win_rate: full trades list passed; the function handles the no-trades
+        # case internally, matching the old inline if/else exactly.
+        win_rate = metrics.win_rate(trades)
 
         # n_trades is cached on the result so callers don't recompute len().
         n_trades = len(trades)
