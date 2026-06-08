@@ -303,3 +303,87 @@ def test_last_timestamp_returns_max(tmp_path) -> None:
         assert store.last_timestamp("TEST", timeframe="1h") is None, (
             "last_timestamp must filter by timeframe, not symbol alone"
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 5 — Timezone-duplicate regression (no network)
+# ---------------------------------------------------------------------------
+# Reproduces the exact production bug: SPY had 505 date-duplicate rows because
+# one ingest run stored daily bars at 00:00 UTC (yfinance naive timestamps) and
+# a second run stored the same bars at 05:00 UTC (yfinance America/New_York
+# timestamps, winter/EST = UTC-5).  The PRIMARY KEY (symbol, timestamp,
+# timeframe) did not catch them because 00:00 != 05:00.
+# The fix floors daily bars to midnight UTC in _bar_to_tuple so both arrive
+# with the same stored timestamp and INSERT OR IGNORE deduplicates them.
+
+def test_daily_bar_tz_duplicate_is_rejected(tmp_path) -> None:
+    """Writing the same daily bar under two tz conventions inserts exactly one row.
+
+    Verifies:
+      - A bar at 2024-01-02 00:00:00 UTC (naive-timestamp yfinance path) is stored.
+      - Writing the same bar at 2024-01-02 05:00:00 UTC (Eastern-midnight yfinance
+        path, winter/EST = UTC-5) is silently discarded by INSERT OR IGNORE.
+      - read_bars() returns exactly 1 row for the date, timestamped at midnight UTC.
+
+    Without the _bar_to_tuple daily-floor fix, read_bars() returns 2 rows because
+    both 00:00 and 05:00 clear the PRIMARY KEY constraint.
+    """
+    # Isolated temp DuckDB file — no dependency on the real data/quant_trader.duckdb.
+    db_file: str = str(tmp_path / "test.duckdb")
+
+    # The shared OHLCV values are identical between the two bars; only the
+    # timestamp tzinfo/offset differs — matching the confirmed production finding
+    # that the 220 "differing" pairs differ only in adj_close at ~1e-5 float
+    # noise, with open/high/low/close/volume byte-identical.  We use exactly
+    # equal values here to isolate the timestamp dimension.
+    common_fields = dict(
+        symbol="SPY",
+        open=476.01, high=479.20, low=474.68, close=476.90, adj_close=476.90,
+        volume=92_000_000, timeframe="1d", source="test",
+    )
+
+    # Bar A: midnight UTC — the "naive timestamp" ingest path.
+    # yfinance returned a tz-naive pd.Timestamp; the fetcher called
+    # ts.replace(tzinfo=timezone.utc), producing 2024-01-02 00:00:00+00:00.
+    bar_midnight_utc = OHLCVBar(
+        timestamp=datetime(2024, 1, 2, 0, 0, 0, tzinfo=timezone.utc),
+        **common_fields,
+    )
+
+    # Bar B: 05:00 UTC — the "Eastern-aware timestamp" ingest path.
+    # yfinance returned a tz-aware pd.Timestamp('2024-01-02 00:00:00-05:00',
+    # tz='America/New_York'); the fetcher called ts.astimezone(timezone.utc),
+    # producing 2024-01-02 05:00:00+00:00.  This is winter (EST = UTC-5).
+    bar_eastern_midnight = OHLCVBar(
+        timestamp=datetime(2024, 1, 2, 5, 0, 0, tzinfo=timezone.utc),
+        **common_fields,
+    )
+
+    with DuckDBStore(db_file) as store:
+        # Write bar A first — must be accepted (new row).
+        first_insert = store.write_bars([bar_midnight_utc])
+        assert first_insert == 1, (
+            f"First write (midnight UTC) should insert 1 row, got {first_insert}"
+        )
+
+        # Write bar B — must be silently discarded because _bar_to_tuple floors
+        # both bars to 2024-01-02 00:00:00 (naive UTC), and the PK already holds
+        # that key.  Without the floor, 05:00 != 00:00 and both get stored.
+        second_insert = store.write_bars([bar_eastern_midnight])
+        assert second_insert == 0, (
+            f"Second write (Eastern midnight = 05:00 UTC) should insert 0 rows "
+            f"(duplicate after daily floor), got {second_insert}"
+        )
+
+        # Read back the date range — must yield exactly 1 bar, not 2.
+        result = store.read_bars("SPY", "2024-01-02", "2024-01-02")
+        assert len(result) == 1, (
+            f"Expected exactly 1 bar for 2024-01-02, got {len(result)} "
+            "(tz-duplicate rows were not deduplicated on write)"
+        )
+
+        # The stored timestamp must be midnight UTC — the canonical daily key.
+        assert result[0].timestamp == datetime(2024, 1, 2, 0, 0, 0, tzinfo=timezone.utc), (
+            f"Expected stored timestamp 2024-01-02 00:00:00+00:00, "
+            f"got {result[0].timestamp}"
+        )

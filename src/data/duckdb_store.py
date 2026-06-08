@@ -281,6 +281,26 @@ class DuckDBStore:
         # then drops the tzinfo without further altering the wall-clock time.
         ts = bar.timestamp.astimezone(timezone.utc).replace(tzinfo=None)
 
+        # Floor daily bars to midnight UTC of their UTC date.
+        # Why: a 1d bar is identified by its trading date, not its time-of-day.
+        # yfinance has historically returned both naive timestamps (stored as
+        # 00:00 UTC via the replace() branch in the fetcher) and timezone-aware
+        # America/New_York timestamps (stored as 05:00 UTC in winter, 04:00 in
+        # summer via the astimezone() branch).  Without this floor, both arrive
+        # here as distinct naive UTC times, both pass the PRIMARY KEY constraint
+        # on (symbol, timestamp, timeframe), and INSERT OR IGNORE lets both
+        # through — producing one duplicate row per date per tz-convention
+        # change.  Flooring to midnight UTC collapses any same-date bar to a
+        # single canonical key so the PK enforces one row per (symbol, date),
+        # and a double-ingest under a different tz convention is silently
+        # deduplicated at the write choke point.
+        # For US equity daily bars the UTC date always equals the trading date
+        # (NYSE opens at 09:30 ET; midnight UTC is well before that), so no
+        # date shift occurs.  Intraday bars are left untouched: their sub-day
+        # time-of-day is meaningful and must not be floored.
+        if bar.timeframe == "1d":
+            ts = ts.replace(hour=0, minute=0, second=0, microsecond=0)
+
         return (
             bar.symbol,
             ts,               # UTC-normalized naive datetime — see docstring above
