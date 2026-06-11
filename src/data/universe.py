@@ -50,7 +50,17 @@ def load_universe(name: str, config_path: str = "config/universe.yaml") -> list[
 
     # Cast each element to str in case the YAML parser produced ints for
     # all-numeric symbols (edge case, but safer to guarantee the return type).
-    return [str(ticker) for ticker in tickers]
+    result: list[str] = []
+    for ticker in tickers:
+        # bool subclasses int; an unquoted YAML keyword (ON/OFF/YES/NO/...) parses as a
+        # boolean, and str(True) -> "True" would be a silent, wrong ticker. Fail loudly.
+        if isinstance(ticker, bool):
+            raise ValueError(
+                f"Universe '{name}' has a ticker that parsed as a boolean ({ticker!r}); "
+                "quote it in config/universe.yaml, e.g. 'ON'."
+            )
+        result.append(str(ticker))
+    return result
 
 
 def list_universes(config_path: str = "config/universe.yaml") -> dict[str, str]:

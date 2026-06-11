@@ -505,6 +505,26 @@ universes:
     - ZBH
     - ZBRA
     - ZTS
+  etf_basket:
+    description: Fixed liquid-ETF basket (broad indices, sectors, bonds, commodities, intl) — stable membership for long-history research
+    tickers:
+    - SPY
+    - QQQ
+    - IWM
+    - XLK
+    - XLF
+    - XLE
+    - XLV
+    - XLY
+    - XLP
+    - XLI
+    - XLU
+    - XLB
+    - TLT
+    - IEF
+    - GLD
+    - EFA
+    - EEM
   test:
     description: Small universe for development and tests
     tickers:
