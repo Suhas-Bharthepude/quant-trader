@@ -7,6 +7,12 @@ Systematic swing trading bot for US equities.
 
 ---
 
+## Scope & Thesis
+
+This project builds a rigorous research-and-validation pipeline (walk-forward, overfitting controls, clean data). The current SMA-on-ETF-basket strategy is a vehicle to build and prove that pipeline, not an alpha claim. The longer-term goal is to use the pipeline to search for a real, validated edge before risking capital. Profitability is not assumed and will only be claimed if it survives out-of-sample validation.
+
+---
+
 ## Overview
 
 `quant-trader` is a research-to-production algorithmic trading system targeting US equity swing trades (multi-day to multi-week holds). The system is built around an event-driven backtesting engine, a modular signal pipeline, and a live execution layer connected to the Alpaca brokerage API.
