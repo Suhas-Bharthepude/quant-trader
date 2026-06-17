@@ -20,6 +20,7 @@ import argparse   # declarative CLI argument parsing
 import logging    # consistent INFO-level logging across scripts
 import sys        # sys.exit() with cron-friendly exit codes
 from datetime import date, datetime  # today's date + per-symbol last_ts handling
+from itertools import pairwise  # adjacent (prev, cur) pairs without copying the list
 from pathlib import Path  # cross-platform file size lookup via Path.stat()
 
 import duckdb  # used directly — DuckDBStore has no read-only mode
@@ -44,6 +45,17 @@ DEFAULT_DB_PATH: str = "data/quant_trader.duckdb"
 # Threshold under which a symbol's stored history is considered "short".
 # 252 ≈ trading days in a year, the standard cutoff for "less than 1 year".
 SHORT_HISTORY_THRESHOLD: int = 252
+
+# Bounds on the consecutive close-to-close ratio (current / prior) outside which
+# a daily bar is flagged as an extreme jump. A single-session move beyond +100%
+# (ratio > 2.0) or −50% (ratio < 0.5) does not happen on a non-leveraged, liquid
+# ETF for a genuine market reason — it is almost always an unadjusted split or
+# other corporate action leaking into the raw `close` the backtester consumes
+# (engine.py reads .close, not .adj_close). If `close` is properly split-adjusted
+# this check comes back clean, which is the useful confirmation; any flag is an
+# invitation to investigate that symbol, not an automatic verdict.
+EXTREME_JUMP_RATIO_LOW: float = 0.5
+EXTREME_JUMP_RATIO_HIGH: float = 2.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -94,6 +106,67 @@ def days_since(ts: datetime, today: date) -> int:
     # ts may be a UTC-aware datetime; .date() drops the time component cleanly
     # so the subtraction yields a timedelta in whole days.
     return (today - ts.date()).days
+
+
+# A bar series row as consumed by the content checks: (date, close, volume),
+# already sorted ascending by date. Kept as a plain tuple (not OHLCVBar) so the
+# helpers are trivially unit-testable with hand-built fixtures and never touch
+# the DB. main() builds these from the read-only query below.
+def find_zero_volume_bars(bars: list[tuple[date, float, int]]) -> list[date]:
+    """Return the dates of bars whose volume is exactly zero.
+
+    Pure function — no I/O. On a liquid ETF a zero-volume trading day is almost
+    always a data gap or a bad bar (a real halt is rare and worth seeing anyway),
+    so we surface the dates rather than silently tolerating them.
+    """
+    # volume is BIGINT in the schema, so an exact == 0 comparison is correct
+    # (no float tolerance needed). Order is preserved from the input series.
+    return [bar_date for bar_date, _close, volume in bars if volume == 0]
+
+
+def find_extreme_jumps(
+    bars: list[tuple[date, float, int]],
+) -> list[tuple[date, float, float, float]]:
+    """Return (date, prior_close, current_close, ratio) for each extreme jump.
+
+    A jump is "extreme" when the consecutive close-to-close ratio falls outside
+    [EXTREME_JUMP_RATIO_LOW, EXTREME_JUMP_RATIO_HIGH]. Pure function — no I/O.
+    Operates on the close series the caller supplies (main() passes raw close).
+    """
+    flags: list[tuple[date, float, float, float]] = []
+
+    # Walk adjacent pairs so each comparison is "this bar vs the one before it".
+    # pairwise(bars) yields (prev, cur) without materializing a copy of the list.
+    for (_prev_date, prev_close, _pv), (cur_date, cur_close, _cv) in pairwise(bars):
+        # Guard against a non-positive prior close: it would make the ratio
+        # meaningless (division by zero or a sign flip). A close <= 0 is itself
+        # corrupt, but it is not this check's job to flag it, so we skip the pair.
+        if prev_close <= 0:
+            continue
+
+        ratio: float = cur_close / prev_close
+
+        # Outside the band → flag it. Inclusive bounds: a clean ETF sits well
+        # inside [0.5, 2.0], so the boundary choice never matters in practice.
+        if ratio < EXTREME_JUMP_RATIO_LOW or ratio > EXTREME_JUMP_RATIO_HIGH:
+            flags.append((cur_date, prev_close, cur_close, ratio))
+
+    return flags
+
+
+def should_alert(
+    stale: list[tuple[str, date, int]],
+    missing: list[str],
+    zero_volume: list[tuple[str, int]],
+) -> bool:
+    """Return True when the run should exit 1 (something actionable / bad data).
+
+    Pure decision function so the exit policy is unit-testable without running
+    main(). Deliberately excludes extreme_jumps: that heuristic also fires on
+    genuine extreme moves (e.g. GL's real -53% day), so it stays informational
+    like short-history. Only unambiguous bad data or behind-data hard-fails.
+    """
+    return bool(stale or missing or zero_volume)
 
 
 def main() -> None:
@@ -227,6 +300,66 @@ def main() -> None:
         missing = sorted(set(universe_tickers) - set(stats.keys()))
 
     # -----------------------------------------------------------------------
+    # Content checks — fetch the ordered (date, close, volume) series per symbol.
+    # -----------------------------------------------------------------------
+    # Structural checks above only need counts/timestamps; the content checks
+    # need the bar values themselves. One ordered query feeds both helpers.
+    # WHERE timeframe = '1d': a close-to-close ratio is only meaningful within a
+    # single timeframe, and the basket/backtester operate on daily bars — so we
+    # never want a 1h bar interleaved into a daily series here. ORDER BY symbol,
+    # timestamp guarantees each symbol's list is chronological for the jump walk.
+    content_sql = (
+        f"SELECT symbol, timestamp, close, volume "
+        f"FROM {DUCKDB_TABLE_NAME} WHERE timeframe = '1d'"
+    )
+    # When a universe filter is active, inspect_symbols holds exactly the symbols
+    # we will iterate over below, so push that restriction into SQL rather than
+    # loading every symbol's bars and discarding most in Python. With 17 tickers
+    # out of 520 that is ~30x less data crossing the DB boundary. Parameterized
+    # with ? placeholders (never string-interpolated) to stay injection-safe.
+    # When no --universe is given, inspect_symbols is the full DB set, so the
+    # unfiltered query is the intended scope and we add no IN clause.
+    content_params: list[str] = []
+    skip_content = False
+    if args.universe is not None:
+        if inspect_symbols:
+            # Non-empty universe: restrict to exactly those symbols. Parameterized
+            # with ? placeholders (never string-interpolated) to stay injection-safe.
+            placeholders = ", ".join(["?"] * len(inspect_symbols))
+            content_sql += f" AND symbol IN ({placeholders})"
+            content_params = inspect_symbols
+        else:
+            # Universe given but resolves to no symbols → nothing to fetch; skip
+            # rather than fall through to a full-DB scan that checks nothing.
+            skip_content = True
+    content_sql += " ORDER BY symbol, timestamp"
+
+    bars_by_symbol: dict[str, list[tuple[date, float, int]]] = {}
+    if not skip_content:
+        for sym, ts, close_val, volume_val in conn.execute(content_sql, content_params).fetchall():
+            # setdefault appends in query order, which is already chronological.
+            bars_by_symbol.setdefault(sym, []).append((ts.date(), close_val, volume_val))
+
+    # ZERO-VOLUME: (symbol, count) for symbols with one or more zero-volume bars.
+    zero_volume: list[tuple[str, int]] = []
+    # EXTREME-JUMP: one row per flagged jump, (symbol, date, prior, current, ratio).
+    extreme_jumps: list[tuple[str, date, float, float, float]] = []
+
+    for symbol in inspect_symbols:
+        bars = bars_by_symbol.get(symbol)
+        # No bars → already covered by the stale/short/missing sections above.
+        if not bars:
+            continue
+
+        zero_dates = find_zero_volume_bars(bars)
+        if zero_dates:
+            zero_volume.append((symbol, len(zero_dates)))
+
+        # Prefix each flagged jump with its symbol for the flat report table.
+        for jump_date, prior_close, current_close, ratio in find_extreme_jumps(bars):
+            extreme_jumps.append((symbol, jump_date, prior_close, current_close, ratio))
+
+    # -----------------------------------------------------------------------
     # Section a — STALE SYMBOLS.
     # -----------------------------------------------------------------------
     # Sort by most stale first so the worst offenders surface at the top.
@@ -283,6 +416,47 @@ def main() -> None:
     print()
 
     # -----------------------------------------------------------------------
+    # Section b2 — ZERO-VOLUME BARS (content check).
+    # -----------------------------------------------------------------------
+    # Sort worst-first so a symbol riddled with zero-volume bars surfaces on top.
+    zero_volume.sort(key=lambda row: row[1], reverse=True)
+
+    print(f"ZERO-VOLUME BARS (volume == 0): {len(zero_volume)} symbols affected")
+    print("-" * 70)
+    if zero_volume:
+        print(f"{'SYMBOL'.ljust(10)}{'ZERO-VOL BARS'.rjust(14)}")
+        for symbol, count in zero_volume:
+            print(f"{symbol.ljust(10)}{str(count).rjust(14)}")
+    else:
+        print("(none)")
+    print()
+
+    # -----------------------------------------------------------------------
+    # Section b3 — EXTREME CLOSE-TO-CLOSE JUMPS (content check).
+    # -----------------------------------------------------------------------
+    print(
+        f"EXTREME CLOSE-TO-CLOSE JUMPS "
+        f"(ratio outside [{EXTREME_JUMP_RATIO_LOW}, {EXTREME_JUMP_RATIO_HIGH}]): "
+        f"{len(extreme_jumps)}"
+    )
+    print("-" * 70)
+    if extreme_jumps:
+        # Columns: symbol, the date of the jump, the two closes, and the ratio.
+        print(
+            f"{'SYMBOL'.ljust(10)}{'DATE'.ljust(14)}"
+            f"{'PRIOR'.rjust(12)}{'CURRENT'.rjust(12)}{'RATIO'.rjust(10)}"
+        )
+        for symbol, jump_date, prior_close, current_close, ratio in extreme_jumps:
+            # 2dp on prices, 3dp on the ratio — enough to read a split (e.g. 0.250).
+            print(
+                f"{symbol.ljust(10)}{str(jump_date).ljust(14)}"
+                f"{prior_close:>12.2f}{current_close:>12.2f}{ratio:>10.3f}"
+            )
+    else:
+        print("(none)")
+    print()
+
+    # -----------------------------------------------------------------------
     # Section c — IN UNIVERSE BUT NOT IN DB (only when --universe given).
     # -----------------------------------------------------------------------
     if args.universe is not None:
@@ -318,17 +492,22 @@ def main() -> None:
         f"{distinct_symbols} symbols | "
         f"{len(stale)} stale | "
         f"{len(short_history)} short-history | "
-        f"{len(missing)} missing from DB"
+        f"{len(missing)} missing from DB | "
+        f"{len(zero_volume)} zero-vol | "
+        f"{len(extreme_jumps)} extreme-jump"
     )
     print("=" * 70)
 
     # -----------------------------------------------------------------------
     # Exit code — cron-friendly: zero means "nothing to do".
     # -----------------------------------------------------------------------
-    # Exit 1 when there is something the operator should act on (stale or
-    # missing); exit 0 otherwise.  Short-history is informational, not an
-    # alert, so it does not affect the exit code.
-    if stale or missing:
+    # Exit 1 when there is something the operator should act on. Two categories:
+    #   - freshness/coverage: stale or missing symbols (data is behind).
+    #   - data integrity: a zero-volume bar (a liquid name should never have one).
+    # extreme-jump is a heuristic that also fires on genuine extreme moves (e.g.
+    # GL's real -53% day), so it stays informational like short-history. Only
+    # unambiguous bad data hard-fails.
+    if should_alert(stale, missing, zero_volume):
         sys.exit(1)
 
 
