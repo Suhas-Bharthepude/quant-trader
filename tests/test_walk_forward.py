@@ -666,3 +666,83 @@ def test_wfv_buy_and_hold_known_monotonic_series():
 
     assert result.bh_return > 0.0  # monotonic uptrend → positive buy-and-hold
     assert result.bh_return == pytest.approx(expected_bh)
+
+
+# ---------------------------------------------------------------------------
+# Tests — fit_fn seam (per-fold strategy fitting)
+# ---------------------------------------------------------------------------
+
+
+def test_wfv_fit_fn_sees_only_train_window_each_fold():
+    """fit_fn is called once per fold, and the i-th call's bars are splits[i]'s TRAIN bars.
+
+    This is the no-lookahead linchpin for the fitting seam: a fitted strategy may
+    only ever see training data.  We record every argument fit_fn receives and
+    assert (a) it was called exactly n_folds times, and (b) the i-th argument is
+    splits[i][0] — the train bars, NOT the test bars and NOT the full train+test
+    window.  If fitting were ever handed the test slice (or the concatenated
+    full_bars), the test window would leak into parameter selection and the OOS
+    measurement would no longer be out-of-sample.
+    """
+    splits = walk_forward_splits(make_price_bars(30), train_size=20, test_size=5)
+    assert len(splits) == 2  # precondition: exactly the two designed folds
+
+    # Record the exact list handed to each fit_fn call.  The returned strategy is
+    # a fixed instance — this test pins WHAT fit_fn sees, not what it returns.
+    received: list[list[OHLCVBar]] = []
+    fixed = _AlwaysLong()
+
+    def fit_fn(train_bars: list[OHLCVBar]) -> Strategy:
+        received.append(train_bars)
+        return fixed
+
+    # The base `strategy` arg must be ignored when fit_fn is given; pass an SMA to
+    # prove the seam routes through fit_fn rather than the positional strategy.
+    walk_forward_validate(splits, SMACrossoverStrategy(5, 10), fit_fn=fit_fn)
+
+    # Called exactly once per fold — no extra calls, none skipped.
+    assert len(received) == len(splits)
+
+    # The i-th call must receive precisely fold i's TRAIN bars.  Comparing the
+    # full bar lists (OHLCVBar is a frozen dataclass with value equality) catches
+    # any off-by-one or wrong-slice regression: test bars or full_bars would fail.
+    for i, train_bars in enumerate(received):
+        assert train_bars == splits[i][0]
+
+
+def test_wfv_fit_fn_returned_strategy_is_the_one_used():
+    """The strategy fit_fn returns drives the OOS result — proven via the B&H invariant.
+
+    A fit_fn that returns _AlwaysLong() for every fold must make the strategy path
+    identical to the buy-and-hold benchmark (which is itself an always-long run over
+    each test window).  We pass SMACrossoverStrategy as the base `strategy` to prove
+    the base is ignored: if the seam used the base instead of fit_fn's return value,
+    the SMA path would diverge from the always-long benchmark and these equalities
+    would fail.  Reuses the always-long-equals-benchmark invariant.
+    """
+    splits = walk_forward_splits(make_price_bars(30), train_size=20, test_size=5)
+    result = walk_forward_validate(
+        splits,
+        SMACrossoverStrategy(5, 10),     # base strategy must be ignored
+        fit_fn=lambda train_bars: _AlwaysLong(),
+    )
+
+    # always-long strategy == always-long benchmark on every comparable axis.
+    assert result.oos_total_return == pytest.approx(result.bh_return)
+    assert result.oos_sharpe == pytest.approx(result.bh_sharpe)
+
+
+def test_wfv_fit_fn_none_matches_omitted():
+    """Passing fit_fn=None is identical to omitting it (backward-compat default path).
+
+    The existing 132 tests already exercise the default-None code path exhaustively;
+    one explicit equality is enough here to pin that the new keyword's default does
+    not perturb the established behaviour.
+    """
+    strategy = SMACrossoverStrategy(5, 10)
+    splits = walk_forward_splits(make_price_bars(30), train_size=20, test_size=5)
+
+    result_omitted = walk_forward_validate(splits, strategy)
+    result_none = walk_forward_validate(splits, strategy, fit_fn=None)
+
+    assert result_omitted.oos_total_return == pytest.approx(result_none.oos_total_return)

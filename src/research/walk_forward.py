@@ -17,6 +17,11 @@ data layer.  Separation of concerns: the caller is responsible for fetching bars
 This function's only job is to partition a pre-fetched bar list correctly.
 """
 
+# Callable types the fit_fn seam in walk_forward_validate: a per-fold factory
+# that takes that fold's train bars and returns a fitted Strategy.  Imported
+# from collections.abc (not typing) per the project's modern-typing convention.
+from collections.abc import Callable
+
 # OHLCVBar is the canonical in-memory representation of a single price bar,
 # defined in src/data/schema.py.  Importing it here keeps the function's type
 # annotations honest and lets callers import the type from one place rather
@@ -336,6 +341,7 @@ def walk_forward_validate(
     strategy: Strategy,
     backtester: Backtester | None = None,
     annualization_factor: int = 252,
+    fit_fn: Callable[[list[OHLCVBar]], Strategy] | None = None,
 ) -> WalkForwardResult:
     """Run a strategy over every test fold and return stitched OOS results.
 
@@ -355,12 +361,25 @@ def walk_forward_validate(
         strategy:             Any concrete Strategy instance.  generate_signals
                               is called over train+test bars per fold so that
                               indicators are warm before the test window begins.
+                              When fit_fn is provided, `strategy` is ignored —
+                              fit_fn supplies the per-fold strategy instead.
         backtester:           Backtester instance for scoring each fold.  When
                               None, defaults to Backtester(annualization_factor=
                               annualization_factor) so fold-level and stitched
                               Sharpe values use the same scaling factor.
         annualization_factor: Bars per year for Sharpe annualisation.  Defaults
                               to 252 (US trading days), matching Backtester.
+        fit_fn:               Optional per-fold strategy factory.  When None
+                              (default), the passed `strategy` is used unchanged
+                              on every fold — its training window serves only as
+                              an indicator warm-up region (current behaviour).
+                              When provided, fit_fn is called once per fold with
+                              that fold's TRAIN bars and must return a Strategy
+                              fitted to that window; the returned strategy is then
+                              warmed over train+test and scored on the test window
+                              exactly as the default path is.  fit_fn sees TRAIN
+                              bars only and signals are generated causally, so
+                              fitting introduces no lookahead into the test window.
 
     Returns:
         WalkForwardResult with per-fold BacktestResults, stitched OOS metrics,
@@ -443,21 +462,25 @@ def walk_forward_validate(
     for i, (train_bars, test_bars) in enumerate(splits):
 
         # ------------------------------------------------------------------
-        # SEAM — Day 22 parameter fitting replaces exactly this one line.
+        # SEAM — per-fold strategy selection.  This is now LIVE (fit_fn), not
+        # a future TODO.
         #
-        # TODAY:  fold_strategy = strategy
+        # fit_fn is None:  fold_strategy = strategy
         #   The strategy is used unchanged across every fold.  Training bars
         #   serve only as an indicator warm-up window (a 200-bar SMA needs
         #   ≥200 preceding bars before it emits a non-flat signal).
         #
-        # DAY 22: replace ONLY this line with:
-        #   fold_strategy = fit_fn(train_bars)
-        #   where fit_fn optimises strategy parameters on train_bars and
-        #   returns a new Strategy instance tuned to that fold's regime.
-        #   Everything below — full_bars concat, generate_signals, slice,
-        #   backtester.run — stays unchanged; the seam is one assignment.
+        # fit_fn provided: fold_strategy = fit_fn(train_bars)
+        #   fit_fn is called with THIS fold's train bars only and returns a
+        #   Strategy fitted to that window.  fitting sees train bars exclusively;
+        #   everything below — full_bars concat, generate_signals, slice,
+        #   backtester.run — is byte-identical to the default path, so the
+        #   fitted strategy is warmed over train+test yet scored only on the
+        #   test window.  Signals are generated causally (signals[i] uses only
+        #   bars[0..i]), so there is NO lookahead: fitting cannot see test bars
+        #   and the train prefix cannot leak forward into the test suffix.
         # ------------------------------------------------------------------
-        fold_strategy = strategy  # TODAY: no fitting; training window warms indicators only
+        fold_strategy = strategy if fit_fn is None else fit_fn(train_bars)
 
         # Concatenate train + test into one contiguous list so generate_signals
         # sees the full history needed to warm the indicator.  Without training
