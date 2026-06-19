@@ -50,6 +50,11 @@ from src.research.walk_forward import (
 # all-flat signals; the validator's warm run over train+test produces SIGNAL_LONG.
 from src.strategies.sma_crossover import SMACrossoverStrategy
 
+# Strategy/SIGNAL_LONG power the always-long stub used by the buy-and-hold
+# benchmark invariant test: a strategy that emits SIGNAL_LONG on every bar must
+# reproduce the benchmark exactly, since the benchmark IS an always-long run.
+from src.strategies.base import Strategy, SIGNAL_LONG
+
 
 # ---------------------------------------------------------------------------
 # Module-level helper
@@ -119,6 +124,24 @@ def make_price_bars(n: int, start: float = 100.0) -> list[OHLCVBar]:
         )
         for i in range(n)
     ]
+
+
+class _AlwaysLong(Strategy):
+    """Test stub strategy: emits SIGNAL_LONG on every bar (no warmup, no flat).
+
+    The buy-and-hold benchmark IS an always-long run over each test window, so an
+    always-long *strategy* must produce a stitched OOS identical to the benchmark.
+    This stub exists to pin that invariant: if the strategy and benchmark paths
+    ever used different windows or stitching, the equality would break.
+    """
+
+    @property
+    def name(self) -> str:
+        return "always-long"
+
+    def generate_signals(self, bars: list[OHLCVBar]) -> np.ndarray:
+        # One SIGNAL_LONG per bar; integer dtype to satisfy the engine's contract.
+        return np.full(len(bars), SIGNAL_LONG, dtype=np.int64)
 
 
 # ---------------------------------------------------------------------------
@@ -584,3 +607,62 @@ def test_wfv_fixed_strategy_seam():
         # Fold index must appear so individual folds are distinguishable in
         # a multi-fold comparison report.
         assert f"fold {i}" in fr.strategy_name
+
+
+# ---------------------------------------------------------------------------
+# Tests — buy-and-hold benchmark
+# ---------------------------------------------------------------------------
+
+
+def test_wfv_buy_and_hold_invariant_always_long_equals_benchmark():
+    """An always-long strategy's stitched OOS return AND sharpe equal the benchmark.
+
+    This is the strongest alignment check in the suite. The benchmark is itself an
+    always-long run over each test window, so a strategy that is also always-long
+    must reproduce it exactly — same windows, same warm-up exclusion, same seam-zero
+    stripping, same metrics. If the strategy path and the benchmark path were
+    measured over even slightly different windows, these equalities would fail and
+    Δ would be non-zero.
+    """
+    splits = walk_forward_splits(make_price_bars(30), train_size=20, test_size=5)
+    result = walk_forward_validate(splits, _AlwaysLong())
+
+    # Strategy OOS and benchmark must match on every comparable axis.
+    assert result.oos_total_return == pytest.approx(result.bh_return)
+    assert result.oos_sharpe == pytest.approx(result.bh_sharpe)
+    assert result.oos_max_drawdown == pytest.approx(result.bh_max_drawdown)
+
+    # Therefore the deltas the CLI prints are ~0 on both axes.
+    assert result.oos_total_return - result.bh_return == pytest.approx(0.0)
+    assert result.oos_sharpe - result.bh_sharpe == pytest.approx(0.0)
+
+
+def test_wfv_buy_and_hold_known_monotonic_series():
+    """On a monotonic-up series, B&H return is positive and equals the compounded
+    asset return over the stitched test windows.
+
+    make_price_bars(30) → closes 100..129. With train=20/test=5 (default step)
+    there are exactly 2 folds: fold 0 test closes 120→124, fold 1 test closes
+    125→129. Each fold contributes log(last_test / first_test) to the stitched log
+    return — the seam-zero strip drops only the first test bar's structural zero,
+    not any real return — so the benchmark equals (124/120)*(129/125) - 1.
+
+    The benchmark is always-long regardless of the strategy passed, so any strategy
+    yields the same bh_* values; SMACrossoverStrategy is used here only to exercise
+    the realistic code path.
+    """
+    bars = make_price_bars(30)
+    splits = walk_forward_splits(bars, train_size=20, test_size=5)
+    result = walk_forward_validate(splits, SMACrossoverStrategy(5, 10))
+
+    assert result.n_folds == 2  # precondition: exactly the two designed folds
+
+    # Independent expected value: compound each test window's first→last close ratio.
+    # This is the per-window buy-and-hold return chained across the disjoint folds.
+    expected_bh = 1.0
+    for _, test_bars in splits:
+        expected_bh *= test_bars[-1].close / test_bars[0].close
+    expected_bh -= 1.0
+
+    assert result.bh_return > 0.0  # monotonic uptrend → positive buy-and-hold
+    assert result.bh_return == pytest.approx(expected_bh)

@@ -34,7 +34,10 @@ from dataclasses import dataclass
 
 # Strategy is the abstract base that walk_forward_validate accepts so the
 # validator is not coupled to any specific concrete strategy implementation.
-from src.strategies.base import Strategy
+# SIGNAL_LONG is imported for the buy-and-hold benchmark: holding it on every
+# test bar makes the engine reproduce the asset's own per-bar returns over that
+# window, so the benchmark is computed by the exact same path as the strategy.
+from src.strategies.base import Strategy, SIGNAL_LONG
 
 # Backtester is the engine used to score each test fold.  Imported here so
 # walk_forward_validate can create a default instance when the caller passes None.
@@ -251,10 +254,77 @@ class WalkForwardResult:
     oos_max_drawdown: float       # worst peak-to-trough in oos_equity_curve, positive fraction
     oos_win_rate: float           # fraction of all OOS trades with return_pct > 0
 
+    # Buy-and-hold benchmark over the SAME stitched OOS test windows. Computed by
+    # running the identical per-fold backtest + stitch path with an always-long
+    # position (no signal), so these are directly comparable to the oos_* fields
+    # above — the only difference is the position series. This lets callers read
+    # edge vs beta: a strategy that merely tracks the asset shows oos_* ≈ bh_*,
+    # while a strategy adding real edge shows oos_* above the benchmark.
+    bh_return: float              # stitched B&H total return over the OOS test windows
+    bh_sharpe: float              # annualised B&H Sharpe over the same stitched returns
+    bh_max_drawdown: float        # worst peak-to-trough of the B&H stitched equity curve
+
     # Fold-level summary counts.
     n_folds: int                  # total number of (train, test) folds run
     n_folds_positive_sharpe: int  # folds where fold_result.sharpe_ratio > 0
     total_trades: int             # total completed trades across all folds
+
+
+# ---------------------------------------------------------------------------
+# _stitch_oos — fold-stitching + return-based metrics, shared by the strategy
+# path and the buy-and-hold benchmark.
+# ---------------------------------------------------------------------------
+
+def _stitch_oos(
+    per_fold: list[BacktestResult],
+    annualization_factor: int,
+) -> tuple[np.ndarray, np.ndarray, float, float, float]:
+    """Stitch per-fold test results into one OOS timeline and score it.
+
+    Returns (oos_returns, oos_equity_curve, total_return, sharpe, max_drawdown).
+
+    Factored out so the strategy path and the buy-and-hold benchmark are stitched
+    and scored by byte-identical code — the ONLY thing that differs between them
+    is the per-fold position series fed to the engine upstream. Duplicating this
+    logic would make the apples-to-apples guarantee rest on two copies never
+    drifting; a shared function makes it structural instead.
+    """
+    # Drop returns[0] from every fold before concatenating.
+    # Why: the engine always sets strategy_returns[0] = 0.0 because bar 0 of
+    # any run has no preceding signal to act on — it is a structural zero, not
+    # a real return observation.  That zero is correct inside a single backtest
+    # but becomes spurious noise at every fold seam when stitching: it would
+    # depress mean return and inflate std, corrupting the stitched Sharpe ratio.
+    # Stripping [0] from each fold leaves only genuine OOS return observations.
+    oos_returns = np.concatenate([fr.returns[1:] for fr in per_fold])
+
+    # Prepend 0.0 before cumsum so the equity curve starts at exp(0.0) = 1.0.
+    # Why 1.0: each per-fold equity curve also starts at 1.0 (Backtester uses
+    # initial_capital=1.0 by default); anchoring the stitched curve the same
+    # way makes total_return a comparable multiplier from a neutral base.
+    # Log returns are additive — log(A/B) + log(B/C) = log(A/C) — so cumsum
+    # over oos_returns gives the total log return up to each bar, and exp
+    # recovers the multiplicative equity growth factor at each point in time.
+    oos_equity_curve = np.exp(np.cumsum(np.concatenate([[0.0], oos_returns])))
+
+    # total_return: pass oos_equity_curve[0] as initial_capital so the metric
+    # measures growth from the curve's own starting value.  With the 0.0 anchor
+    # above, oos_equity_curve[0] == 1.0 always; we pass it explicitly rather
+    # than hardcoding 1.0 to respect metrics.total_return's contract that the
+    # caller supplies the reference capital.
+    oos_total_return = float(metrics.total_return(oos_equity_curve, oos_equity_curve[0]))
+
+    # sharpe: oos_returns contains no structural zeros — they were stripped
+    # above.  Pass the full array with NO [1:] slice; every element is a real
+    # OOS return observation that must enter the mean/std computation.  This is
+    # the "does not skip element 0" contract documented in metrics.sharpe_ratio.
+    oos_sharpe = metrics.sharpe_ratio(oos_returns, annualization_factor)
+
+    # max_drawdown: computed over the stitched equity curve so peak-to-trough
+    # declines that span multiple fold boundaries are captured correctly.
+    oos_max_drawdown = metrics.max_drawdown(oos_equity_curve)
+
+    return oos_returns, oos_equity_curve, oos_total_return, oos_sharpe, oos_max_drawdown
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +363,9 @@ def walk_forward_validate(
                               to 252 (US trading days), matching Backtester.
 
     Returns:
-        WalkForwardResult with per-fold BacktestResults and stitched OOS metrics.
+        WalkForwardResult with per-fold BacktestResults, stitched OOS metrics,
+        and a buy-and-hold benchmark (bh_return/bh_sharpe/bh_max_drawdown)
+        measured over the identical stitched test windows for edge-vs-beta reads.
 
     Raises:
         ValueError: splits is empty — no folds to evaluate.
@@ -363,6 +435,11 @@ def walk_forward_validate(
     # Accumulates one BacktestResult per fold in chronological (input) order.
     per_fold: list[BacktestResult] = []
 
+    # Parallel accumulator for the buy-and-hold benchmark — one BacktestResult
+    # per fold, scored on the identical test_bars but with an always-long
+    # position instead of the strategy's signals (see the benchmark block below).
+    bh_per_fold: list[BacktestResult] = []
+
     for i, (train_bars, test_bars) in enumerate(splits):
 
         # ------------------------------------------------------------------
@@ -417,52 +494,53 @@ def walk_forward_validate(
         # per_fold is chronological — required for correct OOS stitching below.
         per_fold.append(fold_result)
 
-    # ------------------------------------------------------------------
-    # 4. Stitch per-fold returns into one OOS returns array.
-    # ------------------------------------------------------------------
-
-    # Drop returns[0] from every fold before concatenating.
-    # Why: the engine always sets strategy_returns[0] = 0.0 because bar 0 of
-    # any run has no preceding signal to act on — it is a structural zero, not
-    # a real return observation.  That zero is correct inside a single backtest
-    # but becomes spurious noise at every fold seam when stitching: it would
-    # depress mean return and inflate std, corrupting the stitched Sharpe ratio.
-    # Stripping [0] from each fold leaves only genuine OOS return observations.
-    oos_returns = np.concatenate([fr.returns[1:] for fr in per_fold])
-
-    # ------------------------------------------------------------------
-    # 5. Build the stitched OOS equity curve.
-    # ------------------------------------------------------------------
-
-    # Prepend 0.0 before cumsum so the equity curve starts at exp(0.0) = 1.0.
-    # Why 1.0: each per-fold equity curve also starts at 1.0 (Backtester uses
-    # initial_capital=1.0 by default); anchoring the stitched curve the same
-    # way makes oos_total_return a comparable multiplier from a neutral base.
-    # Log returns are additive — log(A/B) + log(B/C) = log(A/C) — so cumsum
-    # over oos_returns gives the total log return up to each bar, and exp
-    # recovers the multiplicative equity growth factor at each point in time.
-    oos_equity_curve = np.exp(np.cumsum(np.concatenate([[0.0], oos_returns])))
+        # ------------------------------------------------------------------
+        # Buy-and-hold benchmark for THIS fold — same window, only the
+        # position series differs.
+        # ------------------------------------------------------------------
+        # SIGNAL_LONG on every test bar means "fully invested, no signal". Run it
+        # through the SAME backtester.run on the SAME test_bars, so the engine math
+        # and the resulting per-bar returns are byte-identical to the strategy path
+        # except for the constant position — which is exactly what makes the OOS-vs-
+        # B&H comparison apples-to-apples: same windows, same warm-up exclusion
+        # (test_bars only, so each fold's first-bar seam return is dropped for both),
+        # same seam-zero stripping at stitch time. The engine validates dtype 'i'
+        # and values in {-1,0,1}; np.full with SIGNAL_LONG satisfies both.
+        bh_signals = np.full(len(test_bars), SIGNAL_LONG, dtype=np.int64)
+        bh_result = backtester.run(
+            test_bars,
+            bh_signals,
+            strategy_name=f"buy-and-hold fold {i}",
+        )
+        bh_per_fold.append(bh_result)
 
     # ------------------------------------------------------------------
-    # 6. Compute stitched OOS scalar metrics.
+    # 4. Stitch per-fold returns into the OOS timeline and score it.
     # ------------------------------------------------------------------
 
-    # total_return: pass oos_equity_curve[0] as initial_capital so the metric
-    # measures growth from the curve's own starting value.  With the 0.0 anchor
-    # above, oos_equity_curve[0] == 1.0 always; we pass it explicitly rather
-    # than hardcoding 1.0 to respect metrics.total_return's contract that the
-    # caller supplies the reference capital.
-    oos_total_return = float(metrics.total_return(oos_equity_curve, oos_equity_curve[0]))
+    # _stitch_oos concatenates each fold's returns (seam-zero stripped), builds
+    # the equity curve anchored at 1.0, and computes total_return / sharpe /
+    # max_drawdown.  Same helper is used for the benchmark in step 5 so the two
+    # are guaranteed to use identical stitching and metric math.
+    (
+        oos_returns,
+        oos_equity_curve,
+        oos_total_return,
+        oos_sharpe,
+        oos_max_drawdown,
+    ) = _stitch_oos(per_fold, annualization_factor)
 
-    # sharpe: oos_returns contains no structural zeros — they were stripped in
-    # step 4.  Pass the full array with NO [1:] slice; every element is a real
-    # OOS return observation that must enter the mean/std computation.  This is
-    # the "does not skip element 0" contract documented in metrics.sharpe_ratio.
-    oos_sharpe = metrics.sharpe_ratio(oos_returns, annualization_factor)
+    # ------------------------------------------------------------------
+    # 5. Stitch the buy-and-hold benchmark over the IDENTICAL test windows.
+    # ------------------------------------------------------------------
 
-    # max_drawdown: computed over the stitched equity curve so peak-to-trough
-    # declines that span multiple fold boundaries are captured correctly.
-    oos_max_drawdown = metrics.max_drawdown(oos_equity_curve)
+    # Same helper, same annualization, same folds — only bh_per_fold's per-bar
+    # returns differ (always-long instead of strategy signals). We keep only the
+    # three scalar benchmark metrics; the benchmark's returns/equity arrays are
+    # not stored on the result (callers compare scalars, not curves).
+    _, _, bh_return, bh_sharpe, bh_max_drawdown = _stitch_oos(
+        bh_per_fold, annualization_factor
+    )
 
     # ------------------------------------------------------------------
     # 7. Aggregate trades across all folds.
@@ -504,6 +582,9 @@ def walk_forward_validate(
         oos_sharpe=oos_sharpe,
         oos_max_drawdown=oos_max_drawdown,
         oos_win_rate=oos_win_rate,
+        bh_return=bh_return,
+        bh_sharpe=bh_sharpe,
+        bh_max_drawdown=bh_max_drawdown,
         n_folds=n_folds,
         n_folds_positive_sharpe=n_folds_positive_sharpe,
         total_trades=total_trades,

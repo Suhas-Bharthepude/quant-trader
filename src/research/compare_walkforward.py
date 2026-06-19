@@ -422,6 +422,31 @@ def main() -> int:
             f"  pos_folds={pos_folds_str}  trades={result.total_trades}"
         )
 
+        # Buy-and-hold benchmark line, measured over the identical stitched test
+        # windows (same validator path, always-long position).  Printing it
+        # directly under OOS lets the reader compare the strategy to simply
+        # holding the asset at a glance — the "is this edge or just beta?" read.
+        bh_ret_str = f"{result.bh_return * 100:+.2f}%"
+        bh_sharpe_str = f"{result.bh_sharpe:.2f}"
+        bh_dd_str = f"{result.bh_max_drawdown * 100:.2f}%"
+        print(
+            f"  B&H  return={bh_ret_str}  sharpe={bh_sharpe_str}"
+            f"  max_dd={bh_dd_str}"
+        )
+
+        # Delta line: strategy − buy-and-hold.  Computed HERE (a display concern)
+        # rather than stored on the result, mirroring how oos_* formatting lives
+        # in the CLI.  Positive Δ means the strategy beat holding the asset over
+        # the same OOS windows; "+" format on both makes the sign explicit.  The
+        # label is padded so "return=" aligns under the OOS/B&H lines (Δ is one
+        # display column; four trailing spaces match the three-char OOS/B&H tags).
+        d_ret_str = f"{(result.oos_total_return - result.bh_return) * 100:+.2f}%"
+        d_sharpe_str = f"{result.oos_sharpe - result.bh_sharpe:+.2f}"
+        print(
+            f"  Δ    return={d_ret_str}  sharpe={d_sharpe_str}"
+            f"   (strategy − buy-and-hold)"
+        )
+
     # ------------------------------------------------------------------
     # 6. Guard: every symbol was skipped.
     # ------------------------------------------------------------------
