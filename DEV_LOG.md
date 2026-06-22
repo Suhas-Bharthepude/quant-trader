@@ -4,15 +4,40 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 27 — 2026-06-22
+
+**Worked on:** Added CI via GitHub Actions (.github/workflows/ci.yml) — runs `uv run pytest -q -m "not integration"` on every push and PR to main in a clean Ubuntu environment, excluding the 4 live-API/network integration tests (152 hermetic tests run in CI). Added a project CLAUDE.md encoding the engineering conventions (Strategy contract, verify-on-disk discipline, two-commit git flow, untracked-docs rule, scope limits).
+
+**Why it matters:** Moves test verification off conversational attestation onto machine-produced logs — the green check is machine truth, not a prose claim, and catches a lookahead or contract regression the moment it lands. CLAUDE.md makes every Claude Code session start aligned with the conventions instead of re-deriving them per prompt. Neither touches trading edge; both serve result integrity and portfolio credibility.
+
+**Architectural note:** No application or test code changed. CI is tests-only (no coverage gate, lint, or deploy). The `-m "not integration"` filter is the hermeticity boundary — live-API tests need secrets and would be a separate secret-gated job later.
+
+**Blocked on:** None.
+
+**Next up:** Wire TimeSeriesMomentumStrategy into the walk-forward / Optuna / overfitting-tax / buy-and-hold harness; add a transaction-cost model before any verdict.
+
+**Time spent:** 1.5 hours
 
 
 ## Day 26 — 2026-06-21
 
 **Worked on:** Added TimeSeriesMomentumStrategy (long/flat, monthly rebalance, 12-month default lookback) in src/strategies/time_series_momentum.py, matching the existing Strategy contract: list[OHLCVBar] → int8 np.ndarray, emitting only SIGNAL_LONG and SIGNAL_FLAT, with a FLAT warmup and no internal lag. Added 12 unit tests in tests/test_strategies.py (uptrend/downtrend/flat, warmup, output contract, long-flat-only, monthly cadence, no-lookahead, too-short raise, empty raise) — 156 tests green. SPY sanity check: flat through 2008–2009 and through 2022, long through the recoveries — the crisis-avoidance behavior TSMOM is supposed to show.
 
+
+**Worked on:** Added CI via GitHub Actions (.github/workflows/ci.yml) — runs `uv run pytest` on every push and PR to main in a clean Ubuntu environment. Added a project CLAUDE.md encoding the engineering conventions (Strategy contract, verify-on-disk discipline, two-commit git flow, untracked-docs rule, scope limits).
+
+
+
+
 **Why it matters:** First strategy with a real economic thesis (momentum), unlike the edgeless SMA dummy. It drops into the existing backtester/walk-forward harness with no contract change — the primitive the Optuna sweep, cost model, and B&H verdict all hang off.
 
+
+**Why it matters:** Moves test verification off conversational attestation onto machine-produced logs — the green check is machine truth now, not a prose claim. CLAUDE.md makes every Claude Code session start aligned with the conventions instead of re-deriving them per prompt.
+
 **Architectural note:** No internal shift: the backtester's signals[:-1] * returns[1:] is the only lag — each month-end's signal takes effect on its own month-end bar and is forward-filled across the following days. The final bar is forced to be a month-end by convention; this is inert for the backtest (the engine uses signals[:-1], so the last signal earns no return) but needs an exchange-calendar check before live execution, since "is the last bar a month-end" is undecidable from price data alone. It uses raw close, matching the engine, so the backtest is price-return, not total-return.
+
+**Architectural note:** No application or test code changed. CI is tests-only (no coverage gate, lint, or deploy). CLAUDE.md is tracked, unlike the intentionally-untracked trading_explained.md and daily_prompt.md.
+
 
 **Blocked on:** Nothing.
 
