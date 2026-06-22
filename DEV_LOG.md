@@ -4,6 +4,24 @@ Running log of development work. Most recent entry first.
 
 ---
 
+
+
+## Day 26 — 2026-06-21
+
+**Worked on:** Added TimeSeriesMomentumStrategy (long/flat, monthly rebalance, 12-month default lookback) in src/strategies/time_series_momentum.py, matching the existing Strategy contract: list[OHLCVBar] → int8 np.ndarray, emitting only SIGNAL_LONG and SIGNAL_FLAT, with a FLAT warmup and no internal lag. Added 12 unit tests in tests/test_strategies.py (uptrend/downtrend/flat, warmup, output contract, long-flat-only, monthly cadence, no-lookahead, too-short raise, empty raise) — 156 tests green. SPY sanity check: flat through 2008–2009 and through 2022, long through the recoveries — the crisis-avoidance behavior TSMOM is supposed to show.
+
+**Why it matters:** First strategy with a real economic thesis (momentum), unlike the edgeless SMA dummy. It drops into the existing backtester/walk-forward harness with no contract change — the primitive the Optuna sweep, cost model, and B&H verdict all hang off.
+
+**Architectural note:** No internal shift: the backtester's signals[:-1] * returns[1:] is the only lag — each month-end's signal takes effect on its own month-end bar and is forward-filled across the following days. The final bar is forced to be a month-end by convention; this is inert for the backtest (the engine uses signals[:-1], so the last signal earns no return) but needs an exchange-calendar check before live execution, since "is the last bar a month-end" is undecidable from price data alone. It uses raw close, matching the engine, so the backtest is price-return, not total-return.
+
+**Blocked on:** Nothing.
+
+**Next up:** Before any TSMOM-vs-B&H verdict, make the comparison honest: (1) total-return accounting — switch the signal AND the engine to adj_close together, never just one; (2) credit cash yield on flat periods (currently 0); (3) the transaction-cost model. Raw-close plus zero-cash currently flatters TSMOM vs an always-invested B&H. Then run TSMOM through walk-forward + Optuna + overfitting-tax + B&H, sizing folds against the 12-month lookback (a test fold needs multiple years to clear the 12-month warmup with usable post-warmup signal). Cross-sectional rotation stays a separate later phase (it breaks the per-symbol contract).
+
+**Time spent:** 1 hour
+
+---
+
 ## Day 25 — 2026-06-19
 
 **Worked on:** Built scripts/overfitting_tax.py — the CLI that runs the per-fold Optuna fitter (make_sma_optuna_fit_fn) against the fixed SMA(50,200) baseline across the full etf_basket and reports the overfitting tax. It mirrors compare_walkforward's loading (build_symbol_list / load_bars_for_symbols), builds each symbol's (train=504, test=126) splits ONCE and scores them twice on byte-identical windows — fixed (static SMA, no fit_fn) and fitted (fit_fn re-tuning fast/slow per fold by warm-only in-sample Sharpe) — then prints per-symbol Fixed OOS / Fitted OOS / B&H / mean in-sample / tax, plus a basket aggregate and two beat-counts. The only non-glue logic, summarize_tax (tax = mean per-fold in-sample Sharpe − stitched fitted OOS), is a pure function unit-tested in tests/test_overfitting_tax.py (the formula + the empty-fold guard). Full suite 144. Verified the harness against the committed baseline: every Fixed OOS value reproduces the Day-24 baseline run exactly across all 17 symbols, so the fitted column is trustworthy.
