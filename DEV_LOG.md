@@ -4,6 +4,67 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 28 — 2026-06-23
+
+## Day 28
+
+Worked on:
+- Added a transaction-cost model (fees + slippage, in basis points, charged
+  per unit of turnover) to the Backtester in src/backtest/engine.py. Both
+  fee_bps and slippage_bps default to 0.0, so a default Backtester is
+  cost-free and bit-for-bit identical to the pre-cost behavior; all 156 prior
+  tests stayed green unchanged.
+- Cost is a turnover-proportional log-return drag: held position is signals
+  shifted by one (the engine's existing one-bar lag), turnover is the absolute
+  per-bar change in held position, and cost = turnover * (fee+slippage)/10000.
+  Subtracted from gross returns in place, so equity, Sharpe, total return, and
+  max drawdown are all net.
+- Added total_cost_pct to BacktestResult (appended as the last field, default
+  0.0, so the second construction site in test_research_runner.py is untouched).
+- 7 new cost tests in tests/test_backtest.py (zero-cost identity, single round
+  trip = 2 units, holding = 1 unit, long-to-short flip = 3 units, costs lower
+  Sharpe and return, negative bps raise, fee+slippage add). 163 tests green.
+
+Why it matters:
+- This is the friction that turns a backtest from a fantasy into something
+  closer to honest. It is one of the three things (with adj_close total-return
+  accounting and cash-on-flat) that have to be in before any TSMOM-vs-B&H
+  verdict means anything.
+
+Architectural note:
+- Cost is charged as a linear log-return drag (turnover*cost_rate subtracted),
+  not the multiplicative (1 - turnover*cost_rate). At basis-point magnitudes
+  the gap is negligible (second order in the rate); the approximation's
+  validity is bounded by a small cost_rate, which realistic costs respect.
+- win_rate and Trade records stay GROSS; per-trade cost attribution is a
+  deliberately deferred scope boundary. Only the aggregate metrics are net.
+
+Verification:
+- SPY TSMOM(12) gross-vs-net sanity (one-off, not committed) at 3 bps total:
+  total return 3.1236 -> 3.1026, Sharpe 0.5300 -> 0.5281, max drawdown
+  unchanged, total_cost_pct 0.0051 over 9 round trips. Net strictly worse on
+  return and Sharpe, drawdown untouched, cost tiny - momentum's low turnover
+  means costs barely bite, which is the point.
+
+Blocked on:
+- Nothing.
+
+Next up:
+- DATA DEFECT found during the SPY sanity: SPY's stored history has a NaN
+  close on its final bar (2026-06-10; open and volume present, close and
+  adj_close NaN). It poisons total return and max drawdown to NaN on the full
+  series. Likely a stale/partial last-day fetch. Must re-fetch or clean SPY
+  AND audit the other 16 ETFs for the same NaN-tail before any verdict run.
+- ENGINE GAP: run() validates signal length/dtype/values but not finite
+  closes, so a NaN close silently produces NaN metrics. Add a finite-close
+  guard in run() with its own tests.
+- Then the remaining pre-verdict accounting: adj_close total-return (switch
+  signal and engine together), cash yield on flat periods. Then the full
+  walk-forward + Optuna + overfitting-tax + B&H run, folds sized against the
+  12-month lookback.
+
+Time spent: 1 hour
+
 ## Day 27 — 2026-06-22
 
 **Worked on:** Added CI via GitHub Actions (.github/workflows/ci.yml) — runs `uv run pytest -q -m "not integration"` on every push and PR to main in a clean Ubuntu environment, excluding the 4 live-API/network integration tests (152 hermetic tests run in CI). Added a project CLAUDE.md encoding the engineering conventions (Strategy contract, verify-on-disk discipline, two-commit git flow, untracked-docs rule, scope limits). 
