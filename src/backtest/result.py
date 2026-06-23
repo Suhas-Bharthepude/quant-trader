@@ -92,3 +92,11 @@ class BacktestResult:
     max_drawdown_pct: float = 0.0   # worst peak-to-trough decline as a positive fraction (0.20 → 20% drawdown)
     win_rate: float = 0.0           # fraction of trades with positive return_pct; 0.0 when n_trades == 0
     n_trades: int = 0               # len(trades); cached so callers don't recompute len() repeatedly
+
+    # Appended as the LAST field so the positional order of every existing
+    # field is unchanged — both construction sites (engine by keyword, and
+    # tests/test_research_runner.py which omits this field) keep working, the
+    # latter via this default.  Cumulative transaction cost charged over the
+    # run as a fraction of capital (0.0 when no costs are configured), matching
+    # the fraction convention of total_return_pct (0.25 == 25%).
+    total_cost_pct: float = 0.0

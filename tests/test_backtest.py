@@ -428,3 +428,204 @@ def test_result_is_immutable():
         # invalidate any analysis that already read it.  Frozen catches
         # that bug at write time.
         result.total_return_pct = 999.0
+
+
+# ---------------------------------------------------------------------------
+# Transaction-cost model
+#
+# Cost contract (from engine.run, block 4b):
+#   held[i]      = signals[i-1], held[0] = 0.0   (next-bar execution lag)
+#   turnover[i]  = |held[i] - held[i-1]|, turnover[0] = 0.0
+#   cost_returns = turnover * cost_rate          (per-bar log-return drag)
+#   net returns  = gross returns - cost_returns
+#   total_cost_pct = sum(cost_returns)           (fraction of capital)
+#   cost_rate    = (fee_bps + slippage_bps) / 10000.0
+# Every expected number below is derived by hand in the comments.
+# ---------------------------------------------------------------------------
+
+
+def test_zero_cost_is_identical_to_before():
+    """Backward-compat: default costs and explicit fee=slip=0 must be bit-identical."""
+
+    # A small series with both an entry and an exit so turnover is non-trivial:
+    # if zero-cost weren't a true no-op, a costed bar would diverge here.
+    bars = make_bars([100.0, 110.0, 105.0, 108.0])
+
+    # held = [0, 1, 1, 0] → turnover = [0, 1, 0, 1]: an entry at bar 1 and an
+    # exit at bar 3, so there ARE bars that would be charged if cost_rate > 0.
+    signals = np.array([1, 1, 0, 0], dtype=np.int8)
+
+    # Default constructor: fee_bps and slippage_bps default to 0.0, so this is
+    # the pre-cost code path — the behaviour every existing test pins down.
+    default_result = Backtester().run(bars, signals)
+
+    # Explicit zeros: must travel the same arithmetic and produce the same
+    # numbers.  Passing 0.0 explicitly should be indistinguishable from the
+    # default — that's the contract that keeps all 156 prior tests green.
+    explicit_zero_result = Backtester(fee_bps=0, slippage_bps=0).run(bars, signals)
+
+    # np.array_equal (exact, not approximate): with cost_rate == 0.0 the
+    # subtraction strategy_returns - cost_returns subtracts an all-zeros array,
+    # which must leave every element bit-for-bit unchanged — no tolerance.
+    assert np.array_equal(default_result.returns, explicit_zero_result.returns)
+
+    # And the reported cost must be exactly 0.0 on both runs — no cost was
+    # configured, so none can have been charged.
+    assert default_result.total_cost_pct == 0.0
+    assert explicit_zero_result.total_cost_pct == 0.0
+
+
+def test_single_round_trip_charges_two_units():
+    """flat→long→flat charges exactly two bars: the entry and the exit."""
+
+    # Four bars; prices are irrelevant to the cost arithmetic (cost depends
+    # only on turnover and cost_rate), so any strictly increasing series works.
+    bars = make_bars([100.0, 101.0, 102.0, 103.0])
+
+    # signals [1, 1, 0, 0] → held = signals shifted by one = [0, 1, 1, 0].
+    # turnover = |diff(held)| = [_, |1-0|, |1-1|, |0-1|] = [0, 1, 0, 1].
+    # So exactly two bars carry turnover: bar 1 (entry) and bar 3 (exit).
+    signals = np.array([1, 1, 0, 0], dtype=np.int8)
+
+    # fee_bps=100 → cost_rate = 100/10000 = 0.01, a round number that makes the
+    # hand-derived costs (0.01 per charged bar) trivial to read in the asserts.
+    bt = Backtester(fee_bps=100, slippage_bps=0)
+
+    # cost_rate sanity check — the rest of the test's hand math assumes 0.01.
+    assert bt.cost_rate == 0.01
+
+    # The costed run, plus a free run to diff against for the per-bar check.
+    costed = bt.run(bars, signals)
+    free = Backtester().run(bars, signals)
+
+    # total_cost = sum(turnover * cost_rate) = (1 + 1) * 0.01 = 0.02.  Exact
+    # float math here (0.01 + 0.01), so a tight 1e-12 tolerance is honest.
+    assert abs(costed.total_cost_pct - 2 * bt.cost_rate) < 1e-12
+
+    # Per-bar verification: gross minus net should equal the cost charged at
+    # each bar, i.e. turnover * cost_rate = [0, 0.01, 0, 0.01].  Charged only
+    # at the entry (bar 1) and exit (bar 3); zero on the flat bars.
+    expected_cost_per_bar = np.array([0.0, 0.01, 0.0, 0.01])
+
+    # free.returns - costed.returns isolates exactly the cost drag (the gross
+    # component is identical between the two runs), so it must match the hand
+    # array element-for-element within float noise.
+    assert np.allclose(free.returns - costed.returns, expected_cost_per_bar, atol=1e-12)
+
+
+def test_holding_charges_nothing_extra():
+    """Continuous long charges only the single entry bar — holding is free."""
+
+    # Four bars, prices irrelevant to cost (turnover-only), any series works.
+    bars = make_bars([100.0, 101.0, 102.0, 103.0])
+
+    # signals [1, 1, 1, 1] → held = [0, 1, 1, 1].
+    # turnover = |diff(held)| = [0, |1-0|, |1-1|, |1-1|] = [0, 1, 0, 0].
+    # Only bar 1 (the entry) carries turnover; bars 2 and 3 are pure holding.
+    signals = np.array([1, 1, 1, 1], dtype=np.int8)
+
+    # cost_rate = 0.01 again (fee_bps=100), for clean hand math.
+    bt = Backtester(fee_bps=100, slippage_bps=0)
+
+    costed = bt.run(bars, signals)
+    free = Backtester().run(bars, signals)
+
+    # total_cost = 1 entry * cost_rate = 0.01.  Holding adds nothing, so the
+    # total is one unit of turnover regardless of how many bars are held.
+    assert abs(costed.total_cost_pct - 1 * bt.cost_rate) < 1e-12
+
+    # The interior holding bars (indices 2 and 3) must show ZERO cost drag:
+    # free and net returns must be identical there.  This is the assertion
+    # that proves cost is charged on position CHANGES, not on exposure.
+    diff = free.returns - costed.returns
+    assert diff[2] == 0.0
+    assert diff[3] == 0.0
+
+
+def test_long_to_short_flip_charges_double():
+    """A long→short flip charges 2 units on the flip bar (close long + open short)."""
+
+    # Four bars, prices irrelevant to the cost arithmetic.
+    bars = make_bars([100.0, 101.0, 102.0, 103.0])
+
+    # signals [1, 1, -1, -1] → held = [0, 1, 1, -1].
+    # turnover = |diff(held)| = [0, |1-0|, |1-1|, |-1-1|] = [0, 1, 0, 2].
+    # Bar 1 enters long (1 unit); bar 3 flips long→short (2 units: exit the
+    # long AND enter the short).  Total turnover = 1 + 2 = 3.
+    signals = np.array([1, 1, -1, -1], dtype=np.int8)
+
+    # cost_rate = 0.01 (fee_bps=100) for readable hand math.
+    bt = Backtester(fee_bps=100, slippage_bps=0)
+
+    costed = bt.run(bars, signals)
+
+    # total_cost = 3 units * cost_rate = 3 * 0.01 = 0.03.  This is the path an
+    # SMA-style strategy hits when it legitimately flips sign without going
+    # flat in between, so the doubled flip charge must be exercised.
+    assert abs(costed.total_cost_pct - 3 * bt.cost_rate) < 1e-12
+
+
+def test_costs_lower_sharpe_and_total_return():
+    """On a profitable long series, costs strictly lower total return and don't raise Sharpe."""
+
+    # A profitable, varied long series.  Bar 1's return log(100.5/100)≈0.00499
+    # is well BELOW the mean of the per-bar returns, so charging cost there
+    # pushes that return further from the mean — lowering the mean AND raising
+    # the spread, which drives Sharpe down rather than up.
+    bars = make_bars([100.0, 100.5, 105.0, 110.0, 112.0])
+
+    # Long throughout → held = [0, 1, 1, 1, 1], turnover = [0, 1, 0, 0, 0]:
+    # a single entry charge at bar 1.  No shorts — this is a "long-only series."
+    signals = np.array([1, 1, 1, 1, 1], dtype=np.int8)
+
+    # Zero-cost baseline vs a positive-cost run.  fee_bps=10 → cost_rate=0.001,
+    # small but strictly positive so the drag is unambiguous.
+    free = Backtester().run(bars, signals)
+    costed = Backtester(fee_bps=10, slippage_bps=0).run(bars, signals)
+
+    # Strictly lower total return: a positive cost is subtracted from the
+    # cumulative log return, so net terminal equity must be below gross.
+    assert costed.total_return_pct < free.total_return_pct
+
+    # Sharpe must be no higher with costs.  We deliberately do NOT pin an exact
+    # value (Sharpe depends on the whole return distribution) — only the
+    # direction of the inequality is a robust, cost-driven guarantee.
+    assert costed.sharpe_ratio <= free.sharpe_ratio
+
+
+def test_negative_bps_raise():
+    """fee_bps and slippage_bps must be >= 0 — negatives are rejected at construction."""
+
+    # A negative fee would pay the strategy to trade, inflating returns — the
+    # constructor must reject it up front, same as the capital/annualization guards.
+    with pytest.raises(ValueError):
+        Backtester(fee_bps=-1)
+
+    # Slippage is likewise a cost that can never be negative; its guard mirrors
+    # the fee guard exactly, so a negative value must raise here too.
+    with pytest.raises(ValueError):
+        Backtester(slippage_bps=-1)
+
+
+def test_fee_and_slippage_add():
+    """Only the SUM of fee_bps + slippage_bps matters — the split is irrelevant."""
+
+    # Any series with some turnover so a non-zero cost is actually charged.
+    bars = make_bars([100.0, 101.0, 102.0, 103.0])
+
+    # held = [0, 1, 1, 0] → turnover [0, 1, 0, 1]: an entry and an exit, so
+    # total turnover is 2 and the run carries a non-zero cost to compare.
+    signals = np.array([1, 1, 0, 0], dtype=np.int8)
+
+    # Three different (fee, slippage) splits that all sum to 3 bps, hence all
+    # have cost_rate = 3/10000 = 0.0003.  Because the engine sums fee+slippage
+    # into a single cost_rate, the per-run total cost must be identical.
+    split = Backtester(fee_bps=1, slippage_bps=2).run(bars, signals)
+    all_fee = Backtester(fee_bps=3, slippage_bps=0).run(bars, signals)
+    all_slip = Backtester(fee_bps=0, slippage_bps=3).run(bars, signals)
+
+    # All three total costs must match exactly: the components enter the model
+    # only through their sum, so the split cannot change the charged amount.
+    # 1e-12 covers float-add noise (1+2 vs 3+0 vs 0+3 over /10000.0).
+    assert abs(split.total_cost_pct - all_fee.total_cost_pct) < 1e-12
+    assert abs(split.total_cost_pct - all_slip.total_cost_pct) < 1e-12

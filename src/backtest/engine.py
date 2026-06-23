@@ -11,8 +11,10 @@ This is the standard "next-bar execution" model used in vectorbt, backtrader,
 and academic backtests.  It's intentionally NOT lookahead: a signal at bar i
 cannot use information from bar i+1 or later.
 
-No transaction costs or slippage in this first version.  That's a Phase 3
-addition (risk module) — for now we measure raw strategy edge.
+Transaction costs (fees + slippage, expressed in basis points and charged
+per unit of turnover) are now modeled.  Both default to 0.0 — a default
+Backtester is cost-free — and when configured they are applied to the net
+per-bar returns, so every downstream metric reflects them.
 
 No position sizing — every signal is "100% of capital, long or short."
 Position sizing is also Phase 3.
@@ -52,7 +54,13 @@ from src.backtest import metrics
 class Backtester:
     """Run a single backtest from a list of bars and a signal array."""
 
-    def __init__(self, initial_capital: float = 1.0, annualization_factor: int = 252):
+    def __init__(
+        self,
+        initial_capital: float = 1.0,
+        annualization_factor: int = 252,
+        fee_bps: float = 0.0,
+        slippage_bps: float = 0.0,
+    ):
         """Configure the run.
 
         initial_capital defaults to 1.0 so the equity curve is a multiplier —
@@ -61,6 +69,11 @@ class Backtester:
 
         annualization_factor defaults to 252, the conventional number of US
         trading days per year, used to scale Sharpe from per-bar to annualized.
+
+        fee_bps and slippage_bps express transaction costs in basis points of
+        traded notional (1 bp = 0.0001).  Both default to 0.0 so a default
+        Backtester is cost-free and bit-for-bit identical to the pre-cost
+        behaviour; supply positive values to charge fees/slippage per turnover.
         """
         # Capital must be strictly positive — zero or negative capital is
         # nonsensical and would also produce NaNs/infs downstream when used
@@ -74,10 +87,32 @@ class Backtester:
         if annualization_factor <= 0:
             raise ValueError(f"annualization_factor must be > 0, got {annualization_factor}")
 
+        # Fees are a cost, never a credit: a negative fee would pay the strategy
+        # to trade, which is nonsensical and would inflate returns.  0.0 is
+        # allowed (the cost-free default); only strictly negative is rejected.
+        if fee_bps < 0:
+            raise ValueError(f"fee_bps must be >= 0, got {fee_bps}")
+
+        # Same guard for slippage: it is a cost charged on turnover and can
+        # never be negative.  0.0 stays valid so the default run is cost-free.
+        if slippage_bps < 0:
+            raise ValueError(f"slippage_bps must be >= 0, got {slippage_bps}")
+
         # Store both on the instance so run() can read them.  No mutation
         # after construction — Backtester is configured once and reused.
         self.initial_capital = initial_capital
         self.annualization_factor = annualization_factor
+
+        # Keep the raw bps inputs on the instance for introspection/reporting,
+        # so a caller can read back exactly what costs were configured.
+        self.fee_bps = fee_bps
+        self.slippage_bps = slippage_bps
+
+        # cost_rate is the total per-unit-turnover cost as a fraction.  Dividing
+        # bps by 10000 converts basis points to a fraction (10 bps -> 0.001).
+        # Fees and slippage are both charged per unit of turnover, so they sum
+        # into a single rate applied uniformly to each bar's position change.
+        self.cost_rate = (fee_bps + slippage_bps) / 10000.0
 
     def run(
         self,
@@ -171,6 +206,56 @@ class Backtester:
         # multiply.  Cast to float64 so the multiply produces float results
         # rather than truncating to int.
         strategy_returns[1:] = signals[:-1].astype(np.float64) * asset_returns[1:]
+
+        # ------------------------------------------------------------------
+        # 4b. Transaction costs — fees + slippage charged on position changes.
+        #     Computed AFTER the gross returns above and BEFORE the equity
+        #     curve below, so every downstream consumer reads NET returns.
+        #     With cost_rate == 0.0 (the default) every line here adds exactly
+        #     0.0, leaving strategy_returns bit-for-bit unchanged.
+        # ------------------------------------------------------------------
+
+        # held[i] is the position actually held over bar i.  Under next-bar
+        # execution that is signals[i-1] — the same lag the gross returns use
+        # (signals[:-1] aligned to asset_returns[1:]), so costs and returns
+        # are consistent by construction with no extra shift of our own.
+        held = np.zeros(len(bars), dtype=np.float64)
+
+        # held[1:] = signals[:-1] leaves held[0] = 0.0: we are flat on the
+        # first bar, matching strategy_returns[0] = 0.0 (no signal active yet).
+        held[1:] = signals[:-1].astype(np.float64)
+
+        # turnover[i] is the size of the position change at bar i, |Δheld|.
+        # Allocate-then-fill so turnover[0] stays 0.0 (no prior position to
+        # change from on the first bar).
+        turnover = np.zeros(len(bars), dtype=np.float64)
+
+        # np.abs(np.diff(held)) gives |held[i] - held[i-1]| for i >= 1.
+        # Entering a unit long is turnover 1, exiting is 1, and a long-to-short
+        # flip is 2 (close the long, open the short — two units of notional).
+        turnover[1:] = np.abs(np.diff(held))
+
+        # cost_returns[i] is the cost charged at bar i, expressed as a
+        # log-return drag: turnover scaled by the per-unit cost_rate.  This is
+        # a linear approximation of the multiplicative cost — we subtract
+        # turnover*cost_rate from the log return rather than multiplying gross
+        # by (1 - turnover*cost_rate).  At basis-point magnitudes the gap is
+        # negligible (second order in cost_rate), and staying linear makes the
+        # per-bar cost exactly additive and the total trivially auditable.
+        cost_returns = turnover * self.cost_rate
+
+        # Subtract the cost from the gross returns IN PLACE so everything below
+        # — equity curve, Sharpe, total return, max drawdown — consumes the NET
+        # array with no other change.  When cost_rate == 0.0, cost_returns is
+        # all zeros and this subtraction is a no-op (bit-for-bit identical).
+        strategy_returns = strategy_returns - cost_returns
+
+        # total_cost is the cumulative cost charged over the whole run, the sum
+        # of the per-bar drags.  total_return_pct is a FRACTION in this codebase
+        # (e.g. 0.25 == +25%), so total_cost is left as the raw sum with NO
+        # multiply by 100: it is the cumulative trading cost as a fraction of
+        # capital.  float() matches the stored-type convention of the metrics.
+        total_cost = float(cost_returns.sum())
 
         # ------------------------------------------------------------------
         # 5. Equity curve.  Working in log space avoids floating-point drift
@@ -273,6 +358,10 @@ class Backtester:
 
         # win_rate: full trades list passed; the function handles the no-trades
         # case internally, matching the old inline if/else exactly.
+        # NOTE: win_rate stays GROSS — it is computed from signal transitions
+        # and close prices with no per-trade cost.  Per-trade cost attribution
+        # is a deliberately deferred scope boundary; only the aggregate net
+        # metrics (Sharpe, total return, max drawdown, equity) reflect cost.
         win_rate = metrics.win_rate(trades)
 
         # n_trades is cached on the result so callers don't recompute len().
@@ -295,6 +384,10 @@ class Backtester:
             max_drawdown_pct=max_drawdown_pct,
             win_rate=win_rate,
             n_trades=n_trades,
+            # total_cost_pct carries the cumulative transaction cost as a
+            # fraction of capital; 0.0 when no costs are configured.  Passed by
+            # keyword (as every field here is) so field order is irrelevant.
+            total_cost_pct=total_cost,
         )
 
     # ------------------------------------------------------------------
