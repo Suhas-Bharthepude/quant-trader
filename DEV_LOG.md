@@ -6,11 +6,11 @@ Running log of development work. Most recent entry first.
 
 ## Day 27 — 2026-06-22
 
-**Worked on:** Added CI via GitHub Actions (.github/workflows/ci.yml) — runs `uv run pytest -q -m "not integration"` on every push and PR to main in a clean Ubuntu environment, excluding the 4 live-API/network integration tests (152 hermetic tests run in CI). Added a project CLAUDE.md encoding the engineering conventions (Strategy contract, verify-on-disk discipline, two-commit git flow, untracked-docs rule, scope limits).
+**Worked on:** Added CI via GitHub Actions (.github/workflows/ci.yml) — runs `uv run pytest -q -m "not integration"` on every push and PR to main in a clean Ubuntu environment, excluding the 4 live-API/network integration tests (152 hermetic tests run in CI). Added a project CLAUDE.md encoding the engineering conventions (Strategy contract, verify-on-disk discipline, two-commit git flow, untracked-docs rule, scope limits). 
 
-**Why it matters:** Moves test verification off conversational attestation onto machine-produced logs — the green check is machine truth, not a prose claim, and catches a lookahead or contract regression the moment it lands. CLAUDE.md makes every Claude Code session start aligned with the conventions instead of re-deriving them per prompt. Neither touches trading edge; both serve result integrity and portfolio credibility.
+**Why it matters:** Moves test verification off conversational attestation onto machine-produced logs — the green check is machine truth, not a prose claim, and catches a lookahead or contract regression the moment it lands. CLAUDE.md makes every Claude Code session start aligned with the conventions instead of re-deriving them per prompt. Neither touches trading edge; both serve result integrity and portfolio credibility. Made the four load_bars_for_symbols tests in test_cli_common.py hermetic via a tmp_path DuckDB fixture seeded with synthetic SPY/QQQ/AAPL bars (monkeypatching cli_common.DuckDBStore), after the first CI run surfaced that three silently depended on the local ingested DB and a fourth passed only because CI's DB was empty. CI now runs 152 hermetic tests green.
 
-**Architectural note:** No application or test code changed. CI is tests-only (no coverage gate, lint, or deploy). The `-m "not integration"` filter is the hermeticity boundary — live-API tests need secrets and would be a separate secret-gated job later.
+**Architectural note:** No application or test code changed. CI is tests-only (no coverage gate, lint, or deploy). The `-m "not integration"` filter is the hermeticity boundary — live-API tests need secrets and would be a separate secret-gated job later. The first red CI run did its job: it caught three tests that were integration tests in disguise (depending on un-versioned local DB state) and fixed them by isolating the DB, not by tagging them out, so the logic stays covered in CI.
 
 **Blocked on:** None.
 
