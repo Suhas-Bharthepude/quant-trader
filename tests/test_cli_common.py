@@ -7,28 +7,121 @@ Tests 1-6 (build_symbol_list) are pure: no DuckDB, no network — the function
 takes plain strings and a limit integer and returns a list.  They run in
 milliseconds and can be run in isolation.
 
-Tests 7-10 (load_bars_for_symbols) hit real DuckDB and assume the "test"
-universe (SPY, QQQ, AAPL, MSFT, NVDA) has been ingested.  They are
-integration tests in the sense of touching the filesystem, but still fast
-because DuckDB reads are in-process and the test universe is small.
+Tests 7-10 (load_bars_for_symbols) are hermetic: the hermetic_db fixture
+builds a temporary DuckDB seeded with SPY/QQQ/AAPL and monkeypatches
+cli_common.DuckDBStore to point at it, so they pass in a clean CI checkout
+without any ingested data/quant_trader.duckdb on disk.
 
 Run with:
     uv run pytest tests/test_cli_common.py -v
 """
 
-# pytest is the test runner; no fixtures are used here — plain functions
-# keep the test bodies readable without fixture-lookup indirection.
+# pytest is the test runner.  The build_symbol_list tests below are plain
+# functions; the load_bars_for_symbols tests share the hermetic_db fixture
+# defined further down so the temp-DB-and-monkeypatch setup lives in one place.
 import pytest
+
+# functools.partial binds the temp DB path to the real DuckDBStore class so the
+# no-argument `DuckDBStore()` call inside load_bars_for_symbols resolves to our
+# temporary file — see the hermetic_db fixture for why this is the seam we patch.
+import functools
+
+# datetime/timezone build the tz-aware UTC timestamps the synthetic bars require.
+# OHLCVBar's contract is UTC-aware timestamps, and DuckDBStore floors 1d bars to
+# midnight UTC on write, so naive or non-UTC datetimes would be wrong here.
+from datetime import datetime, timezone
 
 # The two functions under test.  Importing by name ties the test module to
 # the public API of cli_common rather than to its internal structure.
 from src.research.cli_common import build_symbol_list, load_bars_for_symbols
+
+# The cli_common module object itself — needed as the monkeypatch target.
+# load_bars_for_symbols looks up DuckDBStore via this module's globals at call
+# time, so patching cli_common.DuckDBStore (not the symbol imported into this
+# test module) is what actually redirects the function to the temp DB.
+from src.research import cli_common
+
+# DuckDBStore is the real persistence class.  The fixture builds the temp DB
+# through it (so the schema is created from the real CREATE_TABLE_SQL and cannot
+# drift) and partial-binds it as the monkeypatch replacement.
+from src.data.duckdb_store import DuckDBStore
+
+# OHLCVBar is the typed bar the synthetic fixture rows are constructed from —
+# imported from the schema module so the test uses the exact production type.
+from src.data.schema import OHLCVBar
 
 # load_universe is used as the reference oracle in the universe-path tests
 # (tests 5 and 6) so we compare against the live config rather than
 # hardcoding symbol names — if the "test" universe is ever updated the
 # tests adapt automatically without code changes.
 from src.data.universe import load_universe
+
+
+# ---------------------------------------------------------------------------
+# Hermetic DuckDB fixture for the load_bars_for_symbols tests
+# ---------------------------------------------------------------------------
+
+
+def _synthetic_bars(symbol: str) -> list[OHLCVBar]:
+    """Build a few trivial-but-valid daily bars for one symbol.
+
+    Three DISTINCT calendar dates (2021-01-04/05/06) so that DuckDBStore's
+    midnight-UTC floor on 1d bars never collapses two rows onto the same
+    (symbol, timestamp, timeframe) primary key and silently drops one.  The
+    dates sit inside the 2021-01-01 → 2026-05-14 window the tests query, so
+    read_bars returns them.  Prices are flat placeholders — these tests assert
+    on dict keys/skip/order, never on bar values, so the OHLC numbers only need
+    to be present and valid, not realistic.
+    """
+    return [
+        # timeframe="1d" matches read_bars' default filter; source="test" marks
+        # the row as fixture data.  timestamps are tz-aware UTC per OHLCVBar's
+        # contract (naive datetimes are rejected upstream at fetch time).
+        OHLCVBar(
+            symbol=symbol,
+            timestamp=datetime(2021, 1, day, tzinfo=timezone.utc),
+            open=1.0,
+            high=1.0,
+            low=1.0,
+            close=1.0,
+            adj_close=1.0,
+            volume=100,
+            timeframe="1d",
+            source="test",
+        )
+        for day in (4, 5, 6)
+    ]
+
+
+@pytest.fixture
+def hermetic_db(tmp_path, monkeypatch):
+    """Point load_bars_for_symbols at a temp DuckDB containing SPY/QQQ/AAPL.
+
+    Makes the DB-backed tests hermetic: they no longer depend on a real ingested
+    data/quant_trader.duckdb, so they run (and pass for the right reason) in a
+    clean CI checkout.  Returns nothing — the tests just need the fixture active.
+    """
+
+    # A real file (not :memory:) under pytest's per-test tmp_path, so the
+    # partial-bound DuckDBStore() opens the same database the fixture populated.
+    db_path = tmp_path / "test.duckdb"
+
+    # Build the temp DB through the REAL DuckDBStore: __init__ runs the real
+    # CREATE_TABLE_SQL, so the ohlcv_bars schema is created by construction and
+    # cannot drift from production.  write_bars inserts the synthetic rows for
+    # the three known symbols; ZZZZ_NOT_A_REAL_SYMBOL / FAKE1 / FAKE2 are
+    # deliberately never inserted so the skip / all-missing paths are exercised.
+    with DuckDBStore(str(db_path)) as store:
+        for symbol in ("SPY", "QQQ", "AAPL"):
+            store.write_bars(_synthetic_bars(symbol))
+
+    # Patch the DuckDBStore name in cli_common's namespace — NOT load_bars_for_
+    # symbols itself.  partial pre-binds the temp path, so the function's
+    # intentional no-argument `DuckDBStore()` call now opens our temp file.
+    # monkeypatch auto-reverts after the test, restoring the real default path.
+    monkeypatch.setattr(
+        cli_common, "DuckDBStore", functools.partial(DuckDBStore, str(db_path))
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -108,16 +201,16 @@ def test_build_symbol_list_from_universe_no_limit_overflow():
 
 
 # ---------------------------------------------------------------------------
-# Tests for load_bars_for_symbols — real DuckDB I/O (test universe required)
+# Tests for load_bars_for_symbols — hermetic DuckDB via the hermetic_db fixture
 # ---------------------------------------------------------------------------
 
 
-def test_load_bars_returns_dict_for_known_symbols():
+def test_load_bars_returns_dict_for_known_symbols(hermetic_db):
     """Known symbols produce a dict with one non-empty bars list per symbol."""
 
-    # SPY and QQQ are both in the test universe and have been ingested, so
-    # both keys must appear in the result.  Non-empty bars confirms the read
-    # actually found rows rather than returning a placeholder empty list.
+    # SPY and QQQ are both seeded into the temp DB by hermetic_db, so both keys
+    # must appear in the result.  Non-empty bars confirms the read actually
+    # found rows rather than returning a placeholder empty list.
     result = load_bars_for_symbols(["SPY", "QQQ"], "2021-01-01", "2026-05-14")
 
     assert set(result.keys()) == {"SPY", "QQQ"}
@@ -125,10 +218,10 @@ def test_load_bars_returns_dict_for_known_symbols():
     assert len(result["QQQ"]) > 0
 
 
-def test_load_bars_skips_missing_symbol():
+def test_load_bars_skips_missing_symbol(hermetic_db):
     """A symbol absent from DuckDB is silently skipped; present symbols are unaffected."""
 
-    # ZZZZ_NOT_A_REAL_SYMBOL will never be in DuckDB.  If load_bars_for_symbols
+    # ZZZZ_NOT_A_REAL_SYMBOL is never seeded into the temp DB.  If load_bars_for_symbols
     # raised on a missing symbol, a 25-symbol sweep would abort because one
     # ticker was not yet ingested — unacceptable for large universes.
     # The correct behaviour is: skip and log, keep going.
@@ -144,7 +237,7 @@ def test_load_bars_skips_missing_symbol():
     assert "ZZZZ_NOT_A_REAL_SYMBOL" not in result
 
 
-def test_load_bars_preserves_input_order():
+def test_load_bars_preserves_input_order(hermetic_db):
     """Returned dict keys appear in the same order as the input symbol list."""
 
     # Python dicts preserve insertion order (3.7+), and the function inserts
@@ -161,13 +254,18 @@ def test_load_bars_preserves_input_order():
     assert list(result.keys()) == ["QQQ", "SPY", "AAPL"]
 
 
-def test_load_bars_all_missing_returns_empty_dict():
+def test_load_bars_all_missing_returns_empty_dict(hermetic_db):
     """When every symbol is absent from DuckDB the return value is an empty dict, not an error."""
 
     # The caller (compare_universe, compare_matrix) owns the "no bars found"
     # error message and the return-1.  This function's job is to collect what
     # data exists and hand it back — raising here would force every caller to
     # wrap the call in a try/except just to print a one-liner error.
+    #
+    # hermetic_db seeds the temp DB with SPY/QQQ/AAPL but NOT FAKE1/FAKE2, so the
+    # empty result here proves "these specific symbols have no rows" — the real
+    # behaviour — rather than the accidental pass you'd get from an empty/missing
+    # database where every lookup trivially returns nothing.
     result = load_bars_for_symbols(
         ["FAKE1", "FAKE2"], "2021-01-01", "2026-05-14"
     )
