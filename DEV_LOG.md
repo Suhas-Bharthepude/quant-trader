@@ -8,7 +8,7 @@ Running log of development work. Most recent entry first.
 
 ## Day 28
 
-Worked on:
+**Worked on:**
 - Added a transaction-cost model (fees + slippage, in basis points, charged
   per unit of turnover) to the Backtester in src/backtest/engine.py. Both
   fee_bps and slippage_bps default to 0.0, so a default Backtester is
@@ -25,13 +25,13 @@ Worked on:
   trip = 2 units, holding = 1 unit, long-to-short flip = 3 units, costs lower
   Sharpe and return, negative bps raise, fee+slippage add). 163 tests green.
 
-Why it matters:
+**Why it matters:**
 - This is the friction that turns a backtest from a fantasy into something
   closer to honest. It is one of the three things (with adj_close total-return
   accounting and cash-on-flat) that have to be in before any TSMOM-vs-B&H
   verdict means anything.
 
-Architectural note:
+**Architectural note:**
 - Cost is charged as a linear log-return drag (turnover*cost_rate subtracted),
   not the multiplicative (1 - turnover*cost_rate). At basis-point magnitudes
   the gap is negligible (second order in the rate); the approximation's
@@ -39,17 +39,17 @@ Architectural note:
 - win_rate and Trade records stay GROSS; per-trade cost attribution is a
   deliberately deferred scope boundary. Only the aggregate metrics are net.
 
-Verification:
+**Verification:**
 - SPY TSMOM(12) gross-vs-net sanity (one-off, not committed) at 3 bps total:
   total return 3.1236 -> 3.1026, Sharpe 0.5300 -> 0.5281, max drawdown
   unchanged, total_cost_pct 0.0051 over 9 round trips. Net strictly worse on
   return and Sharpe, drawdown untouched, cost tiny - momentum's low turnover
   means costs barely bite, which is the point.
 
-Blocked on:
+**Blocked on:**
 - Nothing.
 
-Next up:
+**Next up:**
 - DATA DEFECT found during the SPY sanity: SPY's stored history has a NaN
   close on its final bar (2026-06-10; open and volume present, close and
   adj_close NaN). It poisons total return and max drawdown to NaN on the full
@@ -63,11 +63,11 @@ Next up:
   walk-forward + Optuna + overfitting-tax + B&H run, folds sized against the
   12-month lookback.
 
-Time spent: 1 hour
+**Time spent:** 1 hour
 
 ## Day 27 — 2026-06-22
 
-**Worked on:** Added CI via GitHub Actions (.github/workflows/ci.yml) — runs `uv run pytest -q -m "not integration"` on every push and PR to main in a clean Ubuntu environment, excluding the 4 live-API/network integration tests (152 hermetic tests run in CI). Added a project CLAUDE.md encoding the engineering conventions (Strategy contract, verify-on-disk discipline, two-commit git flow, untracked-docs rule, scope limits). 
+**Worked on:** Added CI via GitHub Actions (.github/workflows/ci.yml) — runs `uv run pytest -q -m "not integration"` on every push and PR to main in a clean Ubuntu environment, excluding the 4 live-API/network integration tests (152 hermetic tests run in CI). Added a project CLAUDE.md encoding the engineering conventions (Strategy contract, verify-on-disk discipline, two-commit git flow, untracked-docs rule, scope limits).
 
 **Why it matters:** Moves test verification off conversational attestation onto machine-produced logs — the green check is machine truth, not a prose claim, and catches a lookahead or contract regression the moment it lands. CLAUDE.md makes every Claude Code session start aligned with the conventions instead of re-deriving them per prompt. Neither touches trading edge; both serve result integrity and portfolio credibility. Made the four load_bars_for_symbols tests in test_cli_common.py hermetic via a tmp_path DuckDB fixture seeded with synthetic SPY/QQQ/AAPL bars (monkeypatching cli_common.DuckDBStore), after the first CI run surfaced that three silently depended on the local ingested DB and a fourth passed only because CI's DB was empty. CI now runs 152 hermetic tests green.
 
@@ -389,7 +389,7 @@ Time spent: 1 hour
 **Why it matters:** This was the first proof that the bot can actually do the one thing it exists to do — place a trade. Everything before this was setup; this was the moment it became real. The multiple safety checks (paper-mode lock, account verification, typing "yes" twice) are deliberate: one mistaken click in a live trading system can cost real money instantly, so the guards have to be there from the very first order.
 **Blocked on / Bugs:** API key accidentally visible in a dashboard screenshot — immediately regenerated keys and updated `.env`.
 **Next up:** Day 7 — limit orders, order cancellation, querying order history.
-**Time spent:** — 1 hour 
+**Time spent:** — 1 hour
 
 ---
 
