@@ -4,6 +4,85 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 30
+
+**Worked on:**
+- Added a configurable price basis to the Backtester so returns can be computed
+  from close (price return, the existing behavior) or adj_close (total return,
+  dividends and splits folded in). New price_field parameter on
+  Backtester.__init__, last positional, defaulting to "close"; validated against
+  {"close","adj_close"} with a ValueError and no silent fallback; run() now
+  builds the price array via getattr(b, self.price_field). _make_trade was not
+  touched - it reads fill prices off the passed-in array, so trade fills inherit
+  the basis automatically. [+4 tests]
+- Mirrored the same change onto TimeSeriesMomentumStrategy: a price_field
+  parameter (last, default "close", same validation), generate_signals now reads
+  getattr(bar, self.price_field), and the name property appends the basis only
+  for the non-default case - "TSMOM(12)" stays byte-identical, "TSMOM(12,
+  adj_close)" for the adj_close basis. [+1 test]
+- Buy-and-hold required no change: it runs an all-long signal through the same
+  Backtester, so it inherits the engine's price basis for free and stays
+  apples-to-apples with the strategy by construction.
+- 174 tests green (was 169).
+
+**Why it matters:**
+- adj_close total-return accounting is one of the three pre-verdict items the
+  momentum verdict is blocked on (transaction costs landed Day 28; this is total
+  return; cash-on-flat is next). Using raw close ignores dividends, which
+  understates a buy-and-hold investor's real return and biases any
+  strategy-vs-buy-and-hold comparison. This adds the capability without yet
+  flipping the basis.
+
+**Architectural note:**
+- Built as a configurable basis defaulting to "close", NOT a hard switch, so all
+  prior results stay bit-for-bit reproducible and every existing test stays
+  green. The verdict run will opt into "adj_close" explicitly.
+- The basis is set in TWO disconnected places - the Backtester and the strategy
+  - because the engine and strategy are intentionally decoupled (the engine does
+  not know which strategy produced the signals). There is no single threading
+  point; consistency is enforced at the CALL SITE that constructs both for a run.
+  The footgun: a future call site that forgets to pass adj_close to both silently
+  gets price return. Mitigation deferred to verdict day - the entry point will
+  pass the same basis to both explicitly, and the proof tests ensure the
+  adj_close path genuinely differs so a silent no-op would be caught.
+- SMA crossover still reads close and would need the same parameter for a
+  consistent basis across strategies; scoped as a small follow-on, not today, to
+  keep this change on the momentum path heading for a verdict.
+
+**Verification:**
+- Engine: prior 169 plus 4 new = 173 green on the full suite. Default and
+  explicit "close" produce bit-identical returns (np.array_equal); invalid
+  price_field raises; diverging close vs adj_close data yields different
+  total_return_pct (>1e-6); identical data through either basis yields identical
+  returns (so the difference is data-driven, not flag-driven).
+- Strategy: 173 plus 1 new = 174 green on the full suite. name property prints
+  "TSMOM(12)" for the default and "TSMOM(12, adj_close)" for the adj_close basis
+  (verified live). The proof test constructs an increasing close path (LONG
+  basis) against a decreasing-but-positive adj_close path (FLAT basis) so every
+  warmed-up month-end's trailing-return sign flips between bases, and asserts the
+  two signal arrays are not array-equal.
+- Two code commits, both two-file and additive: "Add configurable price basis to
+  backtester" and "Add configurable price basis to time-series momentum".
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- Cash-on-flat accounting: model a short-term interest rate earned while the
+  strategy is FLAT (out of the market), which currently earns nothing - the last
+  pre-verdict accounting item.
+- Then wire price_field through the verdict path (walk_forward_validate / the
+  overfitting-tax CLI), passing the SAME basis to both the engine and the
+  strategy explicitly - the footgun mitigation.
+- Optional operational step still pending: re-fetch the basket to un-stale it
+  (blocks nothing).
+- Then momentum through the full harness (walk-forward + Optuna + overfitting tax
+  + buy-and-hold) on adj_close after costs, folds sized against the 12-month
+  lookback, judged on drawdown and downside, not just Sharpe.
+- SMA crossover price_field for a consistent basis across strategies.
+
+**Time spent:** [fill in]
+
 ## Day 29
 
 **Worked on:**
