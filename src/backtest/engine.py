@@ -176,6 +176,36 @@ class Backtester:
         closes = np.array([b.close for b in bars], dtype=np.float64)
 
         # ------------------------------------------------------------------
+        # 2b. Validate close prices.  A close that is non-finite (NaN or
+        #     +/- infinity) or not strictly positive (<= 0) cannot produce a
+        #     valid log return: np.log(closes[1:] / closes[:-1]) below would
+        #     yield NaN (from a NaN or 0/0), -inf (from log of 0), or a
+        #     domain error (from log of a negative), silently poisoning every
+        #     downstream return, metric, and trade.  Reject the run here so a
+        #     corrupt bar surfaces as a clear ValueError instead of a quiet NaN.
+        # ------------------------------------------------------------------
+
+        # bad_closes[i] is True when closes[i] is unusable: not finite OR not
+        # strictly positive.  ~np.isfinite catches NaN and +/- inf; the
+        # `closes <= 0` arm catches zero and negative prices (also non-loggable).
+        bad_closes = ~np.isfinite(closes) | (closes <= 0)
+
+        # .any() collapses the mask to a single bool — only build the error
+        # message (and pay for np.where) when at least one close is bad.
+        if bad_closes.any():
+            # np.where returns the indices where the mask is True; [0][0] is the
+            # FIRST such index, the most useful one to report for debugging.
+            first_bad = int(np.where(bad_closes)[0][0])
+            # Mirror the other guards' style: state the count and pinpoint the
+            # first offender by index and its bar timestamp so the caller can
+            # locate the corrupt row in the source data immediately.
+            raise ValueError(
+                f"closes must be finite and strictly positive; found "
+                f"{int(bad_closes.sum())} bad value(s), first at index {first_bad} "
+                f"(timestamp {bars[first_bad].timestamp}, close {closes[first_bad]})"
+            )
+
+        # ------------------------------------------------------------------
         # 3. Per-bar log returns of the underlying asset.
         #    asset_returns[i] = log(closes[i] / closes[i-1]) for i >= 1.
         #    asset_returns[0] = 0.0 — no prior bar to compare against.

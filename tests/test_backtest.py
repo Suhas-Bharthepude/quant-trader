@@ -176,6 +176,89 @@ def test_backtester_validates_signal_values():
         Backtester().run(bars, signals)
 
 
+def test_backtester_rejects_nan_close():
+    """A NaN close must raise — it cannot produce a valid log return."""
+
+    # Three bars where the middle close is NaN.  A NaN close would propagate
+    # through np.log(closes[1:] / closes[:-1]) into the returns series; the
+    # finite-close guard catches it before any math runs.
+    bars = make_bars([100.0, float("nan"), 102.0])
+
+    # All-flat, correctly-sized int8 signals: length/dtype/value checks pass,
+    # so the only thing that can trip is the new finite-close guard.
+    signals = np.array([SIGNAL_FLAT, SIGNAL_FLAT, SIGNAL_FLAT], dtype=np.int8)
+
+    # ValueError, same exception surface as the other input-shape guards.
+    with pytest.raises(ValueError):
+        Backtester().run(bars, signals)
+
+
+def test_backtester_rejects_infinite_close():
+    """An infinite close must raise — log of inf is not a usable return."""
+
+    # Three bars where one close is +inf.  ~np.isfinite in the guard flags
+    # both NaN and +/- infinity, so this case exercises the infinity arm.
+    bars = make_bars([100.0, float("inf"), 102.0])
+
+    # Correctly-sized flat signals so only the finite-close guard can fire.
+    signals = np.array([SIGNAL_FLAT, SIGNAL_FLAT, SIGNAL_FLAT], dtype=np.int8)
+
+    # ValueError, uniform with the rest of the validation surface.
+    with pytest.raises(ValueError):
+        Backtester().run(bars, signals)
+
+
+def test_backtester_rejects_zero_close():
+    """A zero close must raise — log(0) is -inf, not a valid return."""
+
+    # Three bars where one close is exactly 0.0.  Zero is finite, so it slips
+    # past the isfinite check; the `closes <= 0` arm of the guard is what
+    # catches it (a ratio through 0 yields 0/0 -> NaN or log(0) -> -inf).
+    bars = make_bars([100.0, 0.0, 102.0])
+
+    # Correctly-sized flat signals so only the finite-close guard can fire.
+    signals = np.array([SIGNAL_FLAT, SIGNAL_FLAT, SIGNAL_FLAT], dtype=np.int8)
+
+    # ValueError, same as the other guards.
+    with pytest.raises(ValueError):
+        Backtester().run(bars, signals)
+
+
+def test_backtester_rejects_negative_close():
+    """A negative close must raise — a price below zero is non-physical and non-loggable."""
+
+    # Three bars where one close is negative.  Negatives are finite, so the
+    # `closes <= 0` arm (not isfinite) is what rejects them; log of a negative
+    # is a domain error that would otherwise corrupt the returns silently.
+    bars = make_bars([100.0, -5.0, 102.0])
+
+    # Correctly-sized flat signals so only the finite-close guard can fire.
+    signals = np.array([SIGNAL_FLAT, SIGNAL_FLAT, SIGNAL_FLAT], dtype=np.int8)
+
+    # ValueError, uniform exception surface.
+    with pytest.raises(ValueError):
+        Backtester().run(bars, signals)
+
+
+def test_backtester_accepts_clean_finite_positive_series():
+    """A clean all-finite, all-positive series still runs — backward-compatibility check."""
+
+    # A normal upward series: every close finite and strictly positive, so the
+    # new guard must NOT fire.  This pins down that the guard is additive and
+    # does not regress the happy path.
+    bars = make_bars([100.0, 101.0, 102.0, 103.0])
+
+    # Correctly-sized flat signals — the run should complete and return a result.
+    signals = np.array([SIGNAL_FLAT, SIGNAL_FLAT, SIGNAL_FLAT, SIGNAL_FLAT], dtype=np.int8)
+
+    # No exception expected; capture the result to assert on its type.
+    result = Backtester().run(bars, signals)
+
+    # The run must produce a BacktestResult, confirming the guard let a clean
+    # series through untouched.
+    assert isinstance(result, BacktestResult)
+
+
 # ---------------------------------------------------------------------------
 # Behaviour tests — known mathematical answers
 # ---------------------------------------------------------------------------
