@@ -31,6 +31,14 @@ released even if an exception occurs mid-ingest):
 # DuckDB may return as naive datetimes depending on the driver version.
 from datetime import datetime, timezone
 
+# logging lets write_bars warn (not raise) when it skips a corrupt bar — same
+# stdlib logging the rest of the data layer uses (yfinance_fetcher, cli_common).
+import logging
+
+# math.isfinite() is the canonical "is this a real finite number?" test — False
+# for NaN and +/- infinity, True otherwise.  Used to screen close/adj_close on write.
+import math
+
 # Path makes cross-platform directory creation one concise call.
 from pathlib import Path
 
@@ -42,6 +50,11 @@ import duckdb
 #   DUCKDB_TABLE_NAME — the canonical table name string ("ohlcv_bars")
 #   CREATE_TABLE_SQL  — the idempotent CREATE TABLE IF NOT EXISTS statement
 from src.data.schema import CREATE_TABLE_SQL, DUCKDB_TABLE_NAME, OHLCVBar
+
+# Module-level logger.  getLogger(__name__) ties records to this module so they
+# inherit whatever handler/level the application configures — matching the
+# logger setup in yfinance_fetcher and research/cli_common.
+log = logging.getLogger(__name__)
 
 
 class DuckDBStore:
@@ -114,6 +127,36 @@ class DuckDBStore:
         if not bars:
             return 0  # fast exit — skip the round-trip to DuckDB
 
+        # Screen out bars with a non-finite close OR adj_close before they reach
+        # the insert.  A NaN/+-inf price clears the NOT NULL / PRIMARY KEY
+        # constraints (NaN is a valid DOUBLE), so without this guard a corrupt
+        # trailing bar is written straight through and later poisons the
+        # backtester's log-return math.  We DROP the bad bar and keep the good
+        # ones — a multi-symbol ingest must not abort because one symbol's
+        # trailing bar is garbage; we warn instead of raising.
+        clean_bars: list[OHLCVBar] = []  # the surviving finite bars, to be written
+        for b in bars:
+            # math.isfinite is False for NaN and both infinities; a bar is bad
+            # if EITHER price field fails the test.
+            if not math.isfinite(b.close) or not math.isfinite(b.adj_close):
+                # Warn (do not raise) naming the symbol and the bar's date so the
+                # operator can see exactly which row was skipped during ingest.
+                log.warning(
+                    "Skipping bar with non-finite price: symbol=%s date=%s "
+                    "close=%r adj_close=%r",
+                    b.symbol,
+                    b.timestamp.date().isoformat(),
+                    b.close,
+                    b.adj_close,
+                )
+                continue  # drop this bar; do not append it to clean_bars
+            clean_bars.append(b)  # finite on both fields — keep it
+
+        # If every incoming bar was bad there is nothing to write; return 0 so
+        # the count reflects rows actually written and we skip the DB round-trip.
+        if not clean_bars:
+            return 0
+
         # Snapshot row count before the insert.  The difference after gives
         # us the number of rows that were not duplicates.
         # f-string is safe here: DUCKDB_TABLE_NAME is a module constant, not
@@ -133,8 +176,9 @@ class DuckDBStore:
 
         # executemany() binds each tuple to the ? placeholders and runs one
         # INSERT per tuple — significantly faster than calling execute() in
-        # a Python loop because DuckDB batches the work internally.
-        self._conn.executemany(sql, [self._bar_to_tuple(b) for b in bars])
+        # a Python loop because DuckDB batches the work internally.  We pass
+        # clean_bars (not bars) so only the finite-price rows are written.
+        self._conn.executemany(sql, [self._bar_to_tuple(b) for b in clean_bars])
 
         # Row count after insert; delta = new rows added.
         after: int = self._conn.execute(

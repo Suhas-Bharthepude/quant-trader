@@ -387,3 +387,80 @@ def test_daily_bar_tz_duplicate_is_rejected(tmp_path) -> None:
             f"Expected stored timestamp 2024-01-02 00:00:00+00:00, "
             f"got {result[0].timestamp}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 6 — write_bars drops bars with non-finite prices (no network)
+# ---------------------------------------------------------------------------
+# In-memory only (no @pytest.mark.integration): exercises the write-boundary
+# guard that screens NaN/+-inf close or adj_close before insert.  The known
+# production defect was a corrupt trailing bar with NaN close/adj_close; this
+# pins down that write_bars silently skips such rows (warns, does not raise)
+# while still persisting the good bars in the same batch.
+
+def test_write_bars_skips_non_finite_prices(tmp_path) -> None:
+    """write_bars drops bars with a non-finite close or adj_close and keeps the rest."""
+    # Isolated temp DuckDB file — same tmp_path pattern as the tests above, so
+    # this test never touches the project's real data file.
+    db_file: str = str(tmp_path / "test.duckdb")
+
+    # Build a mixed batch: two clean bars, one with a NaN close, one with a NaN
+    # adj_close.  All four share symbol "TEST" and distinct daily dates so the
+    # PRIMARY KEY never collapses them — any missing row is a dropped bar, not a
+    # dedup artifact.
+    bars = [
+        # Jan 2 — fully finite, must be stored.
+        OHLCVBar(
+            symbol="TEST",
+            timestamp=datetime(2024, 1, 2, tzinfo=timezone.utc),
+            open=100.0, high=101.0, low=99.0, close=100.5, adj_close=100.5,
+            volume=1000, timeframe="1d", source="test",
+        ),
+        # Jan 3 — NaN close: the bad-price guard must DROP this bar.
+        OHLCVBar(
+            symbol="TEST",
+            timestamp=datetime(2024, 1, 3, tzinfo=timezone.utc),
+            open=100.0, high=101.0, low=99.0, close=float("nan"), adj_close=100.5,
+            volume=1000, timeframe="1d", source="test",
+        ),
+        # Jan 4 — NaN adj_close: the guard checks BOTH fields, so this drops too.
+        OHLCVBar(
+            symbol="TEST",
+            timestamp=datetime(2024, 1, 4, tzinfo=timezone.utc),
+            open=100.0, high=101.0, low=99.0, close=100.5, adj_close=float("nan"),
+            volume=1000, timeframe="1d", source="test",
+        ),
+        # Jan 5 — fully finite, must be stored.
+        OHLCVBar(
+            symbol="TEST",
+            timestamp=datetime(2024, 1, 5, tzinfo=timezone.utc),
+            open=100.0, high=101.0, low=99.0, close=101.5, adj_close=101.5,
+            volume=1000, timeframe="1d", source="test",
+        ),
+    ]
+
+    # Two of the four bars are clean; the other two must be skipped.
+    expected_written: int = 2
+
+    # Open the store as a context manager so the file lock is always released,
+    # even if an assertion fails mid-test.
+    with DuckDBStore(db_file) as store:
+        # write_bars must return the count of rows ACTUALLY written — only the
+        # two finite bars, never the two NaN bars.
+        inserted = store.write_bars(bars)
+        assert inserted == expected_written, (
+            f"Expected {expected_written} rows written (NaN bars skipped), got {inserted}"
+        )
+
+        # Read the full date range back; only the two good bars should be present.
+        result = store.read_bars("TEST", "2024-01-02", "2024-01-05")
+        assert len(result) == expected_written, (
+            f"Expected {expected_written} stored bars, got {len(result)}"
+        )
+
+        # The surviving bars must be exactly Jan 2 and Jan 5 — the two NaN
+        # dates (Jan 3, Jan 4) must be absent from the store.
+        stored_dates = {b.timestamp.date() for b in result}
+        assert stored_dates == {date(2024, 1, 2), date(2024, 1, 5)}, (
+            f"Expected only the finite-price dates stored, got {sorted(stored_dates)}"
+        )
