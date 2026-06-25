@@ -59,13 +59,32 @@ from src.backtest.result import Trade, BacktestResult
 # closes.  Fixtures shine when state is shared across tests; here each test
 # passes its own list, so a helper keeps the call site explicit:
 # `make_bars([100, 110])` reads cleaner than juggling fixture params.
-def make_bars(closes: list[float]) -> list[OHLCVBar]:
-    """Build OHLCVBar list with given closes and sequential daily UTC timestamps starting 2024-01-01."""
+def make_bars(
+    closes: list[float],
+    adj_closes: list[float] | None = None,
+) -> list[OHLCVBar]:
+    """Build OHLCVBar list with given closes (and optional adj_closes) and sequential daily UTC timestamps starting 2024-01-01."""
 
     # Anchor every test series at 2024-01-01 UTC.  The exact date does not
     # matter — the backtester never reads calendar values — but pinning it
     # keeps tests deterministic and easy to eyeball when debugging.
     base = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+    # When adj_closes is None (the default), mirror the historic behaviour:
+    # each bar's adj_close equals its close.  We build that mirror list once
+    # here so the comprehension below can index it uniformly in both cases —
+    # callers that never pass adj_closes are bit-for-bit unchanged.
+    if adj_closes is None:
+        adj_closes = closes
+
+    # When adj_closes IS provided it must align 1:1 with closes; a length
+    # mismatch is a test-authoring bug, so fail loudly with a clear message
+    # rather than silently zipping to the shorter list.
+    if len(adj_closes) != len(closes):
+        raise ValueError(
+            f"adj_closes length ({len(adj_closes)}) must equal "
+            f"closes length ({len(closes)})"
+        )
 
     # Build one bar per close price.  enumerate gives the day offset, added
     # to `base` so timestamps stay strictly increasing — a property the
@@ -74,11 +93,11 @@ def make_bars(closes: list[float]) -> list[OHLCVBar]:
         OHLCVBar(
             symbol="TEST",          # arbitrary; backtester does not read this
             timestamp=base + timedelta(days=i),  # strictly increasing UTC
-            open=c,                 # dummy: engine only reads `close`
+            open=c,                 # dummy: engine reads only the price_field
             high=c,                 # dummy
             low=c,                  # dummy
-            close=c,                # the only price field the engine reads
-            adj_close=c,            # dummy
+            close=c,                # the close-basis price (price_field="close")
+            adj_close=adj_closes[i],  # the adj_close-basis price; == c by default
             volume=1000,            # dummy
             timeframe="1d",         # daily; matches the timedelta above
             source="test",          # provenance marker for synthetic data
@@ -712,3 +731,94 @@ def test_fee_and_slippage_add():
     # 1e-12 covers float-add noise (1+2 vs 3+0 vs 0+3 over /10000.0).
     assert abs(split.total_cost_pct - all_fee.total_cost_pct) < 1e-12
     assert abs(split.total_cost_pct - all_slip.total_cost_pct) < 1e-12
+
+
+# ---------------------------------------------------------------------------
+# Configurable price basis (price_field: "close" vs "adj_close")
+#
+# Contract (from engine.__init__ + run):
+#   price_field defaults to "close" → price return, pre-existing behaviour.
+#   price_field="adj_close"          → total return (dividends/splits folded in).
+#   Invalid values are rejected at construction (no silent fallback).
+#   The basis difference is DATA-driven: when adj_close == close the two bases
+#   produce identical results; they diverge only when the data diverges.
+# ---------------------------------------------------------------------------
+
+
+def test_price_field_defaults_to_close_behavior():
+    """Backtester() and Backtester(price_field="close") must be a true no-op match."""
+
+    # A normal, all-positive series so the finite-positive guard passes and the
+    # run produces real returns to compare.
+    bars = make_bars([100.0, 110.0, 105.0, 108.0])
+
+    # An all-long int8 signal of the right length so every bar carries exposure
+    # and the returns array is fully populated (not all-zero).
+    signals = np.array([SIGNAL_LONG, SIGNAL_LONG, SIGNAL_LONG, SIGNAL_LONG], dtype=np.int8)
+
+    # The implicit default ("close") and the explicit "close" must travel the
+    # exact same code path — getattr(b, "close") in both cases.
+    default_result = Backtester().run(bars, signals)
+    explicit_close_result = Backtester(price_field="close").run(bars, signals)
+
+    # np.array_equal is EXACT (not approximate): the default really is "close",
+    # so the two returns arrays must be bit-for-bit identical, pinning the
+    # default as a genuine no-op.
+    assert np.array_equal(default_result.returns, explicit_close_result.returns)
+
+
+def test_invalid_price_field_raises():
+    """price_field outside {"close","adj_close"} is rejected at construction."""
+
+    # "open" is a real OHLCVBar field but not a legal return basis; the
+    # constructor guard must reject it outright with a ValueError, the same
+    # exception surface as every other constructor guard.
+    with pytest.raises(ValueError):
+        Backtester(price_field="open")
+
+
+def test_adj_close_basis_differs_from_close():
+    """When adj_close diverges from close, the two bases yield different total return."""
+
+    # close and adj_close are both all-finite and strictly positive (so the
+    # guard passes for both bases) but DIVERGE bar-by-bar, so the log-return
+    # series differ and the computed total return must differ too.
+    closes = [100.0, 110.0, 120.0, 130.0]
+    adj_closes = [100.0, 105.0, 99.0, 140.0]
+    bars = make_bars(closes, adj_closes)
+
+    # All-long int8 signal of the right length: full exposure on both runs so
+    # the entire price path feeds the return, isolating the basis as the only
+    # difference between the two runs.
+    signals = np.array([SIGNAL_LONG, SIGNAL_LONG, SIGNAL_LONG, SIGNAL_LONG], dtype=np.int8)
+
+    # Same bars, same signals — only the price_field differs between the runs.
+    close_result = Backtester(price_field="close").run(bars, signals)
+    adj_result = Backtester(price_field="adj_close").run(bars, signals)
+
+    # The total returns must NOT be approximately equal: a gap well above float
+    # noise proves the basis switch actually changes the computed return rather
+    # than being ignored.
+    assert abs(close_result.total_return_pct - adj_result.total_return_pct) > 1e-6
+
+
+def test_adj_close_equal_to_close_reproduces_close_basis():
+    """When adj_close == close, the "adj_close" basis matches the "close" basis exactly."""
+
+    # No adj_closes argument → make_bars sets each bar's adj_close equal to its
+    # close, so the two price series are identical and any difference must come
+    # from the DATA, not the flag.
+    bars = make_bars([100.0, 110.0, 105.0, 108.0])
+
+    # All-long int8 signal of the right length, full exposure on both runs.
+    signals = np.array([SIGNAL_LONG, SIGNAL_LONG, SIGNAL_LONG, SIGNAL_LONG], dtype=np.int8)
+
+    # Run the identical data through both bases.  With close == adj_close the
+    # getattr reads numerically-equal values, so the returns must match.
+    close_result = Backtester(price_field="close").run(bars, signals)
+    adj_result = Backtester(price_field="adj_close").run(bars, signals)
+
+    # np.array_equal (exact): identical input data through either basis must
+    # produce bit-for-bit identical returns, pinning that divergence is
+    # data-driven and never an artefact of the flag itself.
+    assert np.array_equal(close_result.returns, adj_result.returns)

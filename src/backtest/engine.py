@@ -60,6 +60,10 @@ class Backtester:
         annualization_factor: int = 252,
         fee_bps: float = 0.0,
         slippage_bps: float = 0.0,
+        # price_field is appended LAST and defaults to "close" so every existing
+        # construction site — positional initial_capital, keyword fee_bps/
+        # slippage_bps, or a bare Backtester() — is left unchanged and cost-free.
+        price_field: str = "close",
     ):
         """Configure the run.
 
@@ -74,6 +78,15 @@ class Backtester:
         traded notional (1 bp = 0.0001).  Both default to 0.0 so a default
         Backtester is cost-free and bit-for-bit identical to the pre-cost
         behaviour; supply positive values to charge fees/slippage per turnover.
+
+        price_field selects which OHLCVBar price field returns are computed from.
+        "close" (the default) gives PRICE return and reproduces the pre-existing
+        behaviour bit-for-bit; "adj_close" gives TOTAL return, with dividends and
+        splits folded in.  WARNING: when comparing a strategy against the
+        buy-and-hold benchmark, the strategy's own price basis and this
+        Backtester's price_field must match, or the comparison mixes price return
+        with total return — the caller is responsible for passing the same basis
+        to both.
         """
         # Capital must be strictly positive — zero or negative capital is
         # nonsensical and would also produce NaNs/infs downstream when used
@@ -98,10 +111,26 @@ class Backtester:
         if slippage_bps < 0:
             raise ValueError(f"slippage_bps must be >= 0, got {slippage_bps}")
 
+        # price_field must name a real, loggable price column.  Only "close"
+        # and "adj_close" are valid bases; anything else (e.g. "open", a typo,
+        # or a non-price field) is rejected OUTRIGHT here — no silent fallback
+        # to a default — so a bad basis surfaces at construction, not as a quiet
+        # wrong-number result deep in run().  {price_field!r} quotes the bad
+        # value so the message reads cleanly even for empty strings.
+        if price_field not in {"close", "adj_close"}:
+            raise ValueError(
+                f"price_field must be 'close' or 'adj_close', got {price_field!r}"
+            )
+
         # Store both on the instance so run() can read them.  No mutation
         # after construction — Backtester is configured once and reused.
         self.initial_capital = initial_capital
         self.annualization_factor = annualization_factor
+
+        # Store the validated price basis on the instance so run() can read it
+        # via getattr.  No mutation after construction, consistent with every
+        # other stored config field above and below.
+        self.price_field = price_field
 
         # Keep the raw bps inputs on the instance for introspection/reporting,
         # so a caller can read back exactly what costs were configured.
@@ -172,8 +201,14 @@ class Backtester:
 
         # List comprehension is fine here: bars is already in memory and a
         # single pass is O(n).  dtype=np.float64 guarantees the precision the
-        # downstream log/exp math depends on.
-        closes = np.array([b.close for b in bars], dtype=np.float64)
+        # downstream log/exp math depends on.  The basis is configurable via
+        # self.price_field; getattr reads the chosen field ("close" or
+        # "adj_close") off each bar.  The variable is INTENTIONALLY still named
+        # `closes` (not renamed) because it is the reference price series the
+        # entire engine and _make_trade build on — renaming it would ripple
+        # through the whole function and _make_trade for zero functional gain;
+        # the price_field docstring carries the meaning instead.
+        closes = np.array([getattr(b, self.price_field) for b in bars], dtype=np.float64)
 
         # ------------------------------------------------------------------
         # 2b. Validate close prices.  A close that is non-finite (NaN or
@@ -339,7 +374,9 @@ class Backtester:
             # Case B: we're in a position and the signal goes flat → close the trade.
             elif current_position != SIGNAL_FLAT and sig == SIGNAL_FLAT:
                 # entry_idx is guaranteed non-None whenever current_position
-                # is non-flat — the two are updated together.
+                # is non-flat — the two are updated together.  No change needed
+                # in _make_trade for price_field: it reads entry/exit prices off
+                # the `closes` array we pass in, so it INHERITS the basis here.
                 trades.append(self._make_trade(bars, closes, entry_idx, i, current_position))
                 # Reset state: no open trade, position is flat.
                 current_position = SIGNAL_FLAT
