@@ -4,6 +4,70 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 29
+
+**Worked on:**
+- Audited all 17 etf_basket ETFs for non-finite (NaN / inf) close and
+  adj_close. Found exactly 17 bad bars: one per symbol, all the trailing
+  2026-06-10 row, close=NaN and adj_close=NaN. No interior holes, no
+  infinities - a stale whole-basket last-fetch (the close had not settled
+  when it was pulled).
+- Cleaned the store: scripts/migrate_drop_nonfinite_bars.py deletes every
+  row with a non-finite close or adj_close. It probes DuckDB for
+  isnan()/isinf() before building the predicate (both exist in 1.5.2), has a
+  sanity gate that aborts unless exactly 17 rows match, and a backup guard.
+  DB backed up to .bak-pre-nonfinite first. Pre-count 17, post-count 0,
+  deleted 17; verified on disk with an independent count separate from the
+  script's self-report.
+- Compute boundary: Backtester.run now rejects any close that is non-finite
+  or <= 0, raising a ValueError that names the count and the first bad bar's
+  index and timestamp - instead of silently producing NaN metrics. The guard
+  sits between building the closes array and the log-return math. [+5 tests]
+- Write boundary: write_bars now skips-and-warns on any bar with a non-finite
+  close or adj_close (math.isfinite, log.warning, no raise) so a bad bar can
+  never be stored again. Returned count excludes skipped bars. [+1 test]
+- 169 tests green (was 163).
+
+**Why it matters:**
+- Day 28's SPY sanity exposed a NaN close that poisoned full-history return
+  and drawdown. The verdict on momentum is only as trustworthy as the data
+  and the engine under it, so this had to be closed before any pre-verdict
+  work.
+
+**Architectural note:**
+- Two boundaries, two correct responses. The WRITE boundary skips-and-warns:
+  one bad trailing bar must not abort a multi-symbol ingest. The COMPUTE
+  boundary raises: a NaN close means no valid result is possible, so fail
+  loud.
+- The store uses INSERT OR IGNORE keyed on (symbol, timestamp, timeframe)
+  with daily bars floored to midnight UTC, so a re-fetch cannot overwrite an
+  existing bad row - the bad row must be DELETED before a clean re-fetch can
+  replace it. That ordering is why the migration deletes rather than updates.
+- This is the Day 21 prevention-plus-detection pattern reused: prevent at the
+  write boundary, detect at the compute boundary, clean the existing damage
+  with a backed-up one-off migration.
+
+**Verification:**
+- migrate output: per-symbol breakdown 17x1, "Sanity check passed: 17 == 17",
+  non-finite remaining 0, rows deleted 17. Independent on-disk count returned
+  0 after the migration. Full suite 169 passed, only the pre-existing
+  websockets DeprecationWarning.
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- Optional operational step: re-fetch the basket to refresh the now-deleted
+  2026-06-10 row (the write-boundary guard now protects against re-storing a
+  bad trailing bar; the basket is ~2 weeks stale).
+- Pre-verdict accounting: total-return via adj_close (switch the signal AND
+  the engine together, never one alone) and cash yield on flat periods.
+- Then momentum through the full harness (walk-forward + Optuna + overfitting
+  tax + buy-and-hold), folds sized against the 12-month lookback, judged on
+  drawdown and downside, not just Sharpe.
+
+**Time spent:** [fill in]
+
 ## Day 28 — 2026-06-23
 
 ## Day 28
