@@ -67,7 +67,19 @@ from src.strategies.base import (
 class TimeSeriesMomentumStrategy(Strategy):
     """Long when the trailing `lookback`-month return is positive, else flat."""
 
-    def __init__(self, lookback: int = 12) -> None:
+    def __init__(self, lookback: int = 12, price_field: str = "close") -> None:
+        # price_field selects which OHLCVBar price field the trailing-return
+        # signal is computed from. "close" (the default) computes momentum from
+        # PRICE return and reproduces the pre-existing behaviour bit-for-bit;
+        # "adj_close" computes it from TOTAL return (dividends/splits folded in).
+        # It is the LAST parameter and defaults to "close" so every existing
+        # construction site (positional/keyword lookback, bare
+        # TimeSeriesMomentumStrategy()) is unchanged. WARNING: when this strategy
+        # is run against a buy-and-hold benchmark, this price_field and the
+        # Backtester's price_field must match, or the comparison mixes price
+        # return with total return — the caller is responsible for passing the
+        # same basis to both.
+
         # lookback < 1 has no meaning — you cannot measure a return over zero
         # or fewer months. Catching it here gives a clear, actionable error
         # rather than a confusing empty/degenerate result deeper down.
@@ -76,18 +88,43 @@ class TimeSeriesMomentumStrategy(Strategy):
             # matching the validation style in sma_crossover.py.
             raise ValueError(f"lookback must be >= 1, got {lookback}")
 
+        # price_field must name a real, loggable price column. Only "close" and
+        # "adj_close" are valid bases; anything else (a typo or non-price field)
+        # is rejected OUTRIGHT here — no silent fallback — mirroring the engine's
+        # own guard. {price_field!r} quotes the bad value so the message reads
+        # cleanly even for empty strings.
+        if price_field not in {"close", "adj_close"}:
+            raise ValueError(
+                f"price_field must be 'close' or 'adj_close', got {price_field!r}"
+            )
+
         # Stash the validated parameter on the instance so generate_signals and
         # the `name` property can read it. Plain attribute (no property/
         # dataclass) keeps this minimal and effectively immutable by
         # convention — construct a new strategy rather than mutate this one.
         self.lookback = lookback
 
+        # Stash the validated price basis right after lookback, same no-mutation
+        # convention: generate_signals reads it via getattr to pick the field.
+        self.price_field = price_field
+
     @property
     def name(self) -> str:
         # f-string includes the actual lookback so logs and backtest reports
         # identify the exact configuration that produced a result — critical
         # when comparing parameter sweeps side by side.
-        return f"TSMOM({self.lookback})"
+        #
+        # The default-basis branch MUST stay byte-for-byte "TSMOM({lookback})":
+        # existing tests and any committed result labels reference this exact
+        # string, so emitting the basis here only for the non-default case keeps
+        # the default fully backward-compatible while still making an adj_close
+        # run distinguishable in reports and parameter sweeps.
+        if self.price_field == "close":
+            return f"TSMOM({self.lookback})"
+
+        # Non-default basis: surface it so a total-return run is never silently
+        # confused with a price-return run of the same lookback.
+        return f"TSMOM({self.lookback}, {self.price_field})"
 
     def generate_signals(self, bars: list[OHLCVBar]) -> np.ndarray:
         # Empty input is almost always an upstream bug (e.g. a symbol with no
@@ -101,8 +138,14 @@ class TimeSeriesMomentumStrategy(Strategy):
         # in ascending chronological order — the same assumption sma_crossover
         # and the backtester make — so we do NOT re-sort here.
         close_series = pd.Series(
-            # The values are the raw close prices, one per bar, in arrival order.
-            data=[bar.close for bar in bars],
+            # The values are the per-bar prices in arrival order. The basis is
+            # configurable via self.price_field; getattr reads the chosen field
+            # ("close" or "adj_close") off each bar. The local is still named
+            # close_series because it is the reference price series the
+            # month-end/trailing-return logic builds on — renaming it would
+            # ripple for zero gain; the price_field meaning is carried by the
+            # constructor param/comments.
+            data=[getattr(bar, self.price_field) for bar in bars],
             # The index is the bars' real timestamps, so every downstream
             # selection and forward-fill happens at true trading dates.
             index=pd.DatetimeIndex([bar.timestamp for bar in bars]),

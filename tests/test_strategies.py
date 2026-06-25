@@ -706,3 +706,62 @@ def test_tsmom_raises_on_empty_bars():
     # it immediately instead of returning a zero-length array downstream.
     with pytest.raises(ValueError):
         strategy.generate_signals([])
+
+
+# ---------------------------------------------------------------------------
+# 11. Configurable price basis (close vs adj_close) changes the signal
+# ---------------------------------------------------------------------------
+
+
+def test_tsmom_adj_close_basis_differs_from_close():
+    """When close and adj_close diverge, the two bases produce different signals."""
+
+    # ~18 months of daily bars (540 days) so the number of month-end
+    # observations comfortably exceeds the 12-month lookback (M > lookback) and
+    # a post-warmup region exists for both bases to emit real positions.
+    n_days = 540
+
+    # Anchor at 2024-01-01 UTC, matching make_bars so timestamps are real,
+    # strictly-increasing trading dates the month-end detection can key off.
+    base = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+    # CONSTRUCTION (why the bases diverge): the close path is strictly INCREASING
+    # (100, 101, 102, ...), so every post-warmup month-end's trailing 12-month
+    # return is positive → the close basis is LONG everywhere past warmup. The
+    # adj_close path is strictly DECREASING (10000, 9995, 9990, ...) yet stays
+    # strictly positive (10000 - 539*5 = 7305 > 0), so every post-warmup
+    # month-end's trailing return is negative → the adj_close basis is FLAT
+    # everywhere past warmup. The two signal arrays therefore MUST differ across
+    # the entire warmed-up region — every month-end's sign flips between bases.
+    closes = [100.0 + i for i in range(n_days)]          # increasing → LONG basis
+    adj_closes = [10000.0 - i * 5 for i in range(n_days)]  # decreasing → FLAT basis
+
+    # Build the bars inline (this file's make_bars cannot set adj_close
+    # separately, so we construct OHLCVBar objects directly, the same way
+    # test_backtest.py's make_bars now supports diverging adj_closes). Each bar's
+    # close and adj_close take the corresponding diverging value; OHLC dummies
+    # mirror close, exactly as make_bars does for the non-divergent case.
+    bars = [
+        OHLCVBar(
+            symbol="TEST",                       # arbitrary; strategy ignores it
+            timestamp=base + timedelta(days=i),  # strictly increasing UTC dates
+            open=closes[i],                      # dummy: strategy reads price_field
+            high=closes[i],                      # dummy
+            low=closes[i],                       # dummy
+            close=closes[i],                     # the close-basis price
+            adj_close=adj_closes[i],             # the diverging adj_close-basis price
+            volume=1000,                         # dummy
+            timeframe="1d",                      # daily; matches the timedelta
+            source="test",                       # provenance marker
+        )
+        for i in range(n_days)
+    ]
+
+    # Same bars, same default 12-month lookback — only the price_field differs.
+    close_signals = TimeSeriesMomentumStrategy(price_field="close").generate_signals(bars)
+    adj_signals = TimeSeriesMomentumStrategy(price_field="adj_close").generate_signals(bars)
+
+    # The two signal arrays must NOT be array-equal: the basis switch genuinely
+    # changes the trailing-return sign (LONG vs FLAT) across the warmed-up
+    # region, proving the strategy's price basis actually drives the signal.
+    assert not np.array_equal(close_signals, adj_signals)
