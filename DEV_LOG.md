@@ -4,6 +4,90 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 31
+
+**Worked on:**
+- Added cash-on-flat accounting to the Backtester: on bars where the held
+  position is FLAT (out of the market), idle capital now earns interest instead
+  of nothing. New annual_cash_yield parameter on Backtester.__init__, last
+  positional, defaulting to 0.0; validated >= 0 with a ValueError and no silent
+  fallback (mirrors the fee/slippage guards).
+- The rate is an ANNUAL simple-interest fraction (0.04 = 4%/yr), converted
+  internally to a per-bar log return: self.per_bar_cash_yield = log(1 +
+  annual_cash_yield) / annualization_factor. Storing it annual (not per-bar)
+  means a caller passes a familiar yearly percentage and is not off by a factor
+  of ~252.
+- New block 4c in run(), after the cost block (reuses its `held` array) and
+  before the equity cumsum: flat_yield = where(held == 0, per_bar_cash_yield, 0),
+  then flat_yield[0] = 0.0 to preserve the structural index-0 zero, then
+  strategy_returns = strategy_returns + flat_yield. Added (mirroring how cost is
+  subtracted) so every downstream metric reflects it.
+- Reported the cumulative interest earned as cash_earned_pct on BacktestResult,
+  the income mirror of total_cost_pct - same type, same default 0.0, placed
+  immediately after it. [+6 tests]
+- Buy-and-hold and the strategy layer required no change: B&H is always long (its
+  only flat bar is the structural bar 0, which the mask zeroes), and cash yield is
+  an engine accounting concept, not a signal concept.
+- 180 tests green (was 174).
+
+**Why it matters:**
+- Cash-on-flat is the last of the three pre-verdict accounting items (transaction
+  costs landed Day 28, total return Day 30, this is cash-on-flat). A momentum
+  strategy sits in cash for long stretches; modeling zero return on that idle
+  capital understates its true return, especially against a buy-and-hold
+  benchmark that is always invested. This closes the last accounting gap before
+  the verdict.
+
+**Architectural note:**
+- Built as a rate defaulting to 0.0, NOT an always-on charge, so all prior
+  results stay bit-for-bit reproducible and every existing test stays green. The
+  verdict run will opt into a real rate explicitly.
+- One-place, engine-only change (plus one field on BacktestResult). The
+  walk-forward validator passes the Backtester through unchanged, so the yield
+  flows to both the strategy path and the B&H path with no validator edit.
+- The flat_yield[0] = 0.0 line is load-bearing: held[0] is 0 by construction, so
+  without it the mask would credit yield at index 0 and leak a spurious return
+  into the equity curve's first step - corrupting the Sharpe [1:] slice and the
+  walk-forward seam-stripping (fr.returns[1:]). A dedicated test pins that index-0
+  stays exactly 0.0.
+- Annualization is the footgun this guards against: log(1 + rate) /
+  annualization_factor, using self.annualization_factor (not a hardcoded 252), so
+  compounding the per-bar yield over a year sums back to the full annual rate -
+  not the rate charged once per bar.
+
+**Verification:**
+- Full suite 180 passed (was 174), only the pre-existing websockets
+  DeprecationWarning. Prior 174 unchanged, proving annual_cash_yield=0.0 is a true
+  no-op and the new cash_earned_pct field broke no existing BacktestResult
+  construction.
+- test_all_flat_earns_annualized_yield: 252 flat bars (after the index-0 mask) at
+  4%/yr produce total_return_pct ~ 0.04 (not 0.04 per bar) - the off-by-252 proof.
+  test_index_zero_yield_stays_zero: returns[0] == 0.0 exactly with a 5%/yr yield.
+  test_all_long_earns_no_cash_yield: a fully-invested run earns 0.0 and is
+  bit-identical to a free run. test_mixed_earns_yield_only_on_flat_bars: signals
+  [1,1,0,0,0] credits yield only on the two flat bars. test_cash_yield_default_is_no_op
+  and test_negative_annual_cash_yield_raises round out the set.
+- One code commit (engine + result field + tests): "Add cash-on-flat yield to
+  backtester".
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- Wire price_field AND annual_cash_yield through the verdict path
+  (walk_forward_validate / the overfitting-tax CLI), passing the SAME basis and
+  the same yield to both the engine and the strategy explicitly - the footgun
+  mitigation, and the last wiring before the verdict.
+- Optional operational step still pending: re-fetch the basket to un-stale it
+  (blocks nothing).
+- Then momentum through the full harness (walk-forward + Optuna + overfitting tax
+  + buy-and-hold) on adj_close, after costs, with cash-on-flat - the actual
+  verdict. Folds sized against the 12-month lookback; judged on drawdown and
+  downside, not just Sharpe.
+- SMA crossover price_field for a consistent basis across strategies.
+
+**Time spent:** [fill in]
+
 ## Day 30
 
 **Worked on:**
