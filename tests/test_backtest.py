@@ -822,3 +822,146 @@ def test_adj_close_equal_to_close_reproduces_close_basis():
     # produce bit-for-bit identical returns, pinning that divergence is
     # data-driven and never an artefact of the flag itself.
     assert np.array_equal(close_result.returns, adj_result.returns)
+
+
+# ---------------------------------------------------------------------------
+# Cash-on-flat yield — interest earned on idle capital while FLAT.
+# ---------------------------------------------------------------------------
+
+def test_cash_yield_default_is_no_op():
+    """A default Backtester (and an explicit annual_cash_yield=0.0) earns no yield."""
+
+    # A series with both held-position bars and flat bars: signals [1,1,0,0]
+    # means held = [0,1,1,0] under next-bar execution, so bars 3 (held==0,
+    # index>0) is a genuine flat bar — the case a yield WOULD touch if enabled.
+    bars = make_bars([100.0, 110.0, 105.0, 108.0])
+
+    # int8 per the strategy contract; mixes long exposure (bars 0-1 of signals)
+    # with flat exposure (bars 2-3 of signals).
+    signals = np.array([SIGNAL_LONG, SIGNAL_LONG, SIGNAL_FLAT, SIGNAL_FLAT], dtype=np.int8)
+
+    # The bare default Backtester — must be cost-free AND yield-free.
+    default_result = Backtester().run(bars, signals)
+
+    # Explicit annual_cash_yield=0.0 — must be bit-for-bit identical to the bare
+    # default, because np.log1p(0)/252 == 0.0 so per_bar_cash_yield is 0.0.
+    explicit_zero_result = Backtester(annual_cash_yield=0.0).run(bars, signals)
+
+    # np.array_equal (exact, not approximate): the no-op default must not perturb
+    # a single bit of the returns array versus passing 0.0 explicitly.
+    assert np.array_equal(default_result.returns, explicit_zero_result.returns)
+
+    # And the reported cumulative cash earned must be exactly 0.0 — no yield ran.
+    assert default_result.cash_earned_pct == 0.0
+
+
+def test_all_flat_earns_annualized_yield():
+    """An all-flat year earns ~4% total at 4%/yr — the off-by-252 annualization proof."""
+
+    # 253 bars of CONSTANT price: the asset return is 0.0 on every bar, so the
+    # ONLY contribution to the equity curve is the cash-on-flat yield — isolating
+    # the yield math from any price movement.
+    bars = make_bars([100.0] * 253)
+
+    # All-FLAT int8 signals of length 253.  held is therefore all zeros; the
+    # mask credits per_bar_cash_yield on every bar, then index 0 is zeroed,
+    # leaving EXACTLY 252 flat bars that earn the yield.
+    signals = np.zeros(253, dtype=np.int8)
+
+    # 4%/yr at the default annualization_factor=252.
+    result = Backtester(annual_cash_yield=0.04).run(bars, signals)
+
+    # Hand derivation: per_bar = log(1.04)/252, earned over 252 bars (index 0 is
+    # zeroed), so the total log return is 252 * (log(1.04)/252) == log(1.04).
+    # exp(log(1.04)) - 1 == 0.04 EXACTLY — a 4%/yr rate gives ~4% over 252 bars,
+    # NOT 4% per bar.  total_return_pct is exp(cumsum)-1, so it equals 0.04.
+    assert abs(result.total_return_pct - 0.04) < 1e-9
+
+    # cash_earned_pct is the SUM of per-bar yields = 252 * (log(1.04)/252) =
+    # log(1.04) = np.log1p(0.04).  Tight tolerance: this is exact float math.
+    assert abs(result.cash_earned_pct - np.log1p(0.04)) < 1e-12
+
+
+def test_index_zero_yield_stays_zero():
+    """The structural index-0 zero is preserved even with a yield configured."""
+
+    # Short all-flat series; with a yield enabled the naive mask would credit
+    # index 0, so this test pins the flat_yield[0] = 0.0 guard.
+    bars = make_bars([100.0, 100.0, 100.0, 100.0])
+
+    # All-FLAT int8 signals — held is all zeros, so index 0 is the at-risk bar.
+    signals = np.zeros(4, dtype=np.int8)
+
+    # A non-trivial 5%/yr yield so per_bar_cash_yield is clearly non-zero; if the
+    # index-0 guard were missing, returns[0] would equal per_bar_cash_yield.
+    result = Backtester(annual_cash_yield=0.05).run(bars, signals)
+
+    # Exact: bar 0 must stay the structural zero the Sharpe [1:] slice and the
+    # walk-forward seam-stripping (fr.returns[1:]) both depend on.
+    assert result.returns[0] == 0.0
+
+
+def test_all_long_earns_no_cash_yield():
+    """A fully-invested run earns no cash yield — only flat bars do."""
+
+    # A normal upward-then-down positive series; the actual path is irrelevant
+    # because no bar is flat, so no bar can earn yield.
+    bars = make_bars([100.0, 110.0, 105.0, 108.0])
+
+    # All-LONG int8 signals: held = [0,1,1,1].  The only held==0 bar is index 0,
+    # which the flat_yield[0] = 0.0 guard zeroes — so NO bar earns yield.
+    signals = np.array([SIGNAL_LONG, SIGNAL_LONG, SIGNAL_LONG, SIGNAL_LONG], dtype=np.int8)
+
+    # 4%/yr configured, but it must never apply on this all-invested run.
+    yield_result = Backtester(annual_cash_yield=0.04).run(bars, signals)
+
+    # The free baseline run for a bit-identical comparison.
+    free_result = Backtester().run(bars, signals)
+
+    # Exact: no flat bar means zero cumulative cash earned.
+    assert yield_result.cash_earned_pct == 0.0
+
+    # np.array_equal (exact): with no flat bars the yield path adds 0.0 to every
+    # element, so the returns must be bit-identical to the free run.
+    assert np.array_equal(yield_result.returns, free_result.returns)
+
+
+def test_mixed_earns_yield_only_on_flat_bars():
+    """Yield is credited only on flat bars, isolated by differencing two runs."""
+
+    # 5 bars; signals [1,1,0,0,0] → held = [0,1,1,0,0] under next-bar execution.
+    # held==0 at indices 0,3,4; index 0 is masked to 0.0, so yield is earned on
+    # indices 3 and 4 only — exactly 2 flat bars.
+    bars = make_bars([100.0, 110.0, 105.0, 108.0, 107.0])
+
+    # int8 signals matching the held derivation above.
+    signals = np.array([SIGNAL_LONG, SIGNAL_LONG, SIGNAL_FLAT, SIGNAL_FLAT, SIGNAL_FLAT], dtype=np.int8)
+
+    # Free baseline and a 4%/yr-yield run on the SAME bars+signals; gross returns
+    # are identical between them, so their difference isolates the yield exactly.
+    free_result = Backtester().run(bars, signals)
+    yield_result = Backtester(annual_cash_yield=0.04).run(bars, signals)
+
+    # per_bar is the engine's exact per-bar conversion: log(1.04)/252.
+    per_bar = np.log1p(0.04) / 252
+
+    # Expected yield contribution per bar: 0 on indices 0,1,2 (index 0 masked,
+    # 1-2 held long), per_bar on indices 3,4 (flat).
+    expected_yield_per_bar = np.array([0.0, 0.0, 0.0, per_bar, per_bar])
+
+    # The difference of the two returns arrays must equal the yield contribution
+    # alone, since gross returns cancel.  allclose with a tight atol for float math.
+    assert np.allclose(yield_result.returns - free_result.returns, expected_yield_per_bar, atol=1e-12)
+
+    # cash_earned_pct is the sum of credited yields = 2 * per_bar (indices 3,4).
+    assert abs(yield_result.cash_earned_pct - 2 * per_bar) < 1e-12
+
+
+def test_negative_annual_cash_yield_raises():
+    """A negative annual_cash_yield is rejected at construction time."""
+
+    # A negative rate would make idle capital LOSE money on flat bars — a
+    # deliberate-only modeling choice the guard rejects.  pytest.raises asserts
+    # the ValueError fires during construction, before any run.
+    with pytest.raises(ValueError):
+        Backtester(annual_cash_yield=-0.01)

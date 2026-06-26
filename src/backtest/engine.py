@@ -64,6 +64,10 @@ class Backtester:
         # construction site — positional initial_capital, keyword fee_bps/
         # slippage_bps, or a bare Backtester() — is left unchanged and cost-free.
         price_field: str = "close",
+        # annual_cash_yield is appended AFTER price_field (now the last param) and
+        # defaults to 0.0 so every existing construction site stays unchanged and
+        # yield-free.  It is an ANNUAL simple-interest fraction: 0.04 == 4%/yr.
+        annual_cash_yield: float = 0.0,
     ):
         """Configure the run.
 
@@ -87,6 +91,15 @@ class Backtester:
         Backtester's price_field must match, or the comparison mixes price return
         with total return — the caller is responsible for passing the same basis
         to both.
+
+        annual_cash_yield is the annual interest earned on idle capital while the
+        held position is FLAT (out of the market), expressed as a plain fraction:
+        0.04 means 4% per year.  It defaults to 0.0 (no yield, bit-for-bit
+        identical to the pre-yield behaviour).  NOTE it is an ANNUAL rate: it is
+        converted internally to a per-bar log return (see per_bar_cash_yield
+        below), so a caller passes a familiar yearly percentage and is NOT off by
+        a factor of annualization_factor.  Only idle (flat) bars earn it; bars
+        holding a position earn the asset return instead.
         """
         # Capital must be strictly positive — zero or negative capital is
         # nonsensical and would also produce NaNs/infs downstream when used
@@ -110,6 +123,13 @@ class Backtester:
         # never be negative.  0.0 stays valid so the default run is cost-free.
         if slippage_bps < 0:
             raise ValueError(f"slippage_bps must be >= 0, got {slippage_bps}")
+
+        # A cash yield is interest earned, never paid: a negative rate would make
+        # idle capital LOSE money on flat bars, which is a deliberate-only modeling
+        # choice we reject outright.  0.0 stays valid (the no-op default); only
+        # strictly negative is rejected, mirroring the fee_bps/slippage_bps guards.
+        if annual_cash_yield < 0:
+            raise ValueError(f"annual_cash_yield must be >= 0, got {annual_cash_yield}")
 
         # price_field must name a real, loggable price column.  Only "close"
         # and "adj_close" are valid bases; anything else (e.g. "open", a typo,
@@ -142,6 +162,23 @@ class Backtester:
         # Fees and slippage are both charged per unit of turnover, so they sum
         # into a single rate applied uniformly to each bar's position change.
         self.cost_rate = (fee_bps + slippage_bps) / 10000.0
+
+        # Keep the raw annual rate on the instance for introspection/reporting,
+        # mirroring how fee_bps/slippage_bps are kept raw alongside the derived
+        # cost_rate.  A caller can read back exactly what yield was configured.
+        self.annual_cash_yield = annual_cash_yield
+
+        # per_bar_cash_yield is the derived per-bar value, the yield analogue of
+        # cost_rate.  np.log1p(x) computes log(1 + x), turning the simple annual
+        # rate into a per-bar LOG return so it lives in the SAME units as
+        # asset_returns (which are log returns).  Dividing by annualization_factor
+        # (252 by default) spreads that annual log return across the bars in a
+        # year, so compounding it over annualization_factor flat bars SUMS back to
+        # exactly log(1 + annual_cash_yield) — i.e. the full annual rate over a
+        # year, NOT per bar.  annualization_factor is already validated > 0 above,
+        # so this division is safe.  With annual_cash_yield == 0.0, np.log1p(0) ==
+        # 0.0, so per_bar_cash_yield == 0.0 — a true no-op.
+        self.per_bar_cash_yield = float(np.log1p(annual_cash_yield) / annualization_factor)
 
     def run(
         self,
@@ -323,6 +360,40 @@ class Backtester:
         total_cost = float(cost_returns.sum())
 
         # ------------------------------------------------------------------
+        # 4c. Cash-on-flat yield — interest earned on idle capital while FLAT.
+        #     Computed AFTER the gross/cost block above (it reuses the same
+        #     `held` array built in 4b) and BEFORE the equity-curve cumsum in
+        #     step 5, so the yield flows into every downstream metric.  With
+        #     per_bar_cash_yield == 0.0 (the default) every line here adds 0.0,
+        #     leaving strategy_returns bit-for-bit unchanged.
+        # ------------------------------------------------------------------
+
+        # flat_yield[i] is the per-bar yield earned at bar i: per_bar_cash_yield
+        # on every FLAT bar (held == 0 means we are out of the market over bar i
+        # under next-bar execution), and 0.0 on bars that hold a position.
+        flat_yield = np.where(held == 0.0, self.per_bar_cash_yield, 0.0)
+
+        # CRITICAL: strategy_returns[0] is the STRUCTURAL index-0 zero that the
+        # Sharpe [1:] slice and the walk-forward seam-stripping (fr.returns[1:])
+        # both depend on.  held[0] is 0 by construction (bar 0 is flat), so without
+        # this line the naive mask above would credit yield at index 0 and leak a
+        # spurious return into the equity curve's first step.  Force index 0 back
+        # to 0.0, matching the leading-structural-zero convention every other array
+        # in this engine follows.
+        flat_yield[0] = 0.0
+
+        # ADD the yield (mirrors how cost is SUBTRACTED just above); addition is
+        # commutative with the cost subtraction, so a bar that both exits to cash
+        # (a cost) and then holds cash (a yield) is handled correctly and
+        # independently.
+        strategy_returns = strategy_returns + flat_yield
+
+        # cash_earned is the cumulative interest earned over the whole run, as a
+        # fraction of capital — the income mirror of total_cost.  float() matches
+        # the stored-type convention of the other metrics.
+        cash_earned = float(flat_yield.sum())
+
+        # ------------------------------------------------------------------
         # 5. Equity curve.  Working in log space avoids floating-point drift
         #    that would accumulate from repeated (1 + r) multiplications
         #    across thousands of bars.
@@ -455,6 +526,10 @@ class Backtester:
             # fraction of capital; 0.0 when no costs are configured.  Passed by
             # keyword (as every field here is) so field order is irrelevant.
             total_cost_pct=total_cost,
+            # cash_earned_pct carries the cumulative cash interest earned on flat
+            # bars as a fraction of capital; 0.0 when no yield is configured.  The
+            # income mirror of total_cost_pct.  Passed by keyword like every field.
+            cash_earned_pct=cash_earned,
         )
 
     # ------------------------------------------------------------------

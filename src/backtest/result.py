@@ -100,3 +100,11 @@ class BacktestResult:
     # run as a fraction of capital (0.0 when no costs are configured), matching
     # the fraction convention of total_return_pct (0.25 == 25%).
     total_cost_pct: float = 0.0
+
+    # Placed IMMEDIATELY AFTER total_cost_pct, declared the same way (float,
+    # default 0.0) so dataclass default-ordering rules stay satisfied and every
+    # existing construction site (engine by keyword; tests that omit this field)
+    # keeps working via the default.  Cumulative interest earned on idle capital
+    # while the held position is FLAT, as a fraction of capital — the income
+    # mirror of total_cost_pct (which is a cost); 0.0 when no yield is configured.
+    cash_earned_pct: float = 0.0
