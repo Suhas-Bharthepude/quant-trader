@@ -4,6 +4,99 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 32
+
+**Worked on:**
+- Added a price-basis consistency guard to walk_forward_validate (commit "Add
+  price-basis consistency guard to walk-forward validation"). It raises ValueError
+  when the engine's price_field disagrees with the running strategy's price_field,
+  so a caller can no longer silently mix price-return signals with total-return
+  scoring. It checks fold_strategy (NOT the passed-in strategy), so it covers BOTH
+  the fit_fn=None path and the fit_fn path; it is hasattr-safe via
+  getattr(fold_strategy, "price_field", None), so strategies without a price_field
+  (SMACrossoverStrategy) are skipped, never crashed; and it sits immediately after
+  per-fold strategy selection and before generate_signals - fail-fast, before any
+  signal math runs. [+4 tests, including a fit_fn-path mismatch]
+- Added the fixed time-series-momentum walk-forward verdict runner,
+  scripts/momentum_walkforward.py (commit "Add fixed time-series-momentum
+  walk-forward verdict runner"). This is the FIRST entry point that runs
+  TimeSeriesMomentum through walk_forward_validate - grep confirmed none existed,
+  the prior CLIs were SMA-only. It constructs exactly ONE Backtester and a
+  TimeSeriesMomentumStrategy from a SINGLE price_field variable, so engine and
+  strategy bases are equal by construction and the new guard is a backstop here,
+  never the mechanism. It reads the built-in always-long buy-and-hold benchmark.
+- The runner reports per symbol: OOS Sharpe, B&H Sharpe, MaxDD on both sides, and
+  dd_reduction = bh_max_dd - oos_max_dd (POSITIVE = momentum had the SMALLER
+  drawdown, i.e. cut risk), plus a cross-symbol MEAN row and bottom-line tallies
+  ("beat B&H on Sharpe on X/N; cut max drawdown on Y/N"). Split into a pure
+  summarize_verdict helper + a thin run_one_symbol for hermetic testing. [+4 tests]
+- Flags: --lookback (12), --train (756), --test (252), --step (None),
+  --price-field (adj_close), --cash-yield (0.0), --fee-bps (0.0), --slippage-bps
+  (0.0), --symbols.
+- 188 tests green (was 180).
+
+**Why it matters:**
+- This is the verdict-path wiring: the guard closes the footgun Days 30 and 31
+  both deferred - price basis lived in two disconnected places (engine and
+  strategy) with nothing forcing them to agree - and the runner is the first real
+  caller that passes a basis to both at once. With a FIXED 12-month rule, the
+  runner is already a genuine partial verdict on whether momentum beats holding,
+  out-of-sample and after accounting, with no Optuna involved yet.
+
+**Architectural note:**
+- Verdict-first reorder: for momentum the FIXED 12-month rule is the headline
+  question (unlike the SMA dummy, where no single parameter had a special claim),
+  so the fixed runner is a real partial verdict without needing per-fold tuning.
+  Tuning + the overfitting tax are the NEXT step, not this one.
+- The guard was folded into Day 32 rather than shipped standalone because the
+  runner is its first real caller - the first place a basis is passed to both
+  engine and strategy - so the safety ships with the code that first needs it.
+- Window sizing for a MONTHLY 12-month-lookback strategy: train=756 (~3y) warms
+  the 12-month lookback with margin so no FLAT warmup bleeds into the test window
+  and TSMOM's own ">lookback month-end observations" guard cannot trip; test=252
+  (~1y, ~12 monthly rebalances per fold); step=None (non-overlapping). On a
+  full-history basket symbol (~4,600 bars from 2008) this yields ~15 folds.
+- --cash-yield defaults to 0.0 because B&H is always-long and so earns ZERO
+  flat-yield by construction - a non-zero yield only lifts the strategy side. That
+  is a legitimate effect (idle capital earns interest) but a cash-rate assumption,
+  so the headline verdict makes none; bracket it later at 0.04.
+- --price-field defaults to adj_close (the honest total-return basis): verified in
+  DuckDB that adj_close is genuinely dividend-adjusted, not a copy of close -
+  SPY/TLT/XLU/XLP show 2008 adj_close materially below close and the latest bar
+  equal, the signature of correct back-adjustment.
+
+**Verification:**
+- Full suite 188 passed (was 180), only the pre-existing websockets
+  DeprecationWarning. The prior 180 are unchanged, proving the guard is a clean
+  no-op on every existing path and the new runner touched nothing shared.
+- Guard tests: a fit_fn=None mismatch raises, a matched basis runs clean, a
+  strategy without price_field (SMA) is skipped via the getattr-None branch, and a
+  fit_fn-path mismatch raises - proving the guard reads fold_strategy, not the
+  ignored passed-in strategy.
+- Runner tests are fully hermetic (synthetic in-memory bars, no DuckDB):
+  summarize_verdict sign conventions, run_one_symbol returns a WalkForwardResult
+  end-to-end, a basis-matched run never trips the guard, and a positive
+  --cash-yield never lowers OOS return (lifts it when bars go flat).
+- Two code commits ("Add price-basis consistency guard to walk-forward
+  validation", "Add fixed time-series-momentum walk-forward verdict runner") plus
+  this DEV_LOG entry.
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- Run the fixed verdict against the basket (adj_close, then a --cash-yield 0.04
+  bracket) and read it on MaxDD / drawdown reduction, not Sharpe alone -
+  crisis-avoidance is what momentum is meant to deliver.
+- Build make_tsmom_optuna_fit_fn (additive, optuna_fit.py only) and add a momentum
+  overfitting-tax column: the FULL verdict on whether tuning the lookback adds edge
+  or just overfits the way the SMA did.
+- Later: a true downside-deviation / Sortino metric (WalkForwardResult exposes
+  MaxDD only today); cross-sectional sector / cross-asset rotation (needs a
+  portfolio-level backtester).
+
+**Time spent:** [fill in]
+
 ## Day 31
 
 **Worked on:**
