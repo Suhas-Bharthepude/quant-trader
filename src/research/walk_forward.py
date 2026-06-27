@@ -482,6 +482,42 @@ def walk_forward_validate(
         # ------------------------------------------------------------------
         fold_strategy = strategy if fit_fn is None else fit_fn(train_bars)
 
+        # ------------------------------------------------------------------
+        # BASIS-CONSISTENCY GUARD — engine price basis must match the running
+        # strategy's price basis, or the run silently mixes price-return signals
+        # with total-return scoring (or vice versa).
+        # ------------------------------------------------------------------
+        # Read the strategy's price basis if it has one.  getattr(..., None) is the
+        # hasattr-safe check: strategies WITHOUT a price_field (e.g.
+        # SMACrossoverStrategy) return None here and are intentionally SKIPPED by
+        # the guard below, never crashed — the None branch of the condition.
+        strat_pf = getattr(fold_strategy, "price_field", None)
+
+        # We check fold_strategy (NOT the passed-in `strategy`) on purpose: this
+        # covers BOTH paths — the fit_fn=None path where fold_strategy IS strategy,
+        # AND the fit_fn path where fold_strategy is the per-fold fitted strategy.
+        # A check on `strategy` alone would miss the fit_fn path entirely, because
+        # there the passed-in `strategy` is ignored and the real basis lives on the
+        # object fit_fn returned.
+        #
+        # This sits BEFORE the full_bars concat / generate_signals call below so we
+        # fail fast on a misconfigured basis, before any signal math runs.
+        #
+        # strat_pf is None  → strategy has no basis knob → skip (do not raise).
+        # strat_pf set but != backtester.price_field → the bases disagree → raise.
+        if strat_pf is not None and strat_pf != backtester.price_field:
+            # Name the fold index, the strategy's price_field, and the engine's
+            # price_field so the caller can see exactly which side to fix; the
+            # message states the bases disagree and that BOTH must be passed the
+            # same basis (the engine's price_field and the strategy's price_field).
+            raise ValueError(
+                f"Price-basis mismatch on fold {i}: strategy price_field "
+                f"{strat_pf!r} does not match the engine's price_field "
+                f"{backtester.price_field!r}. The engine and strategy price bases "
+                "disagree — mixing price return with total return. Pass the SAME "
+                "basis to both the Backtester and the strategy."
+            )
+
         # Concatenate train + test into one contiguous list so generate_signals
         # sees the full history needed to warm the indicator.  Without training
         # bars, a slow-window strategy (e.g. SMA-200) would emit SIGNAL_FLAT

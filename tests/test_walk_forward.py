@@ -746,3 +746,105 @@ def test_wfv_fit_fn_none_matches_omitted():
     result_none = walk_forward_validate(splits, strategy, fit_fn=None)
 
     assert result_omitted.oos_total_return == pytest.approx(result_none.oos_total_return)
+
+
+# ---------------------------------------------------------------------------
+# Tests — price-basis consistency guard
+# ---------------------------------------------------------------------------
+#
+# The validator raises if the engine's price basis (Backtester.price_field) and
+# the running strategy's price basis (strategy.price_field) disagree, so a caller
+# cannot silently mix price-return signals with total-return scoring. The guard
+# fires BEFORE generate_signals, so the mismatch tests need only enough bars for
+# walk_forward_splits to emit one fold — they do NOT depend on a strategy
+# producing valid signals (the all-FLAT dummy below never even reaches scoring on
+# the mismatch path).
+# ---------------------------------------------------------------------------
+
+
+class _DummyBasisStrategy(Strategy):
+    """Test stub exposing a settable price_field, emitting all-FLAT signals.
+
+    Isolates the guard's behaviour from any real strategy's data requirements:
+    generate_signals always returns zeros (SIGNAL_FLAT), so a basis-MATCHED run
+    is a clean, valid backtest, while a basis-MISMATCHED run is rejected by the
+    guard before generate_signals is ever called.
+    """
+
+    def __init__(self, price_field: str) -> None:
+        # Store the basis the guard reads via getattr(fold_strategy, "price_field").
+        self.price_field = price_field
+
+    @property
+    def name(self) -> str:
+        # Constant name — the guard tests never compare on the label.
+        return "dummy-basis"
+
+    def generate_signals(self, bars: list[OHLCVBar]) -> np.ndarray:
+        # All-FLAT, integer dtype, length-aligned to bars — a clean run on the
+        # matched path; never reached on the mismatched path (guard fires first).
+        return np.zeros(len(bars), dtype=np.int8)
+
+
+def test_basis_mismatch_raises():
+    """fit_fn=None path: engine adj_close vs strategy close raises on fold 0."""
+    # Engine scores on total return (adj_close); strategy's basis is price (close).
+    engine_adj = Backtester(price_field="adj_close")
+    # Dummy strategy carrying the MISMATCHED basis ("close").
+    dummy_close = _DummyBasisStrategy(price_field="close")
+    # Minimal one-fold splits: 15 bars = train 10 + test 5 (the exact-fit case).
+    splits = walk_forward_splits(make_price_bars(15), train_size=10, test_size=5)
+
+    # The guard fires on fold 0 before any signal math, so the bar values are
+    # irrelevant — only that one fold exists. Mismatch → ValueError.
+    with pytest.raises(ValueError):
+        walk_forward_validate(splits, dummy_close, backtester=engine_adj)
+
+
+def test_basis_match_does_not_raise():
+    """Engine adj_close and strategy adj_close (matched) run cleanly to a result."""
+    # Engine and strategy share the SAME basis ("adj_close") → guard must NOT fire.
+    engine_adj = Backtester(price_field="adj_close")
+    dummy_adj = _DummyBasisStrategy(price_field="adj_close")
+    splits = walk_forward_splits(make_price_bars(15), train_size=10, test_size=5)
+
+    # The all-FLAT dummy produces a clean run; the guard agreeing on basis lets
+    # the validator complete and return a WalkForwardResult.
+    result = walk_forward_validate(splits, dummy_adj, backtester=engine_adj)
+    assert isinstance(result, WalkForwardResult)
+
+
+def test_strategy_without_price_field_is_skipped():
+    """A strategy without price_field (SMA) is skipped by the getattr-None branch."""
+    # Engine on adj_close; SMACrossoverStrategy has NO price_field attribute, so
+    # getattr(..., None) returns None and the guard skips it regardless of basis.
+    engine_adj = Backtester(price_field="adj_close")
+    # Small windows + enough bars (30) for at least one fold with slow_window=10.
+    strategy = SMACrossoverStrategy(5, 10)
+    splits = walk_forward_splits(make_price_bars(30), train_size=20, test_size=5)
+
+    # Must run to completion and return a result — the guard never raises for a
+    # strategy that lacks the price_field knob.
+    result = walk_forward_validate(splits, strategy, backtester=engine_adj)
+    assert isinstance(result, WalkForwardResult)
+
+
+def test_fit_fn_path_basis_mismatch_raises():
+    """fit_fn path: the guard checks fold_strategy (fit_fn's return), not the base."""
+    # Engine on adj_close; fit_fn returns a dummy carrying the MISMATCHED "close".
+    engine_adj = Backtester(price_field="adj_close")
+    splits = walk_forward_splits(make_price_bars(15), train_size=10, test_size=5)
+
+    # fit_fn supplies the per-fold strategy; the positional `strategy` below is
+    # ignored when fit_fn is given, so the SMA placeholder proves the guard reads
+    # fold_strategy (the dummy with "close"), not the ignored passed-in strategy.
+    def fit_fn(train_bars: list[OHLCVBar]) -> Strategy:
+        return _DummyBasisStrategy(price_field="close")
+
+    with pytest.raises(ValueError):
+        walk_forward_validate(
+            splits,
+            SMACrossoverStrategy(5, 10),  # ignored placeholder — fit_fn drives the fold
+            backtester=engine_adj,
+            fit_fn=fit_fn,
+        )
