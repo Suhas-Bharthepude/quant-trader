@@ -46,8 +46,12 @@ from src.strategies.base import (
 from src.strategies.sma_crossover import SMACrossoverStrategy
 
 # The second concrete strategy under test — long/flat monthly time-series
-# momentum.  Imported alongside the SMA strategy so both live in one test file.
-from src.strategies.time_series_momentum import TimeSeriesMomentumStrategy
+# momentum.  month_end_indices is the shared month-end helper extracted from the
+# strategy; imported here so the new helper test can exercise it directly.
+from src.strategies.time_series_momentum import (
+    TimeSeriesMomentumStrategy,
+    month_end_indices,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -765,3 +769,66 @@ def test_tsmom_adj_close_basis_differs_from_close():
     # changes the trailing-return sign (LONG vs FLAT) across the warmed-up
     # region, proving the strategy's price basis actually drives the signal.
     assert not np.array_equal(close_signals, adj_signals)
+
+
+# ---------------------------------------------------------------------------
+# 12. month_end_indices helper (shared month-end detection)
+# ---------------------------------------------------------------------------
+
+
+def test_month_end_indices_picks_last_bar_of_each_month():
+    """month_end_indices returns each calendar month's last-bar index, final bar forced."""
+
+    # Build bars with EXPLICIT dates spanning three distinct calendar months, so
+    # the expected month-end positions are obvious by hand:
+    #   index 0,1,2 → Jan 29, 30, 31 2024  (last Jan bar = index 2)
+    #   index 3,4   → Feb 1, 2 2024        (last Feb bar = index 4)
+    #   index 5,6   → Mar 15, 20 2024      (last bar overall = index 6, mid-month)
+    # Expected month-end indices are therefore [2, 4, 6]: the last Jan bar, the
+    # last Feb bar, and the final bar (Mar 20) forced as a month-end by convention
+    # even though it is NOT the calendar end of March.
+    dates = [
+        datetime(2024, 1, 29, tzinfo=timezone.utc),  # index 0 — Jan
+        datetime(2024, 1, 30, tzinfo=timezone.utc),  # index 1 — Jan
+        datetime(2024, 1, 31, tzinfo=timezone.utc),  # index 2 — last Jan bar
+        datetime(2024, 2, 1, tzinfo=timezone.utc),   # index 3 — Feb
+        datetime(2024, 2, 2, tzinfo=timezone.utc),   # index 4 — last Feb bar
+        datetime(2024, 3, 15, tzinfo=timezone.utc),  # index 5 — Mar
+        datetime(2024, 3, 20, tzinfo=timezone.utc),  # index 6 — final bar (forced)
+    ]
+
+    # Construct one OHLCVBar per date; only the timestamp matters to the helper,
+    # so the price fields are arbitrary constants (close=adj_close=100.0).
+    bars = [
+        OHLCVBar(
+            symbol="TEST",            # arbitrary; helper reads only timestamps
+            timestamp=ts,             # the only field month_end_indices reads
+            open=100.0,               # dummy
+            high=100.0,               # dummy
+            low=100.0,                # dummy
+            close=100.0,              # dummy
+            adj_close=100.0,          # dummy
+            volume=1000,              # dummy
+            timeframe="1d",           # daily
+            source="test",            # provenance marker
+        )
+        for ts in dates
+    ]
+
+    # Compute the month-end indices via the shared helper under test.
+    result = month_end_indices(bars)
+
+    # The result must be a numpy integer array (positional indices), so that
+    # callers can use it directly for .iloc / slicing without a cast.
+    assert isinstance(result, np.ndarray)
+    assert result.dtype.kind == "i"
+
+    # Exact expected positions, derived by hand from the dates above.
+    assert list(result) == [2, 4, 6]
+
+    # The final element is always len(bars) - 1 — the forced-final-month-end
+    # convention — even though Mar 20 is mid-month, not a calendar month end.
+    assert result[-1] == len(bars) - 1
+
+    # The indices must be strictly ascending (month-ends occur in time order).
+    assert list(result) == sorted(result)

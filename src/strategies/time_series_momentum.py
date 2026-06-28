@@ -61,6 +61,61 @@ from src.strategies.base import (
 
 
 # ---------------------------------------------------------------------------
+# Shared month-end detection
+# ---------------------------------------------------------------------------
+
+
+def month_end_indices(bars: list[OHLCVBar]) -> np.ndarray:
+    """Return the ascending positional indices of each calendar month's LAST bar.
+
+    A bar is a month-end when the NEXT bar belongs to a different calendar month;
+    by convention the FINAL bar of the series is ALWAYS treated as a month-end
+    (it has no "next" bar to compare against) — matching the is_month_end[-1] =
+    True rule the strategy has always used.
+
+    The year*12+month integer arithmetic is used DELIBERATELY instead of
+    pandas to_period("M"): to_period drops timezone info on our tz-aware UTC
+    index and would emit a UserWarning on every call, whereas the arithmetic is
+    tz-safe.  This is the same rationale carried over from the inline block.
+
+    This helper assumes NON-EMPTY input: generate_signals validates bars
+    non-empty upstream (and is the only caller today), so an empty guard here
+    would be dead code that changes nothing.
+
+    Extracted so the strategy and any consumer that needs the warm-up boundary
+    (e.g. a momentum Optuna fitter computing the lookback-th month-end index)
+    share ONE definition of "month-end" — structural agreement rather than two
+    copies that could silently drift, the same reasoning behind _stitch_oos in
+    walk_forward.py.
+    """
+    # Build a tz-aware DatetimeIndex from the bars' real timestamps, IN ARRIVAL
+    # ORDER (bars are assumed ascending chronological, as everywhere else).
+    index = pd.DatetimeIndex([b.timestamp for b in bars])
+
+    # Convert each timestamp to a single integer "month code" (year*12+month)
+    # so consecutive bars in the same calendar month share a code and a month
+    # boundary shows up as a code change.  tz-safe (see docstring).
+    month_codes = index.year * 12 + index.month
+
+    # Pre-allocate the boolean month-end mask, one slot per bar.  We fill it
+    # explicitly below so the month-end is a REAL trading date, never a synthetic
+    # calendar month-end that could land on a non-trading day.
+    mask = np.empty(len(bars), dtype=bool)
+
+    # A bar is a month-end when the NEXT bar's month code differs from its own:
+    # month_codes[:-1] != month_codes[1:] is True exactly at those boundary bars.
+    mask[:-1] = month_codes[:-1] != month_codes[1:]
+
+    # The very last bar has no "next" bar to compare against and, by convention,
+    # always qualifies as a month-end observation.
+    mask[-1] = True
+
+    # np.where(mask)[0] returns the ascending positional indices where mask is
+    # True — exactly the month-end bar positions, in order.
+    return np.where(mask)[0]
+
+
+# ---------------------------------------------------------------------------
 # Time-Series Momentum concrete strategy
 # ---------------------------------------------------------------------------
 
@@ -153,34 +208,19 @@ class TimeSeriesMomentumStrategy(Strategy):
             dtype=np.float64,
         )
 
-        # Convert each bar's timestamp to a single integer "month code"
-        # (year * 12 + month) so consecutive bars in the same calendar month
-        # share a code and a month boundary shows up as a code change. We do
-        # this with .year/.month arithmetic rather than to_period("M") because
-        # to_period drops timezone info on our tz-aware UTC index and would
-        # emit a UserWarning on every call; the arithmetic is tz-safe.
-        month_codes = close_series.index.year * 12 + close_series.index.month
-
-        # Pre-allocate a boolean mask marking which bars are the LAST bar of
-        # their calendar month. We fill it explicitly below rather than relying
-        # on resample("ME").last(), so the signal-change bar is a REAL trading
-        # date and never a synthetic calendar month-end that lands on a weekend.
-        is_month_end = np.empty(len(close_series), dtype=bool)
-
-        # A bar qualifies as a month-end if the NEXT bar belongs to a different
-        # month/year: month_codes[:-1] != month_codes[1:] is True exactly at
-        # those boundary bars. This compares each bar's month to the following
-        # bar's, which is precisely the "next bar in a different year or month"
-        # rule. The element-wise comparison yields a plain positional bool array.
-        is_month_end[:-1] = month_codes[:-1] != month_codes[1:]
-
-        # The very last bar has no "next" bar to compare against, and by
-        # convention the final bar always qualifies as a month-end observation.
-        is_month_end[-1] = True
+        # Positional indices of each calendar month's last bar, via the shared
+        # helper above.  Extracting this means the strategy and any consumer that
+        # needs the warm-up boundary (e.g. the momentum Optuna fitter) compute
+        # "month-end" from ONE definition, so they cannot drift apart.
+        mei = month_end_indices(bars)
 
         # Select just the month-end closes, still indexed at their real
         # trading-date timestamps. This is the monthly series we reason over.
-        month_end_close = close_series[is_month_end]
+        # .iloc[mei] selects the same positions, in the same order, that the old
+        # close_series[boolean_mask] selected — np.where(mask)[0] is exactly the
+        # True positions of that mask — so month_end_close, its DatetimeIndex, M,
+        # the guard, trailing_return, monthly_signal, and the ffill are unchanged.
+        month_end_close = close_series.iloc[mei]
 
         # M is the number of month-end observations we actually have.
         M = len(month_end_close)
