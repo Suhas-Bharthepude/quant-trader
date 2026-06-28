@@ -40,6 +40,21 @@ from src.strategies.sma_crossover import SMACrossoverStrategy
 # The factory under test.
 from src.research.optuna_fit import make_sma_optuna_fit_fn
 
+# numpy supplies array equality / argmax helpers used by the momentum tests below.
+import numpy as np
+
+# The momentum fitter under test, plus the strategy it returns and the shared
+# month-end helper the warm-only test uses to reconstruct the warm-up boundary.
+from src.research.optuna_fit import make_tsmom_optuna_fit_fn
+from src.strategies.time_series_momentum import (
+    TimeSeriesMomentumStrategy,
+    month_end_indices,
+)
+
+# SIGNAL_FLAT identifies warm-up / flat bars when locating the first non-flat
+# signal in the warm-only test.
+from src.strategies.base import SIGNAL_FLAT
+
 # The seam end-to-end test drives the real validator the same way step 3's CLI
 # will; WalkForwardResult is its frozen output type.
 from src.research.walk_forward import (
@@ -271,3 +286,206 @@ def test_recorded_sharpe_is_warm_only():
     assert record[0]["in_sample_sharpe"] == pytest.approx(warm_only)
     # ...and is NOT the full-window Sharpe (proves the warm-up region was dropped).
     assert record[0]["in_sample_sharpe"] != pytest.approx(full_window)
+
+
+# ===========================================================================
+# make_tsmom_optuna_fit_fn — momentum fitter (tunes the single lookback)
+# ===========================================================================
+#
+# make_price_bars uses CALENDAR-daily timestamps (one per day, weekends
+# included), so make_price_bars(400) spans 400 calendar days ≈ 14 distinct
+# calendar months → ~14 month-end observations, comfortably above the
+# lookback_range used below.  The small kwargs keep each seeded study sub-second.
+
+# Shared small momentum search params: a one-param lookback range and a low trial
+# count.  Kept here so every momentum test uses the identical search and one edit
+# retunes them all (mirrors _SMALL_KW for the SMA fitter).
+_TSMOM_SMALL_KW = dict(n_trials=8, lookback_range=(3, 6))
+
+
+def test_tsmom_reproducible_with_same_seed():
+    """Two momentum fit_fns with the same seed on the same window pick the same lookback.
+
+    TPESampler(seed) makes the trial sequence deterministic, so two independent
+    studies with the same seed must converge on the same best lookback and record
+    the same in_sample_sharpe — the repeatability the tax CLI relies on.
+    """
+    train_bars = make_price_bars(400)  # ~14 month-ends ≫ lookback_range high (6)
+
+    # Two independent fit_fns, same seed → same search → same chosen lookback.
+    rec_a: list[dict] = []
+    rec_b: list[dict] = []
+    a = make_tsmom_optuna_fit_fn(seed=42, record=rec_a, **_TSMOM_SMALL_KW)(train_bars)
+    b = make_tsmom_optuna_fit_fn(seed=42, record=rec_b, **_TSMOM_SMALL_KW)(train_bars)
+
+    # The returned strategies must carry the identical tuned lookback.
+    assert a.lookback == b.lookback
+    # ...and the recorded warm-only Sharpe must match exactly (same study path).
+    assert rec_a[0]["in_sample_sharpe"] == pytest.approx(rec_b[0]["in_sample_sharpe"])
+
+
+def test_tsmom_returns_usable_strategy():
+    """The factory returns a TimeSeriesMomentumStrategy whose generate_signals runs clean.
+
+    Beyond type, the contract is that the returned strategy is immediately usable:
+    the lookback clamp guarantees the chosen lookback is valid for this bar count,
+    so generate_signals must not raise and must honour the int8 / length contract.
+    """
+    train_bars = make_price_bars(400)
+    result = make_tsmom_optuna_fit_fn(seed=42, **_TSMOM_SMALL_KW)(train_bars)
+
+    # The returned object is the momentum strategy, not the SMA one.
+    assert isinstance(result, TimeSeriesMomentumStrategy)
+
+    # Must not raise — the clamp design exists to keep this call valid — and must
+    # return the canonical int8 array aligned 1:1 with the bars.
+    signals = result.generate_signals(train_bars)
+    assert signals.dtype == np.int8
+    assert len(signals) == len(train_bars)
+
+
+def test_tsmom_record_accumulates_per_call():
+    """A shared record list gets one well-formed dict per fit_fn call, in order.
+
+    record is the side-channel the tax CLI uses to pair each fold's in-sample
+    Sharpe against its OOS Sharpe.  Calling the fit_fn twice (two folds) must leave
+    exactly two entries, each carrying a lookback and a float in_sample_sharpe —
+    the momentum analogue of the SMA fitter's fast/slow record (single key now).
+    """
+    train_bars = make_price_bars(400)
+    record: list[dict] = []
+    fit_fn = make_tsmom_optuna_fit_fn(seed=42, record=record, **_TSMOM_SMALL_KW)
+
+    # Two calls simulate two folds; the validator calls fit_fn once per fold.
+    fit_fn(train_bars)
+    fit_fn(train_bars)
+
+    assert len(record) == 2
+    for entry in record:
+        # The SMA fitter's {fast, slow, in_sample_sharpe} becomes {lookback, ...}.
+        assert set(entry.keys()) == {"lookback", "in_sample_sharpe"}
+        # in_sample_sharpe is study.best_value — a Python float.
+        assert isinstance(entry["in_sample_sharpe"], float)
+
+
+def test_tsmom_plugs_into_walk_forward_seam():
+    """The momentum fit_fn drives walk_forward_validate end-to-end without error.
+
+    Integration check: the factory output satisfies the seam's
+    Callable[[list[OHLCVBar]], Strategy] contract, so the validator can fit a fresh
+    lookback per fold and return a well-formed WalkForwardResult.  A basis-matched
+    Backtester is passed as backtester= (price_field on both sides), so the Day-32
+    basis-consistency guard stays inert — exactly how the real tax CLI will call it.
+    """
+    bars = make_price_bars(800)  # ~26 months, so each fold's train has many month-ends
+    # train=300 (~10 months ≫ lookback high), test=120, default step → 4 folds.
+    splits = walk_forward_splits(bars, train_size=300, test_size=120)
+
+    # Engine and fitter share the SAME price_field, so engine basis == strategy
+    # basis by construction and the guard cannot fire.
+    engine = Backtester(price_field="adj_close")
+    fit_fn = make_tsmom_optuna_fit_fn(
+        seed=42, n_trials=5, lookback_range=(3, 5), price_field="adj_close"
+    )
+    result = walk_forward_validate(
+        splits, TimeSeriesMomentumStrategy(12), backtester=engine, fit_fn=fit_fn
+    )
+
+    assert isinstance(result, WalkForwardResult)
+    assert result.n_folds == len(splits)
+    assert result.n_folds >= 1
+    assert len(result.per_fold) == len(splits)
+
+
+def test_tsmom_lookback_clamped_to_train_month_ends():
+    """A short train window never trips TSMOM's M>lookback guard — the clamp protects it.
+
+    A 150-calendar-day window spans only ~5 distinct months (≈5 month-ends).  Even
+    with lookback_range high=18 (far above 5), the per-window clamp pins the upper
+    bound to n_month_ends - 1, so every suggested lookback is strictly below the
+    month-end count and the strategy is always constructible.  The fit must
+    complete WITHOUT raising and choose a lookback < the available month-ends.
+    """
+    train_bars = make_price_bars(150)  # ~5 distinct calendar months
+
+    # The number of month-end observations this window actually has, via the SAME
+    # helper the fitter and strategy use.
+    n_month_ends = len(month_end_indices(train_bars))
+
+    # high=18 deliberately exceeds n_month_ends so the clamp is what prevents a
+    # guard trip; if the clamp were absent, a suggested lookback >= n_month_ends
+    # would make generate_signals raise mid-search.
+    record: list[dict] = []
+    result = make_tsmom_optuna_fit_fn(
+        seed=42, n_trials=8, lookback_range=(3, 18), record=record
+    )(train_bars)
+
+    # Completed without raising and returned a constructible strategy whose
+    # lookback is strictly below the month-end count (so M > lookback holds).
+    assert isinstance(result, TimeSeriesMomentumStrategy)
+    assert result.lookback < n_month_ends
+    assert record[0]["lookback"] < n_month_ends
+
+
+def test_tsmom_recorded_sharpe_is_warm_only():
+    """The recorded Sharpe is the warm-up-BOUNDARY slice, NOT the first-non-flat slice.
+
+    This is the apples-to-apples-with-OOS lock.  We hand-build a train window that,
+    AFTER the (lookback=2) warm-up, sits legitimately FLAT for several month-ends
+    (a decline) and only later turns LONG (a recovery).  Those post-warm-up FLAT
+    bars are REAL positions the validator's OOS window also scores, so the honest
+    in-sample slice must START at the warm-up boundary (mei_train[lookback]) and
+    KEEP them — not skip ahead to the first LONG bar.
+
+    Price path (240 calendar days = Jan–Aug 2024, 8 month-ends; lookback pinned
+    to 2 via lookback_range=(2, 2)):
+      * days 0..150  decline 200 → 50  (each month-end's trailing 2-month return
+                     is negative → FLAT through the early post-warm-up months)
+      * days 151..239 recover 51 → 139 (later month-ends' trailing return turns
+                     positive → LONG)
+    So the warmed-up region LEADS with flat bars before the first LONG, making the
+    warm-up-boundary slice and the first-non-flat slice genuinely different.
+    """
+    # Decline then recover; strictly positive throughout (min 50) so every log
+    # return is well-defined.
+    closes = [200.0 - i for i in range(151)]                 # days 0..150: 200 → 50
+    closes += [50.0 + (j + 1) for j in range(89)]            # days 151..239: 51 → 139
+    train_bars = make_bars_from_closes(closes)
+
+    # Pin lookback=2 with a degenerate range so the chosen value is known and the
+    # warm-up boundary is exactly the 3rd month-end (0-indexed position 2).
+    record: list[dict] = []
+    make_tsmom_optuna_fit_fn(
+        seed=42, n_trials=5, lookback_range=(2, 2), price_field="close", record=record
+    )(train_bars)
+
+    lookback = record[0]["lookback"]
+    assert lookback == 2  # precondition: the degenerate range forced lookback=2
+
+    # Independently reconstruct what the objective scored for this lookback, on the
+    # SAME frictionless, basis-matched engine the fitter hoists internally.
+    strat = TimeSeriesMomentumStrategy(lookback=lookback, price_field="close")
+    signals = strat.generate_signals(train_bars)
+    result = Backtester(annualization_factor=252, price_field="close").run(train_bars, signals)
+
+    # Warm-up BOUNDARY slice: returns from the lookback-th month-end's bar onward —
+    # the exact slice the fitter scores.
+    mei_train = month_end_indices(train_bars)
+    warm_start = int(mei_train[lookback])
+    warm_boundary_sharpe = metrics.sharpe_ratio(result.returns[warm_start:], 252)
+
+    # FIRST-NON-FLAT slice: returns from the first bar carrying a non-FLAT signal.
+    # Because the warmed-up region leads with FLAT bars, this index is strictly
+    # later than warm_start, so the two slices — and their Sharpes — differ.
+    first_nonflat = int(np.argmax(signals != SIGNAL_FLAT))
+    first_nonflat_sharpe = metrics.sharpe_ratio(result.returns[first_nonflat:], 252)
+
+    # Precondition for a meaningful test: the path really does lead with flats, so
+    # the two slice starts genuinely differ (otherwise the inequality is vacuous).
+    assert first_nonflat > warm_start
+
+    # The recorded value IS the warm-up-boundary Sharpe (keeps post-warm-up flats)...
+    assert record[0]["in_sample_sharpe"] == pytest.approx(warm_boundary_sharpe)
+    # ...and is NOT the first-non-flat Sharpe — the test would FAIL if the fitter
+    # had sliced at the first LONG instead of the warm-up boundary.
+    assert record[0]["in_sample_sharpe"] != pytest.approx(first_nonflat_sharpe)

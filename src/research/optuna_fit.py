@@ -44,6 +44,16 @@ from src.strategies.base import Strategy
 # exactly why the param clamps below pin slow < len(train_bars).
 from src.strategies.sma_crossover import SMACrossoverStrategy
 
+# TimeSeriesMomentumStrategy is the strategy the momentum fitter below tunes
+# (its single `lookback` knob); month_end_indices is the shared month-end helper
+# extracted from that strategy, reused here so the fitter's warm-up boundary is
+# computed from the SAME month-end definition the strategy uses — they cannot
+# drift apart, by construction.
+from src.strategies.time_series_momentum import (
+    TimeSeriesMomentumStrategy,
+    month_end_indices,
+)
+
 # Backtester runs each trial to produce the per-bar return series; one instance
 # is hoisted per fit_fn call (see fit_fn) since .run is pure and reusable.
 from src.backtest.engine import Backtester
@@ -210,5 +220,166 @@ def make_sma_optuna_fit_fn(
         # Return the best strategy; the seam warms it over train+test and scores
         # it on the test window only.
         return SMACrossoverStrategy(best_fast, best_slow)
+
+    return fit_fn
+
+
+def make_tsmom_optuna_fit_fn(
+    n_trials: int = 30,
+    seed: int = 42,
+    lookback_range: tuple[int, int] = (3, 18),
+    annualization_factor: int = 252,
+    price_field: str = "close",
+    record: list[dict] | None = None,
+) -> Callable[[list[OHLCVBar]], Strategy]:
+    """Build a fit_fn that tunes TimeSeriesMomentumStrategy's lookback via Optuna.
+
+    The returned callable matches the walk_forward_validate seam contract:
+    fit_fn(train_bars) -> Strategy.  Each call runs an independent Optuna study
+    that maximises WARM-ONLY in-sample Sharpe over `train_bars`, then returns a
+    TimeSeriesMomentumStrategy built from the best lookback found.  Like the SMA
+    fitter, the recorded in_sample_sharpe is the active-regime (warm-up-dropped)
+    Sharpe, directly comparable to the validator's already-warm OOS Sharpe, and
+    the objective reads train_bars EXCLUSIVELY — never test bars — so the
+    walk-forward no-lookahead guarantee is respected here too.
+
+    TSMOM has ONE tuned knob (lookback), unlike SMA's two (fast, slow), so the
+    search is over a single parameter and the record carries a single key.
+
+    Args:
+        n_trials:             Optuna trials per fold.  More trials = better
+                              optimum but slower; the default 30 matches the SMA
+                              fitter — a reasonable trade-off for a one-param
+                              search (more than enough to cover a small integer
+                              lookback range).
+        seed:                 TPESampler seed.  Fixing it makes the trial
+                              sequence — and therefore the chosen lookback —
+                              deterministic for a given train window, which is
+                              what the reproducibility test pins.
+        lookback_range:       Inclusive (low, high) MONTH bounds for the single
+                              tuned parameter.  high is clamped down per-window so
+                              a trial can never exceed the available month-ends
+                              (see the objective's lookback_hi); low is respected
+                              as-is.  TSMOM has one knob, so this single range
+                              replaces the SMA fitter's fast_range/slow_range.
+        annualization_factor: Bars per year for Sharpe annualisation.  Must match
+                              the value the validator uses (default 252) so the
+                              recorded in_sample_sharpe and the validator's OOS
+                              Sharpe annualise to the same units.  It does NOT
+                              change which lookback wins (a monotonic scale leaves
+                              the argmax unchanged); it only sets the recorded
+                              value's units.
+        price_field:          Price basis ("close" or "adj_close").  Threaded into
+                              BOTH the internal Backtester AND every trial's
+                              TimeSeriesMomentumStrategy from this ONE variable, so
+                              in-sample scoring uses the SAME basis the OOS verdict
+                              uses; the engine basis and the strategy basis are
+                              therefore equal BY CONSTRUCTION (the Day-32
+                              basis-consistency guard in walk_forward_validate is a
+                              backstop, never the mechanism).  This is the one real
+                              divergence from the SMA fitter, which has no basis.
+        record:               Optional side-channel list.  When provided, one dict
+                              is appended per fit_fn call (i.e. per fold, in fold
+                              order) carrying the chosen lookback and the warm-only
+                              in-sample Sharpe: {"lookback": ..., "in_sample_sharpe":
+                              ...} — the SMA fitter's fast/slow keys collapse to a
+                              single lookback key.
+
+    Returns:
+        Callable[[list[OHLCVBar]], Strategy] — the fit_fn for the seam.
+    """
+
+    def fit_fn(train_bars: list[OHLCVBar]) -> Strategy:
+        """Optimise the TSMOM lookback on train_bars and return the best strategy."""
+
+        # Month-end positions of THIS train window, computed ONCE via the shared
+        # helper before the objective.  Using month_end_indices (the very function
+        # TimeSeriesMomentumStrategy uses internally) means the lookback clamp and
+        # the warm-up slice below cannot drift from the strategy's actual warm-up:
+        # "month-end" has exactly one definition across both.
+        mei_train = month_end_indices(train_bars)
+
+        # Number of month-end observations available in this train window — the
+        # ceiling the lookback must stay strictly below (TSMOM needs M > lookback).
+        n_month_ends = len(mei_train)
+
+        # Hoist the Backtester out of the objective: .run is pure, so one instance
+        # serves every trial.  THE divergence from the SMA fitter: price_field is
+        # threaded in so in-sample returns use the same basis (e.g. adj_close total
+        # return) the verdict measures OOS.  Deliberately NOT threading
+        # cash_yield/fee/slippage — in-sample stays frictionless exactly like the
+        # SMA fitter, so the overfitting tax isolates parameter-selection
+        # overfitting, not cost modeling.  annualization_factor is fixed here so
+        # every trial's Sharpe — and the recorded best — use the validator's units.
+        bt = Backtester(annualization_factor=annualization_factor, price_field=price_field)
+
+        def objective(trial: optuna.Trial) -> float:
+            # --- lookback -----------------------------------------------------
+            # Clamp the lookback upper bound to n_month_ends - 1 so a trial can
+            # NEVER trip TSMOM's "M > lookback" guard on this train window:
+            # TimeSeriesMomentumStrategy.generate_signals raises when the number
+            # of month-ends M is <= lookback, and n_month_ends - 1 guarantees the
+            # suggested lookback is strictly fewer than the available month-ends,
+            # so every trial is constructible and scoreable.  This mirrors the SMA
+            # fitter's min(..., len-2) / min(..., len-1) window clamps.
+            lookback_hi = min(lookback_range[1], n_month_ends - 1)
+            lookback = trial.suggest_int("lookback", lookback_range[0], lookback_hi)
+
+            # Build the strategy on the SAME price_field variable as the engine
+            # above, so signal basis and scoring basis agree by construction.
+            # generate_signals reads train_bars only — never test bars — keeping
+            # the OOS measurement honest.
+            strat = TimeSeriesMomentumStrategy(lookback=lookback, price_field=price_field)
+            signals = strat.generate_signals(train_bars)
+            result = bt.run(train_bars, signals)
+
+            # WARM-ONLY in-sample slice via the month-end boundary — the momentum
+            # analogue of the SMA fitter's result.returns[slow:].  The trailing
+            # return is first DEFINED at the lookback-th month-end (0-indexed
+            # position `lookback`), whose bar index is mei_train[lookback];
+            # everything before it is the forced-FLAT warm-up (no prior month-end
+            # `lookback` positions earlier to divide against).
+            #
+            # CRITICAL: we slice at the warm-up BOUNDARY, NOT at the first
+            # non-FLAT signal.  Momentum legitimately sits FLAT after warm-up
+            # whenever the trailing return is negative (a downtrend) — those flat
+            # bars are REAL positions the OOS window also scores, so dropping them
+            # would inflate the in-sample Sharpe and corrupt the tax.  Slicing at
+            # the warm-up boundary keeps both the LONG and the legitimate-flat
+            # post-warm-up bars, matching how the validator scores the OOS window.
+            #
+            # lookback <= lookback_hi <= n_month_ends - 1, so mei_train[lookback]
+            # is always a valid index into mei_train.
+            warm_start = int(mei_train[lookback])
+            warm_returns = result.returns[warm_start:]
+            return metrics.sharpe_ratio(warm_returns, annualization_factor)
+
+        # A fresh study per fold: maximise Sharpe, seeded TPE for determinism —
+        # IDENTICAL construction to the SMA fitter.
+        study = optuna.create_study(
+            direction="maximize",
+            sampler=optuna.samplers.TPESampler(seed=seed),
+        )
+        study.optimize(objective, n_trials=n_trials)
+
+        best_lookback = study.best_params["lookback"]
+
+        # Side-channel for the caller.  record is appended ONCE per fit_fn call,
+        # and the validator calls fit_fn once per fold in chronological order, so
+        # record[i] aligns with WalkForwardResult.per_fold[i].  Because the
+        # objective is itself warm-only, study.best_value IS the warm-only Sharpe
+        # of the winning lookback — no separate recomputation is needed, exactly
+        # as in the SMA fitter.
+        if record is not None:
+            record.append(
+                {
+                    "lookback": best_lookback,
+                    "in_sample_sharpe": study.best_value,
+                }
+            )
+
+        # Return the best strategy on the SAME price_field, so the strategy the
+        # validator warms over train+test and scores OOS uses the identical basis.
+        return TimeSeriesMomentumStrategy(lookback=best_lookback, price_field=price_field)
 
     return fit_fn
