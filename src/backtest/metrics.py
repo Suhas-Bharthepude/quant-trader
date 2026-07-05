@@ -131,6 +131,135 @@ def sharpe_ratio(returns: np.ndarray, annualization_factor: int = 252) -> float:
     return float(mean_return / std_return * np.sqrt(annualization_factor))
 
 
+def downside_deviation(
+    returns: np.ndarray,
+    annualization_factor: int = 252,
+    target: float = 0.0,
+) -> float:
+    """Return the ANNUALIZED downside deviation of the given returns array.
+
+    Downside deviation is the RMS (root-mean-square) of ONLY the below-target
+    return deviations — upside swings contribute zero.  It is the denominator of
+    the Sortino ratio, the downside-only analogue of the standard deviation that
+    sits in the denominator of the Sharpe ratio.  Like sharpe_ratio, this value
+    is annualised by multiplying the per-bar figure by sqrt(annualization_factor)
+    — the SAME annualisation Sharpe uses — so a downside deviation returned here
+    is directly comparable, unit-for-unit, to the std that feeds Sharpe.
+
+    Args:
+        returns:              1-D float64 ndarray of per-bar returns.  Passed
+                              exactly as-is; no internal slicing is performed
+                              (mirrors sharpe_ratio's no-[1:] contract).
+        annualization_factor: Number of bars per year for scaling.  Defaults to
+                              252 (US trading days), matching sharpe_ratio.
+        target:               Minimum acceptable return (MAR) below which a
+                              return counts as "downside".  Defaults to 0.0 so
+                              only actual losses are penalised, matching Sharpe's
+                              implicit risk-free rate of 0.
+
+    Returns:
+        Python float — float() is applied inside this function, matching
+        sharpe_ratio.  0.0 when every return is at or above target (no downside).
+    """
+    # Same small-sample short-circuit as sharpe_ratio: fewer than 2 observations
+    # cannot yield a meaningful dispersion estimate, so return 0.0 rather than
+    # attempting arithmetic on a degenerate array.
+    if len(returns) < 2:
+        return 0.0
+
+    # Below-target deviations only: np.minimum(returns - target, 0.0) keeps the
+    # deviation where a return is BELOW target (a negative number) and clamps it
+    # to 0.0 where the return is AT OR ABOVE target — so upside never contributes.
+    downside = np.minimum(returns - target, 0.0)
+
+    # RMS of those below-target deviations.  Two conventions are load-bearing here:
+    #
+    #   (a) N is the TOTAL number of returns.  np.mean divides the sum of squared
+    #       deviations by len(returns) — ALL observations — NOT by the count of
+    #       below-target returns.  This is the standard published-Sortino
+    #       convention; dividing by the below-target count instead would inflate
+    #       the deviation and make the resulting Sortino non-comparable to how
+    #       Sortino is normally reported in the literature.
+    #
+    #   (b) This is a POPULATION RMS (ddof=0 — np.mean divides by N), DELIBERATELY
+    #       DIFFERENT from sharpe_ratio's std(ddof=1) Bessel-corrected sample std.
+    #       Downside deviation is conventionally a population RMS over all
+    #       observations.  A future reader must NOT "fix" this to ddof=1 to match
+    #       Sharpe — the ddof mismatch between the two metrics is intentional and
+    #       correct.
+    dd = np.sqrt(np.mean(downside ** 2))
+
+    # Annualise the same way sharpe_ratio does (* sqrt(annualization_factor)) and
+    # wrap in float() to return a Python float, matching sharpe_ratio's type.
+    # No zero-guard is needed here: dd == 0.0 is a legitimate return value (all
+    # returns >= target); the divide-by-zero guard lives in sortino_ratio, the
+    # function that would actually divide by this value.
+    return float(dd * np.sqrt(annualization_factor))
+
+
+def sortino_ratio(
+    returns: np.ndarray,
+    annualization_factor: int = 252,
+    target: float = 0.0,
+) -> float:
+    """Return the annualised Sortino ratio of the given returns array.
+
+    The Sortino ratio has the SAME shape as the Sharpe ratio — mean return over
+    a dispersion measure, annualised — but its denominator is the DOWNSIDE
+    deviation rather than the full standard deviation.  Because only below-target
+    volatility enters the denominator, upside swings are not treated as risk, so
+    a strategy whose volatility is mostly to the upside scores higher on Sortino
+    than on Sharpe.  target defaults to 0.0 (MAR=0), matching Sharpe's implicit
+    risk-free rate of 0.
+
+    Args:
+        returns:              1-D float64 ndarray of per-bar returns.  Passed
+                              exactly as-is; no internal slicing (mirrors Sharpe).
+        annualization_factor: Number of bars per year for scaling.  Defaults to
+                              252 (US trading days), matching sharpe_ratio.
+        target:               Minimum acceptable return (MAR).  Defaults to 0.0.
+
+    Returns:
+        Python float — float() is applied inside this function, matching
+        sharpe_ratio.  Zero downside deviation → 0.0; NaN → 0.0.
+    """
+    # Same small-sample short-circuit as sharpe_ratio, checked FIRST: fewer than
+    # 2 observations cannot yield a meaningful ratio, so return 0.0.
+    if len(returns) < 2:
+        return 0.0
+
+    # Arithmetic mean of per-bar returns — the numerator, identical to the value
+    # sharpe_ratio uses as its numerator.
+    mean_return = returns.mean()
+
+    # Delegate the denominator to downside_deviation so there is ONE authoritative
+    # definition of downside deviation.  Note the returned dd is ALREADY annualised
+    # (it carries a * sqrt(annualization_factor) applied inside downside_deviation).
+    dd = downside_deviation(returns, annualization_factor, target)
+
+    # Zero-downside guard, mirroring sharpe_ratio's zero-variance guard EXACTLY:
+    # when every return is at or above target there are no below-target deviations,
+    # so dd is 0.0 and dividing by it would produce inf/nan.  Returning 0.0 (NOT
+    # nan) mirrors sharpe_ratio's guarded return value verbatim, reusing the SAME
+    # _ZERO_STD_TOLERANCE constant, so the two metrics behave identically at the
+    # degenerate boundary and no downstream table ever prints a nan.
+    if dd < _ZERO_STD_TOLERANCE or np.isnan(dd):
+        return 0.0
+
+    # Annualisation algebra — carefully derived so it matches sharpe_ratio's
+    # annualisation despite dd being already annualised:
+    #   sharpe   = (mean / per_bar_std) * sqrt(af)
+    #   here dd  = per_bar_dd * sqrt(af)          (annualised inside downside_deviation)
+    #   mean/dd  = mean / (per_bar_dd * sqrt(af)) = (mean / per_bar_dd) / sqrt(af)
+    # To reach the sharpe-consistent form (mean / per_bar_dd) * sqrt(af) we must
+    # multiply mean/dd by a FULL annualization_factor (not sqrt):
+    #   (mean / per_bar_dd) / sqrt(af) * af = (mean / per_bar_dd) * sqrt(af).
+    # So the ratio-with-already-annualised-dd multiplies by annualization_factor,
+    # NOT sqrt(annualization_factor).  Do NOT "simplify" this to sqrt(af) — that
+    # would silently under-annualise the Sortino relative to the Sharpe.
+    return float(mean_return / dd * annualization_factor)
+
+
 def max_drawdown(equity_curve: np.ndarray) -> float:
     """Return the maximum peak-to-trough decline as a positive fraction.
 

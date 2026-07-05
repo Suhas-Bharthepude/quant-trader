@@ -668,6 +668,29 @@ def test_wfv_buy_and_hold_known_monotonic_series():
     assert result.bh_return == pytest.approx(expected_bh)
 
 
+def test_wfv_sortino_fields_populated_both_paths():
+    """oos_sortino and bh_sortino are populated as finite floats end-to-end.
+
+    This does NOT re-test the Sortino math (that lives in test_metrics.py) — it
+    only pins that the validator threads the new scalar through _stitch_oos on
+    BOTH the strategy path (oos_sortino) and the benchmark path (bh_sortino), so
+    a construction that omitted either field would fail here rather than silently.
+    """
+    strategy = SMACrossoverStrategy(5, 10)
+    splits = walk_forward_splits(make_price_bars(30), train_size=20, test_size=5)
+    result = walk_forward_validate(splits, strategy)
+
+    # Both fields must exist and be plain floats (frozen dataclass required fields).
+    assert isinstance(result.oos_sortino, float)
+    assert isinstance(result.bh_sortino, float)
+
+    # On a monotonic-up run neither is nan — the guard only returns nan-free 0.0,
+    # and a real run with genuine downside yields a finite ratio. np.isfinite
+    # rejects both nan and inf, catching any mis-annualisation blow-up.
+    assert np.isfinite(result.oos_sortino)
+    assert np.isfinite(result.bh_sortino)
+
+
 # ---------------------------------------------------------------------------
 # Tests — fit_fn seam (per-fold strategy fitting)
 # ---------------------------------------------------------------------------

@@ -32,8 +32,10 @@ from datetime import datetime, timezone
 # The four pure functions under test, imported by name so the test bodies
 # read as plain function calls rather than module-qualified attribute lookups.
 from src.backtest.metrics import (
+    downside_deviation,
     max_drawdown,
     sharpe_ratio,
+    sortino_ratio,
     total_return,
     win_rate,
 )
@@ -187,6 +189,95 @@ def test_sharpe_does_not_skip_element_0():
     # pytest.approx(wrong_if_sliced) would NOT match result, which means
     # this test would catch a regression that added [1:] inside the function.
     assert result != pytest.approx(wrong_if_sliced)
+
+
+# ===========================================================================
+# downside_deviation
+# ===========================================================================
+
+
+def test_downside_deviation_known_value():
+    # Array [0.02, -0.03, 0.01, -0.01] with target=0.0:
+    #   below-target deviations (np.minimum(r - 0.0, 0.0)):
+    #     0.02 → 0.0     (>= target, clamped)
+    #    -0.03 → -0.03   (below target)
+    #     0.01 → 0.0     (>= target, clamped)
+    #    -0.01 → -0.01   (below target)
+    #   squared:        [0.0, 0.0009, 0.0, 0.0001]
+    #   mean over N=4:  (0.0 + 0.0009 + 0.0 + 0.0001) / 4 = 0.001 / 4 = 0.00025
+    #   per-bar dd:     sqrt(0.00025) = 0.0158113883...
+    #   annualized:     0.0158113883... * sqrt(252)
+    # The divide-by-N (not by the below-target count of 2) is asserted implicitly:
+    # dividing by 2 would give sqrt(0.0005) instead, a materially different value.
+    arr = np.array([0.02, -0.03, 0.01, -0.01])
+    # Expected computed with the same numpy calls the function uses so there is
+    # no second-rounding-path discrepancy; sqrt(0.00025) is the population RMS.
+    expected = np.sqrt(0.00025) * np.sqrt(252)
+    assert downside_deviation(arr) == pytest.approx(expected)
+
+
+def test_downside_deviation_all_above_target_is_zero():
+    # Every return is strictly positive → all >= target 0.0 → np.minimum clamps
+    # every deviation to 0.0 → RMS is exactly 0.0 → annualized dd is 0.0.
+    # This is the legitimate zero-downside case (no guard inside the function).
+    arr = np.array([0.01, 0.02, 0.03])
+    assert downside_deviation(arr) == 0.0
+
+
+# ===========================================================================
+# sortino_ratio
+# ===========================================================================
+
+
+def test_sortino_zero_downside_returns_zero_not_nan():
+    # CRITICAL guard test: an all-positive returns array has no below-target
+    # returns, so downside_deviation is 0.0 and the naive mean/dd would be inf/nan.
+    # The guard (dd < _ZERO_STD_TOLERANCE) must fire and return 0.0 instead.
+    arr = np.array([0.01, 0.02, 0.03])
+    result = sortino_ratio(arr)
+    # Must be exactly 0.0 (the guarded return), mirroring sharpe_ratio's zero-var path.
+    assert result == 0.0
+    # And explicitly NOT nan — proving the divide-by-zero was guarded, not executed.
+    assert not np.isnan(result)
+
+
+def test_sortino_len_below_2_returns_zero():
+    # Small-sample short-circuit (len < 2) mirrors sharpe_ratio: both a 0-length
+    # and a 1-length array return 0.0 before any dispersion arithmetic runs.
+    assert sortino_ratio(np.array([])) == 0.0
+    assert sortino_ratio(np.array([0.05])) == 0.0
+
+
+def test_sortino_exceeds_sharpe_when_upside_volatile():
+    # THE point of the metric.  This array has volatile UPSIDE (several large
+    # positive returns) but small controlled DOWNSIDE (a few tiny negatives):
+    #   full std (ddof=1) is inflated by the big positive swings, so Sharpe's
+    #   denominator is large; downside deviation ignores those upside swings, so
+    #   Sortino's denominator is much smaller.  With the same positive mean in the
+    #   numerator, Sortino must therefore score HIGHER than Sharpe on this array.
+    # This is exactly the behaviour that motivates adding the metric: upside
+    # volatility should not be penalised as risk.
+    arr = np.array([0.10, 0.12, -0.005, 0.09, -0.004, 0.11])
+    sortino = sortino_ratio(arr, annualization_factor=252)
+    sharpe = sharpe_ratio(arr, annualization_factor=252)
+    assert sortino > sharpe
+
+
+def test_sortino_matches_hand_computation():
+    # Pin the exact annualisation algebra so a future mis-annualisation is caught.
+    # Array [0.02, -0.03, 0.01, -0.01], target=0.0, annualization_factor=252:
+    #   mean            = (0.02 - 0.03 + 0.01 - 0.01) / 4 = -0.01 / 4 = -0.0025
+    #   annualized dd   = sqrt(0.00025) * sqrt(252)   (from the dd test above)
+    #   sortino         = mean / annualized_dd * annualization_factor
+    #                   = -0.0025 / (sqrt(0.00025) * sqrt(252)) * 252
+    # The * annualization_factor (full 252, NOT sqrt) is the derived-and-commented
+    # algebra in sortino_ratio; asserting the closed form here would fail loudly if
+    # anyone "simplified" it to sqrt(252).
+    arr = np.array([0.02, -0.03, 0.01, -0.01])
+    mean_return = arr.mean()
+    annualized_dd = np.sqrt(0.00025) * np.sqrt(252)
+    expected = float(mean_return / annualized_dd * 252)
+    assert sortino_ratio(arr, annualization_factor=252) == pytest.approx(expected)
 
 
 # ===========================================================================

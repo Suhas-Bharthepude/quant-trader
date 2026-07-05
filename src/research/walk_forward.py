@@ -256,6 +256,7 @@ class WalkForwardResult:
     # Scalar aggregates computed over the stitched OOS timeline.
     oos_total_return: float       # (oos_equity_curve[-1] / oos_equity_curve[0]) - 1
     oos_sharpe: float             # annualised Sharpe over oos_returns (no structural zeros)
+    oos_sortino: float            # annualised Sortino over oos_returns (downside-only denom)
     oos_max_drawdown: float       # worst peak-to-trough in oos_equity_curve, positive fraction
     oos_win_rate: float           # fraction of all OOS trades with return_pct > 0
 
@@ -267,6 +268,7 @@ class WalkForwardResult:
     # while a strategy adding real edge shows oos_* above the benchmark.
     bh_return: float              # stitched B&H total return over the OOS test windows
     bh_sharpe: float              # annualised B&H Sharpe over the same stitched returns
+    bh_sortino: float             # annualised B&H Sortino over the same stitched returns
     bh_max_drawdown: float        # worst peak-to-trough of the B&H stitched equity curve
 
     # Fold-level summary counts.
@@ -283,10 +285,11 @@ class WalkForwardResult:
 def _stitch_oos(
     per_fold: list[BacktestResult],
     annualization_factor: int,
-) -> tuple[np.ndarray, np.ndarray, float, float, float]:
+) -> tuple[np.ndarray, np.ndarray, float, float, float, float]:
     """Stitch per-fold test results into one OOS timeline and score it.
 
-    Returns (oos_returns, oos_equity_curve, total_return, sharpe, max_drawdown).
+    Returns (oos_returns, oos_equity_curve, total_return, sharpe, max_drawdown,
+    sortino).
 
     Factored out so the strategy path and the buy-and-hold benchmark are stitched
     and scored by byte-identical code — the ONLY thing that differs between them
@@ -325,11 +328,27 @@ def _stitch_oos(
     # the "does not skip element 0" contract documented in metrics.sharpe_ratio.
     oos_sharpe = metrics.sharpe_ratio(oos_returns, annualization_factor)
 
+    # sortino: computed from the SAME stitched oos_returns as the Sharpe directly
+    # above, with the SAME positional annualization_factor, so the two risk-adjusted
+    # numbers share units.  Downside deviation penalises only below-target (loss)
+    # volatility, so this is the upside-swing-neutral companion to oos_sharpe.
+    oos_sortino = metrics.sortino_ratio(oos_returns, annualization_factor)
+
     # max_drawdown: computed over the stitched equity curve so peak-to-trough
     # declines that span multiple fold boundaries are captured correctly.
     oos_max_drawdown = metrics.max_drawdown(oos_equity_curve)
 
-    return oos_returns, oos_equity_curve, oos_total_return, oos_sharpe, oos_max_drawdown
+    # Append oos_sortino as the LAST tuple element so existing positional unpacks
+    # only need the new trailing name added; element order is:
+    # (returns, equity_curve, total_return, sharpe, max_drawdown, sortino).
+    return (
+        oos_returns,
+        oos_equity_curve,
+        oos_total_return,
+        oos_sharpe,
+        oos_max_drawdown,
+        oos_sortino,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -587,6 +606,7 @@ def walk_forward_validate(
         oos_total_return,
         oos_sharpe,
         oos_max_drawdown,
+        oos_sortino,
     ) = _stitch_oos(per_fold, annualization_factor)
 
     # ------------------------------------------------------------------
@@ -597,7 +617,10 @@ def walk_forward_validate(
     # returns differ (always-long instead of strategy signals). We keep only the
     # three scalar benchmark metrics; the benchmark's returns/equity arrays are
     # not stored on the result (callers compare scalars, not curves).
-    _, _, bh_return, bh_sharpe, bh_max_drawdown = _stitch_oos(
+    # Positions line up with the strategy unpack above: elements 0 and 1
+    # (returns, equity_curve) are discarded; 2,3,4,5 are total_return, sharpe,
+    # max_drawdown, sortino — so bh_sortino is element 5, matching oos_sortino.
+    _, _, bh_return, bh_sharpe, bh_max_drawdown, bh_sortino = _stitch_oos(
         bh_per_fold, annualization_factor
     )
 
@@ -639,10 +662,12 @@ def walk_forward_validate(
         oos_equity_curve=oos_equity_curve,
         oos_total_return=oos_total_return,
         oos_sharpe=oos_sharpe,
+        oos_sortino=oos_sortino,
         oos_max_drawdown=oos_max_drawdown,
         oos_win_rate=oos_win_rate,
         bh_return=bh_return,
         bh_sharpe=bh_sharpe,
+        bh_sortino=bh_sortino,
         bh_max_drawdown=bh_max_drawdown,
         n_folds=n_folds,
         n_folds_positive_sharpe=n_folds_positive_sharpe,
