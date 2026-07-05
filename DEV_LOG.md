@@ -4,6 +4,104 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 34
+
+**Worked on:**
+- Added downside_deviation(returns, annualization_factor=252, target=0.0) and
+  sortino_ratio(returns, annualization_factor=252, target=0.0) to metrics.py
+  (commit "Add downside-deviation and Sortino metrics to walk-forward output"),
+  mirroring sharpe_ratio's shape.  The four existing metrics (total_return,
+  sharpe_ratio, max_drawdown, win_rate) and _ZERO_STD_TOLERANCE are byte-for-byte
+  unchanged; the two new functions are purely additive.  sortino_ratio CALLS
+  downside_deviation, so there is one authoritative definition of the
+  denominator. [+6 tests]
+- Threaded oos_sortino and bh_sortino onto WalkForwardResult: _stitch_oos now
+  returns a 6-tuple (sortino appended last, computed from the SAME stitched
+  oos_returns and SAME annualization_factor as the Sharpe directly above it), both
+  unpack sites (strategy path and B&H path) take the trailing name, the frozen
+  dataclass gained two REQUIRED fields (no defaults), and the single construction
+  site sets both.  So Sortino is populated everywhere Sharpe is, on both the
+  strategy and buy-and-hold paths. [+1 test, an end-to-end field-population check]
+- 204 tests green (was 197 at Day 33 close): +7 (six pure-metric tests in
+  test_metrics.py, one end-to-end field-population test in test_walk_forward.py).
+
+**Why it matters:**
+- Sharpe penalises upside volatility as if it were risk, which misjudges a
+  defensive trend-follower like TSMOM that sits flat in downturns and rides trends
+  up.  Sortino divides return by DOWNSIDE deviation only (the volatility of
+  below-target returns), so it does not punish a strategy for its good months.
+  This is the honest lens for the "loses on Sharpe, wins on drawdown" momentum
+  verdict: it will show whether momentum's Sharpe deficit is real underperformance
+  or a Sharpe artifact from penalised upside.  The metric is now computed and
+  stored on every WalkForwardResult; reading it into the momentum verdict is a
+  later step.
+
+**Architectural note:**
+- Annualisation algebra (the subtle spot): downside_deviation returns the
+  ANNUALISED downside deviation (per-bar dd * sqrt(annualization_factor)), so
+  sortino_ratio annualises the RATIO by multiplying by the FULL
+  annualization_factor, NOT sqrt.  Derivation: sharpe = (mean / per_bar_std) *
+  sqrt(af); here dd = per_bar_dd * sqrt(af) already, so mean/dd =
+  (mean/per_bar_dd)/sqrt(af), and * af yields (mean/per_bar_dd)*sqrt(af), matching
+  sharpe's form.  Using sqrt(af) instead would under-annualise Sortino by ~16x
+  (sqrt 252) and make it silently incomparable to the Sharpe column.  The
+  derivation is commented in the code and pinned by
+  test_sortino_matches_hand_computation.
+- Downside deviation divides the sum of squared below-target deviations by N
+  (TOTAL observations, population RMS, ddof=0), NOT by the below-target count and
+  NOT ddof=1.  This is the published-Sortino convention (comparable to how Sortino
+  is normally reported) and is DELIBERATELY different from sharpe's ddof=1 sample
+  std - a code comment says so explicitly so nobody "fixes" it.
+- Zero-downside guard mirrors sharpe's zero-variance guard EXACTLY: when every
+  return is at or above target there are no below-target deviations, so downside
+  deviation is 0.0 and a naive divide would be inf/nan.  sortino_ratio returns 0.0
+  (NOT nan) via the SAME _ZERO_STD_TOLERANCE constant, guard-before-divide, so no
+  downstream table ever prints a nan.  Also mirrors sharpe's len<2 short-circuit
+  to 0.0.
+- WalkForwardResult fields are REQUIRED, not defaulted: grep confirmed exactly ONE
+  construction site (walk_forward.py) and zero hand-constructions in tests, so a
+  required field is safe and prevents a future construction site silently omitting
+  Sortino (a default 0.0 would let that pass unnoticed).
+
+**Verification:**
+- Full suite 204 passed (was 197), only the pre-existing websockets
+  DeprecationWarning.  All 197 prior tests green unchanged (the change is purely
+  additive - no existing metric recomputed, no existing field moved).
+- New tests pin the load-bearing behaviour: a by-hand downside_deviation
+  known-value check (divides by N, not the below-target count); the
+  all-above-target -> 0.0 case; the CRITICAL zero-downside -> 0.0-not-nan guard
+  test; the len<2 -> 0.0 short-circuit; test_sortino_exceeds_sharpe_when_upside_
+  volatile (Sortino > Sharpe on an upside-volatile array - proves the metric
+  measures something different from Sharpe); test_sortino_matches_hand_computation
+  (pins the * annualization_factor algebra); and an end-to-end test that
+  oos_sortino/bh_sortino are finite floats on both paths.
+- Smoke check: sortino_ratio on an all-positive array printed 0.0 (not nan),
+  confirming the zero-downside guard fires end-to-end.
+- One code commit plus this DEV_LOG entry.
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- Surface Sortino in the momentum CLIs (deferred from today):
+  momentum_walkforward.py's table is on a "="*86 rule with 7 columns and needs a
+  widened rule plus two new VerdictRow fields threaded through summarize_verdict;
+  momentum_overfitting_tax.py builds rows from the imported TaxRow (no Sortino
+  field), so surfacing there means editing the shared SMA-path helper - out of
+  scope for the metric commit.  The fields EXIST on WalkForwardResult now; printing
+  them is a separate later commit.
+- Then re-read the momentum verdict through the Sortino lens: does momentum's
+  Sharpe deficit (lost to B&H on Sharpe 13/17) shrink under Sortino, or is the
+  return shortfall genuine?  Read what it says - do not assume Sortino rescues the
+  strategy.
+- Later / bigger: cross-sectional sector and cross-asset rotation on the ETF
+  basket (needs a portfolio-level backtester - breaks the current per-symbol
+  Strategy contract, a real architectural step up).
+- Housekeeping (non-urgent): commit README.md separately; backfill the [fill in]
+  time-spent placeholders in recent DEV_LOG entries.
+
+**Time spent:** 30 mins
+
 ## Day 33
 
 **Worked on:**
