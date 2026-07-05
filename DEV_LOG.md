@@ -4,6 +4,104 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 33
+
+**Worked on:**
+- Extracted month_end_indices(bars) into a shared module-level helper in
+  time_series_momentum.py and rewired generate_signals to use it (commit "Extract
+  month_end_indices helper from time-series momentum").  Pure no-op refactor: the
+  inline month-code / boolean-mask block became one helper call
+  (close_series.iloc[mei] selects byte-identically to the old
+  close_series[boolean_mask]), so every existing TSMOM signal is unchanged.  WHY
+  extract: the next commit's fitter needs the warm-up boundary computed from the
+  SAME month-end definition the strategy uses, so they cannot drift — the same
+  structural-agreement reasoning behind _stitch_oos. [+1 test, an honest by-hand
+  index check; all prior green is the no-op proof]
+- Added make_tsmom_optuna_fit_fn to optuna_fit.py (commit "Add
+  time-series-momentum Optuna fitter"), the momentum analogue of
+  make_sma_optuna_fit_fn.  Additive: the SMA fitter is byte-for-byte unchanged.
+  It tunes the SINGLE lookback (not fast/slow), threads ONE price_field variable
+  into BOTH the internal in-sample Backtester AND every trial's
+  TimeSeriesMomentumStrategy (so in-sample scoring matches the OOS basis by
+  construction; the Day-32 guard is a backstop, never the mechanism — the one
+  real divergence from the SMA fitter, which has no basis knob), clamps the
+  lookback upper bound to min(lookback_range[1], n_month_ends - 1) so a trial can
+  never trip TSMOM's M>lookback guard mid-search, and scores warm-only in-sample
+  Sharpe sliced at the warm-up BOUNDARY (mei_train[lookback]) — NOT the first
+  non-flat signal. [+6 tests]
+- Added scripts/momentum_overfitting_tax.py (commit "Add momentum overfitting-tax
+  CLI"), the momentum analogue of overfitting_tax.py: fixed TSMOM(12) vs per-fold
+  Optuna-tuned lookback across the etf_basket, reporting the overfitting tax.  It
+  constructs ONE frictionless adj_close Backtester and passes it as backtester= to
+  BOTH the fixed and fitted walk_forward_validate calls (overfitting_tax.py passes
+  none and rides the close default), threads price_field=adj_close into the fixed
+  strategy and the fitter too, defaults --train 756 / --test 252 (matching the
+  fixed momentum verdict's windows so the tax is comparable, NOT
+  overfitting_tax.py's 504/126), and reuses the pure summarize_tax / TaxRow by
+  import. [+2 tests]
+- 197 tests green (was 188 at Day 32 close).
+
+**Why it matters:**
+- This completes the machinery for the momentum verdict's second half: the fixed
+  TSMOM(12) verdict landed Day 32, and this adds the honest "does tuning the
+  lookback add OOS edge or just overfit?" comparison on the same adj_close basis.
+  The shared month-end helper makes the fitter's in-sample warm-up boundary agree
+  with the strategy's actual warm-up by construction, not by two copies that could
+  silently diverge and corrupt the tax.
+
+**Architectural note:**
+- The warm-only in-sample slice is the warm-up BOUNDARY (the lookback-th
+  month-end's bar index), NOT the first non-flat signal.  WHY: momentum
+  legitimately sits FLAT after warm-up whenever the trailing return is negative (a
+  downtrend), and those flat bars are REAL positions the OOS window also scores —
+  slicing past them to the first LONG would inflate the in-sample Sharpe and
+  corrupt the tax in any fold starting in a downtrend.  The boundary slice keeps
+  long AND legitimate-flat post-warm-up bars, matching how the validator scores
+  OOS.  A dedicated test pins this: on a decline-then-recover path that leads with
+  post-warm-up flats, the recorded Sharpe equals the boundary slice and differs
+  from the first-non-flat slice (it would fail if the fitter sliced at the first
+  long).
+- In-sample stays FRICTIONLESS on both the fitter and the tax CLI (price_field
+  only, no cost / yield), so the tax isolates parameter-selection overfitting, not
+  cost drag — exactly as the SMA tax does.
+- Sibling CLI over a --strategy flag on overfitting_tax.py: that file is
+  SMA-specific at every layer (hardcoded SMACrossoverStrategy(50,200),
+  make_sma_optuna_fit_fn), so a flag would branch every line; a sibling keeps each
+  CLI single-purpose, matching the momentum_walkforward.py precedent.
+- Three commits split helper → fitter → CLI so the only change to verdict-central
+  working code (the month_end_indices extraction) is its own
+  trivially-verifiable no-op commit.
+
+**Verification:**
+- Full suite 197 passed (was 188), only the pre-existing websockets
+  DeprecationWarning.  The no-op refactor kept all prior TSMOM tests green
+  unchanged; the SMA fitter and its tests are untouched.
+- A negative-control test proves the basis-matching is load-bearing: a close-basis
+  engine paired with an adj_close strategy RAISES the Day-32 guard, on the same
+  bars the matched run scores cleanly.
+- CLI smoke on SPY (--n-trials 3): 15 folds, fixed=+0.67, fitted=+0.67, B&H=+0.78,
+  in-sample=+1.03, tax=+0.36 — the fixed +0.67 and B&H +0.78 reproduce the fixed
+  momentum verdict's SPY row exactly, confirming the sibling is on the same
+  adj_close basis and 756/252 windows as the verdict.  Early read: tuning the
+  lookback matched fixed TSMOM(12) OOS and bought nothing, the SMA overfitting
+  story repeating — to be confirmed on the full basket.
+- Three code commits plus this DEV_LOG entry.
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- Run the full-basket momentum tax (all 17 etf_basket symbols, the multi-minute
+  Optuna sweep) and read whether tuning the lookback adds OOS edge or just overfits
+  the way the SMA did — the completion of the momentum verdict.
+- Optional: re-fetch the basket to un-stale it (last bar 2026-06-09); backfill the
+  [fill in] time-spent placeholders in recent entries.
+- Later: a true downside-deviation / Sortino metric (WalkForwardResult exposes
+  MaxDD only today); cross-sectional sector / cross-asset rotation (needs a
+  portfolio-level backtester).
+
+**Time spent:** 1 hour
+
 ## Day 32
 
 **Worked on:**
