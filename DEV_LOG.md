@@ -4,6 +4,87 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 35
+
+**Worked on:**
+- Surfaced the Sortino ratio in scripts/momentum_walkforward.py's verdict table
+  (commit "Surface Sortino columns in fixed-momentum verdict table"), reading
+  oos_sortino/bh_sortino which already existed on WalkForwardResult (added
+  Day 34).  Added oos_sortino, bh_sortino, and a computed sortino_delta =
+  oos_sortino - bh_sortino as VerdictRow fields (each grouped next to its Sharpe
+  sibling); threaded the two new params through summarize_verdict's signature and
+  its main() call site; added OOS Sortino and B&H Sortino columns to the table
+  (rule widened 86 -> 112), the MEAN row, and the per-symbol progress line
+  (Δsortino); and added an n_beat_sortino bottom-line tally next to n_beat_sharpe.
+  CLI-only change: no metric, engine, or WalkForwardResult code touched - the
+  fields were already populated. [test updated in place, count unchanged]
+- 204 tests green (unchanged from Day 34 close): the summarize_verdict test gained
+  sortino_delta assertions in place; the positional-lockstep was proven by the
+  existing sharpe_delta/dd_reduction assertions still passing with their original
+  values after the two new params were inserted.
+
+**Why it matters:**
+- This closes the Sortino thread Day 34 opened: the metric existed and was correct
+  but printed nowhere, so the verdict could not yet be read through the
+  downside-only lens.  Now it can.  Sortino is the most charitable metric for a
+  defensive trend-follower (it does not penalise upside volatility as risk), so it
+  was the fair test of whether momentum's Sharpe deficit was real underperformance
+  or a Sharpe artifact.
+
+**Architectural note:**
+- summarize_verdict is called POSITIONALLY at three sites (signature, main() call
+  site, test).  Inserting oos_sortino/bh_sortino after their Sharpe siblings shifts
+  every following positional arg, so all three had to move in lockstep or a value
+  silently misassigns.  The proof it was done right: the existing sharpe_delta
+  (+0.5) and dd_reduction (+0.15 / -0.10) assertions still pass with their ORIGINAL
+  expected values after the insertion - those deltas are computed from the args
+  after the sortino params, so unchanged results prove nothing drifted.
+- sortino_delta is a computed FIELD shown in the progress line and used by the
+  tally, but is NOT a table column - adding a ΔSortino column would push the table
+  past ~120 chars; the two raw Sortino columns beside their Sharpe siblings are the
+  readable side-by-side comparison, and ΔSharpe alone represents the delta axis in
+  the table.
+- The table lives in main(), which has NO hermetic test, so column alignment was
+  verified by eye on a --symbols SPY,TLT run (header, data rows, and MEAN row all
+  aligned under the 112-char rule) rather than by pytest.
+
+**Verification:**
+- Full suite 204 passed (unchanged).  Only scripts/momentum_walkforward.py and
+  tests/test_momentum_walkforward.py changed; walk_forward.py, metrics.py, the
+  engine, and momentum_overfitting_tax.py untouched.
+- SPY,TLT alignment eyeball: columns rendered aligned, non-Sortino numbers
+  (oos_sharpe/bh_sharpe/dd_cut) matched the Day-32 fixed verdict exactly,
+  confirming no existing number moved.
+- FULL-BASKET SORTINO VERDICT (all 17 ETFs, adj_close, frictionless,
+  train=756/test=252): momentum beat B&H on Sharpe on 4/17, on Sortino on 3/17
+  (ONE FEWER, not more), and cut max drawdown on 13/17 (unchanged from Day 32).
+  MEAN OOS Sharpe +0.43 vs B&H +0.52 (ΔSharpe -0.09); MEAN OOS Sortino +0.59 vs
+  B&H +0.72 (a -0.13 gap - WIDER than the Sharpe gap).  The Sortino lens did NOT
+  rescue momentum: on nearly every symbol the ΔSortino is more negative than the
+  ΔSharpe, because both strategy and B&H have upside-concentrated volatility so the
+  downside-only denominator magnifies both ratios, widening the absolute gap when
+  B&H already leads on return.  The three Sortino wins are the same defensive
+  corner as always: IEF (+0.25, standout - Sortino 0.77 vs 0.52, drawdown
+  24%->10%), GLD (+0.05), EEM (+0.05).
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- The momentum verdict is now complete on every lens: fixed TSMOM(12) loses to B&H
+  on risk-adjusted return (Sharpe 4/17, Sortino 3/17 - both confirm
+  underperformance), and its durable value is drawdown reduction (13/17), with real
+  return-edge only in bonds/gold.  Tuning the lookback adds no OOS edge (Day 33
+  overfitting tax).  This closes momentum.
+- The natural next direction is cross-sectional sector / cross-asset rotation on
+  the ETF basket (rank symbols against each other, rotate into the strongest) -
+  this breaks the current per-symbol Strategy contract and needs a portfolio-level
+  backtester, a real architectural step up and likely a multi-day effort.
+- Housekeeping (non-urgent): commit README.md separately; backfill the [fill in]
+  time-spent placeholders in the Day 29-32 entries.
+
+**Time spent:** 1 hour
+
 ## Day 34
 
 **Worked on:**
