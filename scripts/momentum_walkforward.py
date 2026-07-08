@@ -102,8 +102,12 @@ class VerdictRow:
     n_folds: int
     # Stitched OOS Sharpe of the fixed TSMOM strategy.
     oos_sharpe: float
+    # Stitched OOS Sortino of the fixed TSMOM strategy (downside-only denom).
+    oos_sortino: float
     # Stitched buy-and-hold Sharpe over the identical test windows.
     bh_sharpe: float
+    # Stitched buy-and-hold Sortino over the identical test windows.
+    bh_sortino: float
     # Stitched OOS max drawdown of TSMOM (POSITIVE fraction = magnitude).
     oos_max_dd: float
     # Stitched buy-and-hold max drawdown (POSITIVE fraction = magnitude).
@@ -114,6 +118,8 @@ class VerdictRow:
     bh_return: float
     # oos_sharpe - bh_sharpe: positive means TSMOM had the better risk-adj return.
     sharpe_delta: float
+    # oos_sortino - bh_sortino: positive means TSMOM had the better downside-adjusted return.
+    sortino_delta: float
     # bh_max_dd - oos_max_dd: POSITIVE means TSMOM had the SMALLER drawdown
     # (cut risk vs holding) — see the sign-convention comment in summarize_verdict.
     dd_reduction: float
@@ -123,7 +129,9 @@ def summarize_verdict(
     symbol: str,
     n_folds: int,
     oos_sharpe: float,
+    oos_sortino: float,
     bh_sharpe: float,
+    bh_sortino: float,
     oos_max_dd: float,
     bh_max_dd: float,
     oos_return: float,
@@ -139,7 +147,9 @@ def summarize_verdict(
         symbol:      Ticker this row describes.
         n_folds:     Number of (train, test) folds scored.
         oos_sharpe:  Stitched OOS Sharpe of the fixed TSMOM strategy.
+        oos_sortino: Stitched OOS Sortino of the fixed TSMOM strategy.
         bh_sharpe:   Stitched buy-and-hold Sharpe over the same windows.
+        bh_sortino:  Stitched buy-and-hold Sortino over the same windows.
         oos_max_dd:  Stitched OOS max drawdown (positive fraction).
         bh_max_dd:   Stitched buy-and-hold max drawdown (positive fraction).
         oos_return:  Stitched OOS total return (fraction).
@@ -151,6 +161,11 @@ def summarize_verdict(
     # sharpe_delta is the risk-adjusted edge: how much TSMOM's stitched OOS Sharpe
     # exceeds (or trails, if negative) just holding the asset over the same windows.
     sharpe_delta = oos_sharpe - bh_sharpe
+
+    # sortino_delta is the downside-adjusted edge: how much TSMOM's stitched OOS
+    # Sortino exceeds (or trails, if negative) just holding the asset over the same
+    # windows — the Sharpe delta's twin using a downside-only risk denominator.
+    sortino_delta = oos_sortino - bh_sortino
 
     # SIGN CONVENTION (important): max_dd is stored throughout this codebase as a
     # POSITIVE fraction — the peak-to-trough magnitude — so a LARGER number is a
@@ -167,12 +182,15 @@ def summarize_verdict(
         symbol=symbol,
         n_folds=n_folds,
         oos_sharpe=oos_sharpe,
+        oos_sortino=oos_sortino,
         bh_sharpe=bh_sharpe,
+        bh_sortino=bh_sortino,
         oos_max_dd=oos_max_dd,
         bh_max_dd=bh_max_dd,
         oos_return=oos_return,
         bh_return=bh_return,
         sharpe_delta=sharpe_delta,
+        sortino_delta=sortino_delta,
         dd_reduction=dd_reduction,
     )
 
@@ -430,7 +448,9 @@ def main() -> int:
                 symbol,
                 result.n_folds,
                 result.oos_sharpe,
+                result.oos_sortino,
                 result.bh_sharpe,
+                result.bh_sortino,
                 result.oos_max_drawdown,
                 result.bh_max_drawdown,
                 result.oos_total_return,
@@ -446,6 +466,7 @@ def main() -> int:
                 f"oos_sharpe={row.oos_sharpe:+.2f}  "
                 f"bh_sharpe={row.bh_sharpe:+.2f}  "
                 f"Δsharpe={row.sharpe_delta:+.2f}  "
+                f"Δsortino={row.sortino_delta:+.2f}  "
                 f"oos_dd={row.oos_max_dd * 100:.1f}%  "
                 f"bh_dd={row.bh_max_dd * 100:.1f}%  "
                 f"dd_cut={row.dd_reduction * 100:+.1f}%"
@@ -473,22 +494,26 @@ def main() -> int:
     # ------------------------------------------------------------------
 
     print()
-    print("=" * 86)
+    # Rule widths bumped 86 → 112 to span the two added Sortino columns
+    # (2 × (11-char field + 2-char gap) = +26 chars over the prior 7-column table).
+    print("=" * 112)
     header = (
-        f"{'Symbol':<8}{'Folds':>6}  {'OOS Sharpe':>11}  {'B&H Sharpe':>11}  "
+        f"{'Symbol':<8}{'Folds':>6}  {'OOS Sharpe':>11}  {'OOS Sortino':>11}  "
+        f"{'B&H Sharpe':>11}  {'B&H Sortino':>11}  "
         f"{'ΔSharpe':>8}  {'OOS MaxDD':>10}  {'B&H MaxDD':>10}  {'DD cut':>8}"
     )
     print(header)
-    print("-" * 86)
+    print("-" * 112)
     for r in rows:
         print(
             f"{r.symbol:<8}{r.n_folds:>6}  "
-            f"{r.oos_sharpe:>+11.2f}  {r.bh_sharpe:>+11.2f}  "
+            f"{r.oos_sharpe:>+11.2f}  {r.oos_sortino:>+11.2f}  "
+            f"{r.bh_sharpe:>+11.2f}  {r.bh_sortino:>+11.2f}  "
             f"{r.sharpe_delta:>+8.2f}  "
             f"{r.oos_max_dd * 100:>9.1f}%  {r.bh_max_dd * 100:>9.1f}%  "
             f"{r.dd_reduction * 100:>+7.1f}%"
         )
-    print("=" * 86)
+    print("=" * 112)
 
     # ------------------------------------------------------------------
     # 8. MEAN row + bottom-line tallies.
@@ -498,7 +523,9 @@ def main() -> int:
     # fixed momentum help?"  These average the per-symbol stitched metrics, so
     # they are an average of summaries, fine for a directional basket-level read.
     mean_oos_sharpe = mean(r.oos_sharpe for r in rows)
+    mean_oos_sortino = mean(r.oos_sortino for r in rows)
     mean_bh_sharpe = mean(r.bh_sharpe for r in rows)
+    mean_bh_sortino = mean(r.bh_sortino for r in rows)
     mean_sharpe_delta = mean(r.sharpe_delta for r in rows)
     mean_oos_dd = mean(r.oos_max_dd for r in rows)
     mean_bh_dd = mean(r.bh_max_dd for r in rows)
@@ -510,18 +537,23 @@ def main() -> int:
     # counts — the honest expectation is that they are modest, not universal.
     n = len(rows)
     n_beat_sharpe = sum(1 for r in rows if r.oos_sharpe > r.bh_sharpe)
+    # n_beat_sortino mirrors n_beat_sharpe on the downside-only axis — the direct
+    # read of whether the Sortino verdict differs from the Sharpe verdict.
+    n_beat_sortino = sum(1 for r in rows if r.oos_sortino > r.bh_sortino)
     n_cut_dd = sum(1 for r in rows if r.dd_reduction > 0)
 
     print(
         f"{'MEAN':<8}{'':>6}  "
-        f"{mean_oos_sharpe:>+11.2f}  {mean_bh_sharpe:>+11.2f}  "
+        f"{mean_oos_sharpe:>+11.2f}  {mean_oos_sortino:>+11.2f}  "
+        f"{mean_bh_sharpe:>+11.2f}  {mean_bh_sortino:>+11.2f}  "
         f"{mean_sharpe_delta:>+8.2f}  "
         f"{mean_oos_dd * 100:>9.1f}%  {mean_bh_dd * 100:>9.1f}%  "
         f"{mean_dd_reduction * 100:>+7.1f}%"
     )
-    print("=" * 86)
+    print("=" * 112)
     print(
         f"Momentum beat B&H on Sharpe on {n_beat_sharpe}/{n}; "
+        f"on Sortino on {n_beat_sortino}/{n}; "
         f"cut max drawdown on {n_cut_dd}/{n}."
     )
     print()

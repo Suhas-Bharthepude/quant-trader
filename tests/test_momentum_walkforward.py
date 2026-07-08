@@ -107,20 +107,27 @@ def make_oscillating_bars(n: int, base_price: float = 100.0, amp: float = 30.0) 
 
 
 def test_summarize_verdict_sign_conventions():
-    """sharpe_delta and dd_reduction carry the documented signs (risk-cut is positive)."""
-    # Case A — momentum is BETTER: higher Sharpe AND a smaller drawdown than B&H.
-    # oos_sharpe=1.0 vs bh_sharpe=0.5 → sharpe_delta = +0.5.
+    """sharpe_delta, sortino_delta and dd_reduction carry documented signs (risk-cut positive)."""
+    # Args are POSITIONAL in the order:
+    # (symbol, n_folds, oos_sharpe, oos_sortino, bh_sharpe, bh_sortino,
+    #  oos_max_dd, bh_max_dd, oos_return, bh_return).
+    # Case A — momentum is BETTER: higher Sharpe/Sortino AND a smaller drawdown.
+    # oos_sharpe=1.0 vs bh_sharpe=0.5 → sharpe_delta = 1.0 - 0.5 = +0.5.
+    # oos_sortino=1.2 vs bh_sortino=0.6 → sortino_delta = 1.2 - 0.6 = +0.6.
     # oos_max_dd=0.10 vs bh_max_dd=0.25 → dd_reduction = 0.25 - 0.10 = +0.15
     # (POSITIVE = momentum drew down LESS, i.e. cut risk).  Returns are arbitrary.
-    row = summarize_verdict("X", 3, 1.0, 0.5, 0.10, 0.25, 0.20, 0.10)
+    row = summarize_verdict("X", 3, 1.0, 1.2, 0.5, 0.6, 0.10, 0.25, 0.20, 0.10)
     assert row.sharpe_delta == pytest.approx(0.5)
+    assert row.sortino_delta == pytest.approx(0.6)
     assert row.dd_reduction == pytest.approx(0.15)
 
     # Case B — momentum is WORSE on drawdown: oos_max_dd=0.30 vs bh_max_dd=0.20 →
     # dd_reduction = 0.20 - 0.30 = -0.10 (NEGATIVE = momentum drew down MORE than
-    # simply holding).  Confirms the negative case is represented correctly.
-    worse = summarize_verdict("Y", 3, 0.5, 0.5, 0.30, 0.20, 0.0, 0.0)
+    # simply holding).  Sortinos are equal (0.5 vs 0.5) → sortino_delta = 0.0.
+    # Confirms both the negative dd case and a zero-delta Sortino are correct.
+    worse = summarize_verdict("Y", 3, 0.5, 0.5, 0.5, 0.5, 0.30, 0.20, 0.0, 0.0)
     assert worse.dd_reduction == pytest.approx(-0.10)
+    assert worse.sortino_delta == pytest.approx(0.0)
 
 
 # ---------------------------------------------------------------------------
