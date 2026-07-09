@@ -4,6 +4,93 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 38
+
+**Worked on:**
+- Added trailing_returns_at(bars_by_symbol, rebalance_ts, lookback,
+  price_field="close") -> dict[str, float] as a SECOND function in
+  src/research/cross_sectional.py (commit "Add cross-sectional trailing-returns-at
+  returns computer"), plus 6 new hermetic tests in tests/test_cross_sectional.py.
+  This is the second brick of the rotation arc: the returns-COMPUTER that turns the
+  basket's bars into the dict[str, float] that Day 36's rank_by_trailing_return
+  consumes.  It computes each symbol's trailing return via the shared
+  trailing_return_series helper extracted Day 37, so cross-sectional and
+  time-series momentum measure "trailing return" identically and cannot drift.
+  [+6 tests]
+- 221 tests green (was 215 at Day 37 close): +6.  Purely additive:
+  rank_by_trailing_return untouched, the existing 10 cross_sectional tests and the
+  ~26 TSMOM tests all unchanged in status.
+
+**Why it matters:**
+- This is the bridge between "I have bars" and "I have a ranking": at each
+  rebalance date the future portfolio backtester will call trailing_returns_at to
+  get the returns dict, then hand it to rank_by_trailing_return to get the held
+  symbols.  With both halves now in place and connected end-to-end (a test feeds
+  one straight into the other), the compute-returns -> rank pipeline is complete -
+  the portfolio backtester that drives them is the next brick.
+
+**Architectural note:**
+- The rebalance point is a TIMESTAMP, not an integer index.  The 17 ETFs have
+  different-length histories, so an integer index would land on a DIFFERENT
+  calendar date per symbol - a silent lookahead-style bug.  A timestamp is safe
+  because every 1d bar is floored to midnight UTC on ingest (the dedup migration
+  guarantees this), so symbols align by date equality.  "As of D" is resolved on
+  each symbol's OWN month-end grid - the most recent month-end at-or-before D - via
+  s.loc[:rebalance_ts].iloc[-1], which is right-inclusive of D (a rebalance date
+  that IS a month-end selects itself, never one after it, so no lookahead).  Two
+  symbols with month-ends on different dates each resolve to their own
+  most-recent-at-or-before value at the same rebalance date.
+- Two design points pinned by test because they silently corrupt the returns dict:
+  (a) the as-of selection uses the explicit .loc[:D].iloc[-1] slice, NOT
+  Series.asof - asof returns the last NON-NaN value at-or-before D, which would
+  skip a warmup NaN and hand back a stale earlier month-end instead of correctly
+  omitting the symbol; (b) two OMIT guards in a fixed order - the empty-slice guard
+  (len == 0, symbol has no month-end at-or-before D) MUST come before the NaN guard
+  (iloc[-1] is a warmup NaN), because .iloc[-1] on an empty slice raises IndexError
+  so there is nothing to NaN-check yet.  A symbol failing either guard is omitted
+  entirely, never emitted with NaN - so the dict handed to the ranker contains only
+  eligible symbols with finite returns, and the ranker's own NaN backstop stays
+  defense-in-depth rather than the primary mechanism.  Tests 3 (non-empty slice,
+  warmup NaN) and 4 (empty slice) are deliberately distinct scenarios so both
+  guards are exercised separately.
+
+**Verification:**
+- Full suite 221 passed (was 215, +6).  Only two files changed: cross_sectional.py
+  (3 imports + the new function) and test_cross_sectional.py (6 tests + imports +
+  docstring note).  rank_by_trailing_return is byte-for-byte unchanged; no other
+  file touched (the research->strategies import is one-directional and
+  non-circular).
+- The 6 new tests cover: hand-computed as-of returns at a shared month-end; a
+  too-short symbol omitted via the empty-slice guard; a warmup-NaN symbol omitted
+  via the NaN guard (distinct from the empty path); a rebalance date before any
+  month-end yielding an empty dict with no IndexError; each symbol resolving on its
+  own month-end grid (A on its March month-end, B - no March bar - on its February
+  one, at the same rebalance date); and the output dict fed straight into
+  rank_by_trailing_return, proving the returns-computer output is valid ranker
+  input.
+- One code commit plus this DEV_LOG entry.
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- Build the portfolio-level backtester (the centerpiece of Arc A): one combined
+  equity curve across the held symbols with a monthly rebalance, driving the
+  compute-returns -> rank pipeline now complete.  At each month-end it will call
+  trailing_returns_at to get the returns dict, rank_by_trailing_return to pick the
+  held top-N, and produce a single portfolio return stream.  Open design questions
+  to settle first (next session, before code): equal-weight vs other weighting
+  across held symbols; how cash is handled when the ranker returns fewer than
+  top_n (or empty); and how the monthly-rebalance turnover will later carry the
+  transaction-cost model that every verdict needs before it is issued.
+- After that: the walk-forward wrapper around the portfolio backtester, then the
+  rotation verdict through the existing harness (walk-forward, overfitting tax,
+  Sharpe/Sortino, drawdown, after costs) vs an equal-weight-basket buy-and-hold.
+- Housekeeping (non-urgent): commit README.md separately; backfill the [fill in]
+  time-spent placeholders in the Day 29-37 entries.
+
+**Time spent:** 20 minutes
+
 ## Day 37
 
 **Worked on:**
