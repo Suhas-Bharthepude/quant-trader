@@ -51,7 +51,12 @@ from src.strategies.sma_crossover import SMACrossoverStrategy
 from src.strategies.time_series_momentum import (
     TimeSeriesMomentumStrategy,
     month_end_indices,
+    trailing_return_series,
 )
+
+# pandas is imported so the new trailing_return_series test can assert the
+# helper returns a pd.Series; the older tests never needed pandas directly.
+import pandas as pd
 
 
 # ---------------------------------------------------------------------------
@@ -832,3 +837,68 @@ def test_month_end_indices_picks_last_bar_of_each_month():
 
     # The indices must be strictly ascending (month-ends occur in time order).
     assert list(result) == sorted(result)
+
+
+# ---------------------------------------------------------------------------
+# 13. trailing_return_series helper (shared trailing-return computation)
+# ---------------------------------------------------------------------------
+
+
+def test_trailing_return_series_computes_simple_month_end_returns():
+    """trailing_return_series returns simple month-over-lookback returns at each month-end, NaN in warmup."""
+
+    # Build ONE bar per calendar month with EXPLICIT dates, so every bar is a
+    # month-end (each next bar is a new month) and the month-end count is exactly 5.
+    # Hand-chosen closes make the trailing returns computable by hand below.
+    #   index 0 → Jan 2024, close 100
+    #   index 1 → Feb 2024, close 110
+    #   index 2 → Mar 2024, close 120
+    #   index 3 → Apr 2024, close 150
+    #   index 4 → May 2024, close 200
+    dates = [
+        datetime(2024, 1, 31, tzinfo=timezone.utc),  # index 0
+        datetime(2024, 2, 29, tzinfo=timezone.utc),  # index 1
+        datetime(2024, 3, 31, tzinfo=timezone.utc),  # index 2
+        datetime(2024, 4, 30, tzinfo=timezone.utc),  # index 3
+        datetime(2024, 5, 31, tzinfo=timezone.utc),  # index 4
+    ]
+    closes = [100.0, 110.0, 120.0, 150.0, 200.0]
+
+    # One OHLCVBar per (date, close); close=adj_close so the result is basis-
+    # agnostic and the default price_field="close" reads the intended value.
+    bars = [
+        OHLCVBar(
+            symbol="TEST",         # arbitrary; helper reads only timestamp + price
+            timestamp=ts,          # distinct month per bar → each is a month-end
+            open=c,                # dummy
+            high=c,                # dummy
+            low=c,                 # dummy
+            close=c,               # the field the default price_field reads
+            adj_close=c,           # equal to close → basis-agnostic
+            volume=1000,           # dummy
+            timeframe="1d",        # daily
+            source="test",         # provenance marker
+        )
+        for ts, c in zip(dates, closes)
+    ]
+
+    # lookback=2: each month-end's return is vs the month-end 2 positions earlier.
+    lookback = 2
+    result = trailing_return_series(bars, lookback)
+
+    # PINS the return TYPE: the helper must return a pandas Series (both callers
+    # rely on the indexed-Series shape — TSMOM maps it, the ranker selects .asof).
+    assert isinstance(result, pd.Series)
+
+    # PINS the LENGTH: one entry per month-end observation, so len equals the
+    # month-end count from the shared month_end_indices helper (here, 5).
+    assert len(result) == len(month_end_indices(bars))
+
+    # PINS the WARMUP: the first `lookback` entries have no prior month-end
+    # `lookback` positions earlier, so shift(lookback) yields NaN there.
+    assert np.isnan(result.iloc[0])
+    assert np.isnan(result.iloc[1])
+
+    # PINS the ARITHMETIC: at month-end index 2 the trailing return is
+    # close[2]/close[0] - 1 = 120/100 - 1 = 0.20 (simple return, ratio minus 1).
+    assert result.iloc[2] == pytest.approx(120.0 / 100.0 - 1.0)

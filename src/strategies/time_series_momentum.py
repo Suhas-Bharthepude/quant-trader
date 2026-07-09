@@ -116,6 +116,66 @@ def month_end_indices(bars: list[OHLCVBar]) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Shared trailing-return computation
+# ---------------------------------------------------------------------------
+
+
+def trailing_return_series(
+    bars: list[OHLCVBar],
+    lookback: int,
+    price_field: str = "close",
+) -> pd.Series:
+    """Return the trailing `lookback`-month SIMPLE return at each month-end.
+
+    The shared trailing-return primitive that BOTH TimeSeriesMomentumStrategy and
+    (soon) the cross-sectional returns-computer call, so the two share ONE
+    definition of "trailing return" and cannot silently drift — the same rationale
+    behind extracting month_end_indices (and _stitch_oos in walk_forward.py).
+
+    Computes the SIMPLE return (ratio minus 1) between each month-end close and the
+    month-end close `lookback` positions earlier.  The leading `lookback` rows are
+    NaN — the warmup, where shift(lookback) has no prior value to divide against.
+    The result is a pd.Series indexed by month-end timestamp, one entry per
+    month-end observation.
+
+    Assumes NON-EMPTY bars: the caller (generate_signals) validates non-empty
+    upstream, so an empty guard here would be dead code — exactly as
+    month_end_indices assumes.
+
+    Args:
+        bars:        Time-ordered list of OHLCVBar (ascending chronological).
+        lookback:    Formation window in month-end observations.
+        price_field: Which price field to read — "close" or "adj_close".
+
+    Returns:
+        A pd.Series of trailing returns indexed by month-end timestamp.
+    """
+    # Build a pandas Series of prices indexed by each bar's actual timestamp, IN
+    # ARRIVAL ORDER (bars assumed ascending chronological, as everywhere else).
+    # price_field is now the PARAMETER (was self.price_field inline); getattr reads
+    # the chosen field ("close" or "adj_close") off each bar.  float64 keeps the
+    # division math precise and dtype-stable.
+    close_series = pd.Series(
+        data=[getattr(bar, price_field) for bar in bars],
+        index=pd.DatetimeIndex([bar.timestamp for bar in bars]),
+        dtype=np.float64,
+    )
+
+    # Positional indices of each calendar month's last bar, via the shared helper.
+    mei = month_end_indices(bars)
+
+    # Select just the month-end closes, still indexed at their real trading-date
+    # timestamps — the monthly series the trailing return is computed over.
+    month_end_close = close_series.iloc[mei]
+
+    # Trailing-`lookback`-month simple return at each month-end: today's month-end
+    # close divided by the month-end close `lookback` positions earlier, minus 1.
+    # shift(lookback) pulls the earlier month-end value onto the current row; the
+    # first `lookback` rows have no prior value, so they become NaN — the warmup.
+    return month_end_close / month_end_close.shift(lookback) - 1.0
+
+
+# ---------------------------------------------------------------------------
 # Time-Series Momentum concrete strategy
 # ---------------------------------------------------------------------------
 
@@ -188,42 +248,19 @@ class TimeSeriesMomentumStrategy(Strategy):
         if not bars:
             raise ValueError("bars must be non-empty")
 
-        # Build a pandas Series of close prices indexed by each bar's actual
-        # timestamp, IN THE ORDER THE BARS ARRIVE. We assume bars are already
-        # in ascending chronological order — the same assumption sma_crossover
-        # and the backtester make — so we do NOT re-sort here.
-        close_series = pd.Series(
-            # The values are the per-bar prices in arrival order. The basis is
-            # configurable via self.price_field; getattr reads the chosen field
-            # ("close" or "adj_close") off each bar. The local is still named
-            # close_series because it is the reference price series the
-            # month-end/trailing-return logic builds on — renaming it would
-            # ripple for zero gain; the price_field meaning is carried by the
-            # constructor param/comments.
-            data=[getattr(bar, self.price_field) for bar in bars],
-            # The index is the bars' real timestamps, so every downstream
-            # selection and forward-fill happens at true trading dates.
-            index=pd.DatetimeIndex([bar.timestamp for bar in bars]),
-            # float64 keeps the division math precise and dtype-stable.
-            dtype=np.float64,
-        )
+        # Trailing-`lookback`-month simple return at each month-end, via the shared
+        # trailing_return_series helper.  The close_series construction, the
+        # month_end_indices call, the month_end_close selection, and the
+        # ratio-minus-1 arithmetic now ALL live inside that helper, so this
+        # strategy and the cross-sectional returns-computer share ONE definition of
+        # trailing return and cannot drift.  self.lookback and self.price_field are
+        # passed through so the computed return matches this strategy's config.
+        trailing_return = trailing_return_series(bars, self.lookback, self.price_field)
 
-        # Positional indices of each calendar month's last bar, via the shared
-        # helper above.  Extracting this means the strategy and any consumer that
-        # needs the warm-up boundary (e.g. the momentum Optuna fitter) compute
-        # "month-end" from ONE definition, so they cannot drift apart.
-        mei = month_end_indices(bars)
-
-        # Select just the month-end closes, still indexed at their real
-        # trading-date timestamps. This is the monthly series we reason over.
-        # .iloc[mei] selects the same positions, in the same order, that the old
-        # close_series[boolean_mask] selected — np.where(mask)[0] is exactly the
-        # True positions of that mask — so month_end_close, its DatetimeIndex, M,
-        # the guard, trailing_return, monthly_signal, and the ffill are unchanged.
-        month_end_close = close_series.iloc[mei]
-
-        # M is the number of month-end observations we actually have.
-        M = len(month_end_close)
+        # M is the number of month-end observations we actually have.  Recomputed
+        # from the helper's output: x / x.shift(k) - 1 preserves length, so M is the
+        # same integer it was when computed from month_end_close inline.
+        M = len(trailing_return)
 
         # We need strictly MORE month-ends than `lookback` so that at least one
         # month-end has a prior observation `lookback` positions earlier to
@@ -236,13 +273,6 @@ class TimeSeriesMomentumStrategy(Strategy):
                 f"need more than lookback ({self.lookback}) month-end observations "
                 f"to compute time-series momentum, got {M}"
             )
-
-        # Trailing-`lookback`-month simple return at each month-end: today's
-        # month-end close divided by the month-end close `lookback` positions
-        # earlier, minus 1. shift(lookback) pulls the earlier month-end value
-        # onto the current row; the first `lookback` rows have no prior value,
-        # so they become NaN — exactly the warmup period we want.
-        trailing_return = month_end_close / month_end_close.shift(self.lookback) - 1.0
 
         # Map each month-end's trailing return to a monthly position signal:
         # SIGNAL_LONG where the return is STRICTLY greater than 0, otherwise
@@ -257,11 +287,22 @@ class TimeSeriesMomentumStrategy(Strategy):
             data=np.where(trailing_return.to_numpy() > 0.0, SIGNAL_LONG, SIGNAL_FLAT),
             # Keep these signals labeled at the same real month-end timestamps
             # so the forward-fill below aligns them to the right daily bars.
-            index=month_end_close.index,
+            # trailing_return.index IS the old month_end_close.index — the helper's
+            # ratio-minus-1 preserves the month-end DatetimeIndex — so using it here
+            # is byte-identical to the pre-extraction index=month_end_close.index.
+            index=trailing_return.index,
             # int8 matches the signal dtype used across the project (values are
             # only ever in {0, 1} here, so int8 is ample and memory-cheap).
             dtype=np.int8,
         )
+
+        # Rebuild the FULL daily bar index directly from the bars' timestamps.
+        # This EQUALS the old close_series.index (same timestamps, same order) —
+        # close_series now lives inside trailing_return_series, so the ffill target
+        # is reconstructed here.  It is plumbing (an index built from timestamps),
+        # NOT the momentum arithmetic, so no second meaningful definition is
+        # created; the ffill result is byte-identical to the pre-extraction code.
+        daily_index = pd.DatetimeIndex([bar.timestamp for bar in bars])
 
         # Forward-fill the monthly signal onto the FULL daily bar index: each
         # daily bar takes the most recent month-end signal whose date is on or
@@ -269,7 +310,7 @@ class TimeSeriesMomentumStrategy(Strategy):
         # forward across the intervening daily bars until the next month-end.
         # We do NOT shift the signal forward — the month-end's signal takes
         # effect ON its own bar; the backtester supplies the single one-bar lag.
-        daily_signal = monthly_signal.reindex(close_series.index, method="ffill")
+        daily_signal = monthly_signal.reindex(daily_index, method="ffill")
 
         # Bars that fall BEFORE the very first month-end have no prior signal to
         # forward-fill from and arrive as NaN; the contract says they must be
