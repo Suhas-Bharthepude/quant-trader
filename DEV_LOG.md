@@ -4,6 +4,96 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 37
+
+**Worked on:**
+- Extracted trailing_return_series(bars, lookback, price_field="close") ->
+  pd.Series as a module-level helper in src/strategies/time_series_momentum.py
+  (commit "Extract trailing_return_series shared helper from TSMOM"), and rewired
+  TimeSeriesMomentumStrategy.generate_signals to call it.  Added one direct unit
+  test in tests/test_strategies.py (section 13).  This is a BEHAVIOR-PRESERVING
+  refactor: the trailing-return arithmetic that was inline in generate_signals now
+  lives in ONE shared helper that both TSMOM and (next session) the cross-sectional
+  returns-computer will call. [+1 test]
+- 215 tests green (was 214 at Day 36 close): +1.  The change is a pure internal
+  move plus one new test - nothing imports the new helper yet.
+
+**Why it matters:**
+- The cross-sectional rotation strategy must compute each symbol's trailing return
+  the SAME way TSMOM does, or the two momentum strategies become two
+  subtly-different definitions of "momentum" and every verdict comparing them is
+  invalid.  Extracting ONE shared definition guarantees they cannot drift - the
+  identical rationale behind extracting month_end_indices (Day 33), which
+  optuna_fit.py already imports.  trailing_return_series is the natural next member
+  of that shared-primitive family.  Building it as a standalone, proven helper
+  FIRST - before the module that consumes it - is the same discipline used for
+  month_end_indices and walk_forward_splits: the harder consumer later builds on a
+  piece already known correct.
+
+**Architectural note:**
+- The extraction boundary is arithmetic-only: the helper owns the close_series
+  construction, the month_end_indices call, the month_end_close selection, and the
+  month_end_close / month_end_close.shift(lookback) - 1.0 simple-return arithmetic.
+  It deliberately does NOT own the empty-bars guard, the M <= lookback guard, the
+  > 0.0 signal mapping, or the ffill/fillna - those stay in generate_signals, so
+  the helper is a pure returns primitive with no strategy-specific policy baked in.
+  The one rewiring subtlety: generate_signals previously built close_series once and
+  used it BOTH for the month-end selection (now inside the helper) AND as the daily
+  ffill target.  So generate_signals now rebuilds daily_index =
+  pd.DatetimeIndex([bar.timestamp for bar in bars]) directly - byte-equal to the old
+  close_series.index (same timestamps, same order) - and the monthly_signal index
+  uses trailing_return.index, which IS the old month_end_close.index because
+  ratio-minus-1 preserves the pandas index.  Both are plumbing, not arithmetic, so
+  no second definition of anything meaningful was created.
+- Why extract rather than duplicate: duplicating the arithmetic into the new module
+  would have been purely additive (touching nothing), but would leave two
+  definitions of trailing return that could silently drift if someone later changed
+  one.  Consistency-with-TSMOM is the entire reason the cross-sectional module
+  exists, so a shared definition is the correct trade even though it touches the
+  most-tested file in the repo.
+
+**Verification:**
+- Full suite 215 passed (was 214, +1).  Only two files changed:
+  time_series_momentum.py (helper + rewire) and test_strategies.py (one new test).
+  No other file touched - the refactor has no external consumer yet.
+- The ~26 TSMOM tests across test_strategies.py, test_optuna_fit.py,
+  test_momentum_overfitting_tax.py, and test_momentum_walkforward.py all stayed
+  bit-for-bit green.  None of them reads trailing_return directly - they assert on
+  the strategy's OUTPUT signals across uptrend, downtrend, flat, warmup,
+  no-lookahead, month-end cadence, and the adj_close-vs-close divergence - so their
+  staying green is the proof the arithmetic did not move.  The new direct test pins
+  the extracted helper's arithmetic independently: returns a pd.Series, length
+  equals the month-end count, first lookback entries NaN (warmup), and a specific
+  non-warmup month-end equals the hand-computed ratio-minus-1 (120/100 - 1 = 0.20).
+- One code commit plus this DEV_LOG entry.
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- Build the cross-sectional returns-computer (next brick of Arc A): a new function
+  trailing_returns_at(bars_by_symbol, rebalance_ts, lookback, price_field="close")
+  -> dict[str, float] as a SECOND function in src/research/cross_sectional.py,
+  computing each symbol's trailing return via the now-shared trailing_return_series
+  helper and producing the dict[str, float] that feeds rank_by_trailing_return.
+  Design locked this session: (a) the rebalance point is a TIMESTAMP, not an integer
+  index - the 17 ETFs have different-length histories, so an integer index would be
+  a different date per symbol (a silent lookahead-style bug); a timestamp is safe
+  because the dedup migration floors every 1d bar to midnight UTC, so symbols align
+  by date equality; (b) "as of date D" means each symbol's OWN most-recent month-end
+  at-or-before D via an explicit .loc[:D].iloc[-1] slice (not .asof, which silently
+  skips NaN); (c) the returns-computer OMITS ineligible symbols (fewer than
+  lookback+1 month-ends) AND NaN-valued symbols from the returned dict entirely, so
+  the ranker only ever sees eligible symbols with finite returns.
+- After that: the portfolio-level backtester (one combined equity curve across held
+  symbols, monthly rebalance), then the walk-forward wrapper, then the rotation
+  verdict through the existing harness (walk-forward, overfitting tax,
+  Sharpe/Sortino, drawdown, after costs) vs an equal-weight-basket buy-and-hold.
+- Housekeeping (non-urgent): commit README.md separately; backfill the [fill in]
+  time-spent placeholders in the Day 29-36 entries.
+
+**Time spent:** 10 minutes
+
 ## Day 36
 
 **Worked on:**
