@@ -4,6 +4,86 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 36
+
+**Worked on:**
+- Added src/research/cross_sectional.py with
+  rank_by_trailing_return(trailing_returns: dict[str, float], top_n: int,
+  hold_when_all_negative: bool = False) -> list[str] (commit "Add cross-sectional
+  trailing-return ranking function"), plus tests/test_cross_sectional.py.  This is
+  the FIRST brick of the rotation arc: a pure, dumb ranking/selection primitive
+  that takes already-computed trailing returns IN and returns the selected top-N
+  symbols OUT.  It computes no returns, touches no bars/dates/DuckDB/engine, and
+  does NOT subclass Strategy (the Strategy contract is single-symbol
+  list[OHLCVBar] -> array; ranking is inherently multi-symbol dict[str, float] ->
+  list[str]). [+10 tests]
+- 214 tests green (was 204 at Day 35 close): +10, all in the new
+  test_cross_sectional.py.  Purely additive: two NEW files, no existing file
+  touched.
+
+**Why it matters:**
+- Cross-sectional rotation ranks symbols AGAINST EACH OTHER and holds the
+  strongest handful - the defining move that time-series momentum (which judges
+  each symbol only against its own past) cannot express.  It structurally breaks
+  the per-symbol Strategy contract, so the rotation arc needs a portfolio-level
+  backtester built over several days.  Building the pure ranking primitive FIRST -
+  isolated and unit-tested - mirrors how walk_forward_splits was built and proven
+  before the validator that consumed it, so the harder portfolio engine later
+  consumes a piece already known correct.
+
+**Architectural note:**
+- The seam is deliberately pure: returns-in / selection-out.  Separating "compute
+  a trailing return" from "rank and select" keeps this function trivially testable
+  with plain dicts and keeps the return-computation concern (which must match
+  TSMOM's trailing-return arithmetic) in a SEPARATE later module.  Two design
+  decisions were made and locked today: (a) DEFER the trailing-return computation -
+  today's file computes no returns, so the TSMOM extract-vs-duplicate question
+  (whether to share TSMOM's inline month_end_close / shift(lookback) - 1.0
+  arithmetic or duplicate it) is pushed to the module that will actually feed this
+  function, where the needed shape will be known; (b) the all-negative-basket
+  behavior is a PARAMETER hold_when_all_negative defaulting to False (absolute
+  filter ON - an all-<=0 basket returns empty = cash), matching TSMOM's own strict
+  > 0.0 go-flat discipline, with True available to test pure always-invested
+  relative strength.  Parameterizing lets the harness test both rather than betting
+  on one.
+- Two correctness points were pinned by test because they silently corrupt a
+  backtester: the tie-break is deterministic by MECHANISM (sorted key = (-return,
+  symbol), so equal returns resolve alphabetically by the KEY, never by dict
+  insertion order - the test uses reversed insertion order to prove it), and
+  NaN-valued returns are dropped up front in BOTH filter modes by an explicit
+  math.isnan guard (not as a byproduct of the > 0.0 filter, since hold mode has no
+  such filter), so a NaN can never sort to an arbitrary position or be selected.
+
+**Verification:**
+- Full suite 214 passed (was 204, +10).  Only the two new files changed; no
+  existing module or test touched (additive - nothing imports the new module yet).
+- New-file verbose run: all 10 tests green, covering basic top-N ordering,
+  alphabetical tie-break (reversed insertion order), over-large top_n returns all,
+  top_n < 1 raises, empty input, absolute filter excluding negatives, all-negative
+  -> cash (default), all-negative -> least-bad (hold mode), exactly-zero filtered
+  by strict > 0.0, and NaN never selected in either mode.
+- One code commit plus this DEV_LOG entry.
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- The next brick of Arc A is the returns-computation module: given the basket's
+  bars and a rebalance point, produce the dict[str, float] of trailing returns that
+  feeds rank_by_trailing_return, computing each symbol's trailing return the SAME
+  way TSMOM does.  This is where the deferred extract-vs-duplicate decision gets
+  made (extracting TSMOM's inline trailing-return arithmetic into a shared helper
+  is the DRY choice but touches time_series_momentum.py, so it is its own
+  behavior-preserving change - likely its own day).  After that: the
+  portfolio-level backtester (one combined equity curve across held symbols,
+  monthly rebalance), then the walk-forward wrapper, then the rotation verdict
+  through the existing harness (walk-forward, overfitting tax, Sharpe/Sortino,
+  drawdown, after costs) vs an equal-weight-basket buy-and-hold.
+- Housekeeping (non-urgent): commit README.md separately; backfill the [fill in]
+  time-spent placeholders in the Day 29-32 entries.
+
+**Time spent:** 30 minutes
+
 ## Day 35
 
 **Worked on:**
