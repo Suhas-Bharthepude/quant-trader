@@ -29,6 +29,21 @@ deliberately does NOT subclass Strategy: the Strategy contract is single-symbol
 # as ineligible; a plain `x != x` would also work but isnan reads clearly.
 import math
 
+# datetime types the rebalance_ts parameter of trailing_returns_at — the "as of"
+# point at which each symbol's trailing return is measured.
+from datetime import datetime
+
+# OHLCVBar is the bar schema trailing_returns_at consumes (one list per symbol).
+# The ranker above touches no bars; only the returns-computer below needs it.
+from src.data.schema import OHLCVBar
+
+# trailing_return_series is the SHARED trailing-return primitive (extracted from
+# TimeSeriesMomentumStrategy).  Calling it here is the whole point: cross-sectional
+# and time-series momentum compute trailing return from ONE definition and cannot
+# drift.  This import is the same research->strategies direction optuna_fit.py
+# already uses, so there is no circular-import risk.
+from src.strategies.time_series_momentum import trailing_return_series
+
 
 def rank_by_trailing_return(
     trailing_returns: dict[str, float],
@@ -102,3 +117,91 @@ def rank_by_trailing_return(
     # ALL available symbols (no error, no padding).  An empty `ranked` (empty input,
     # or everything filtered out as <=0 / NaN) yields an empty list — cash.
     return [symbol for symbol, _ret in ranked[:top_n]]
+
+
+def trailing_returns_at(
+    bars_by_symbol: dict[str, list[OHLCVBar]],
+    rebalance_ts: datetime,
+    lookback: int,
+    price_field: str = "close",
+) -> dict[str, float]:
+    """Compute each symbol's trailing return AS OF a rebalance timestamp.
+
+    The returns-computing COUNTERPART to rank_by_trailing_return: this produces the
+    dict[str, float] that that function consumes.  For each symbol it computes the
+    trailing return via the SHARED trailing_return_series helper (so cross-sectional
+    and time-series momentum measure "trailing return" identically and cannot
+    drift), selects the value as of the rebalance date, and OMITS any symbol that is
+    ineligible or has no valid (non-NaN) return — so the returned dict contains ONLY
+    eligible symbols with finite returns, exactly matching rank_by_trailing_return's
+    "ineligible symbols are simply absent" input contract.
+
+    The rebalance point is a TIMESTAMP, not an integer index.  The basket's symbols
+    have different-length histories, so an integer index would land on a DIFFERENT
+    calendar date per symbol — a silent lookahead-style bug (one symbol's "index k"
+    could be a later date than another's).  A timestamp is safe because every 1d bar
+    is floored to midnight UTC on ingest, so symbols align by date equality and "as
+    of D" means the same calendar instant for every symbol.
+
+    "As of D" is resolved on each symbol's OWN month-end grid: the most recent
+    month-end AT OR BEFORE D.  s.loc[:D] is right-INCLUSIVE of D on a sorted
+    DatetimeIndex, so a rebalance date that IS a month-end selects itself and never a
+    month-end after it (no lookahead); a date that is a month-end for one symbol and
+    mid-month for another still gives each its own correct most-recent-at-or-before
+    value.  We use the explicit .loc[:D].iloc[-1] slice rather than Series.asof(D):
+    asof silently returns the last NON-NaN value at-or-before D, which would skip a
+    warmup NaN and hand back a stale earlier month-end instead of correctly omitting
+    the symbol.  The explicit slice makes the rule literal and auditable.
+
+    Args:
+        bars_by_symbol: Maps symbol -> that symbol's time-ordered OHLCVBar list.
+        rebalance_ts:   The "as of" timestamp at which returns are measured.
+        lookback:       Trailing formation window in month-end observations.
+        price_field:    Which price field to read — "close" or "adj_close".
+
+    Returns:
+        A dict mapping each ELIGIBLE symbol to its finite as-of trailing return.
+        Symbols that are too short (no month-end at-or-before D) or still in warmup
+        (as-of value is NaN) are absent.  An all-ineligible basket returns {}.
+    """
+    # Accumulate only the eligible symbols; symbols failing either guard below are
+    # never inserted, so the returned dict already satisfies the ranker's contract.
+    result: dict[str, float] = {}
+
+    # Each symbol is computed INDEPENDENTLY on its own bars and its own month-end
+    # grid — there is no cross-symbol alignment beyond the shared rebalance date.
+    for symbol, bars in bars_by_symbol.items():
+        # The full month-end-indexed trailing-return Series, from the SHARED helper.
+        # Do NOT re-derive the arithmetic here — consistency with TSMOM is the point.
+        s = trailing_return_series(bars, lookback, price_field)
+
+        # AS-OF SELECTION: all month-ends at-or-before the rebalance date.  Label
+        # slicing on a sorted DatetimeIndex is right-inclusive of rebalance_ts, so a
+        # rebalance date that IS a month-end is included (selects itself), never a
+        # later one — structurally no lookahead.
+        sliced = s.loc[:rebalance_ts]
+
+        # GUARD (a) — EMPTY: rebalance_ts precedes this symbol's first month-end
+        # (too little history / not listed yet).  This MUST come before the NaN
+        # guard: .iloc[-1] on an empty slice raises IndexError, so there is nothing
+        # to NaN-check yet.  Omit the symbol entirely — the ineligible path.
+        if len(sliced) == 0:
+            continue
+
+        # The most recent month-end value at-or-before rebalance_ts.  Safe now that
+        # the empty case is guarded above.
+        value = sliced.iloc[-1]
+
+        # GUARD (b) — NaN: rebalance_ts falls within this symbol's warmup (the first
+        # `lookback` month-ends are NaN in trailing_return_series), so there is no
+        # valid trailing return yet.  Omit rather than emit a NaN.
+        if math.isnan(value):
+            continue
+
+        # Eligible with a finite return — include it, coercing to a plain float so
+        # the dict is a clean dict[str, float] (not numpy scalars) for the ranker.
+        result[symbol] = float(value)
+
+    # Only eligible symbols with finite returns remain; ineligible/warmup symbols
+    # are absent, so the ranker's NaN backstop stays defense-in-depth, not primary.
+    return result
