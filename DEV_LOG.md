@@ -4,6 +4,99 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 41
+
+**Worked on:**
+- Added test_rotation_n1_equals_engine_run to tests/test_portfolio.py (commit
+  "Add N=1 engine-equivalence test for rotation backtest").  It proves
+  rotation_backtest on a single always-held symbol reproduces Backtester.run's
+  per-bar return stream on that symbol over the aligned held tail.  TEST-ONLY:
+  no production file changed. [+1 test]
+- 239 tests green (was 238).  The equivalence assertion passed on the FIRST run
+  at rtol=1e-12 - no production edit, no tolerance loosening.
+
+**Why it matters:**
+- This CLOSES the Day-39 named risk.  When the portfolio backtester was built
+  NEW rather than wrapping the per-symbol engine (Decision A), it REIMPLEMENTED
+  the engine's per-bar log-return arithmetic (_per_bar_log_returns) instead of
+  calling run().  That reimplementation was a named risk: if it drifted from the
+  engine's np.log(closes[1:]/closes[:-1]) convention even slightly, every
+  rotation number would be on a different basis than the TSMOM verdict, making
+  any rotation-vs-TSMOM comparison invalid.  The equivalence test is the
+  independent proof that the two code paths agree - so the NEW-not-wrap decision
+  is now VALIDATED, not merely asserted, and rotation numbers are confirmed to be
+  on the same log-return basis as everything else the engine produces.
+- An equivalence test's whole value is that it is INDEPENDENT: two
+  separately-written code paths asserted to produce the same numbers, with
+  neither edited to force the match.  It passed first-run with no production
+  change, which is the strongest possible form of that result.
+
+**Architectural note:**
+- THE ALIGNMENT (the day's real design work, locked before any test code via a
+  read-only inspection).  The two streams are NOT trivially comparable: the
+  engine's always-long run has a structural index-0 zero and covers every bar
+  from index 0; the rotation stream has a warmup-cash front (the symbol is not
+  yet eligible) and never covers the pre-first-month-end region or D_0's own bar.
+  So the test compares the ALIGNED HELD TAIL, not the full streams.
+- Construction: ONE bar per calendar month (so every bar is a month-end and
+  ref_mei = [0..N-1], making the index math exact), N=6, STRICTLY INCREASING
+  closes with DISTINCT ratios [100, 108, 121, 130, 145, 160].  Strictly-increasing
+  => every trailing return > 0 => the symbol is always held after warmup (never
+  drops to cash mid-stream).  Distinct ratios => every per-bar log return is
+  distinct, so a wrong alignment offset FAILS rather than coincidentally passing
+  on a uniform series - the distinctness is what makes the offset genuinely tested.
+- lookback L=1 => exactly one warmup period.  top_n=1 with one symbol => weight
+  1/top_n = 1.0, cash_weight = 0.0, so each held period is exactly the symbol's
+  own per-bar stream (the N=1 identity).
+- THE INDEX CORRESPONDENCE (load-bearing): with one bar per month, period k spans
+  engine bar k+1, so rot_returns[k] = log(close[k+1]/close[k]) = engine_returns[k+1].
+  Two SEPARATE assertions: (a) warmup front rot_returns[:L] all exactly 0.0;
+  (b) held tail rot_returns[L:] == engine_returns[L+1:] via assert_allclose at
+  rtol=1e-12/atol=1e-15.  The +1 on the ENGINE side is essential: rotation's
+  period 0 covers engine bar 1 (the bar after D_0), never engine bar 0, so the
+  engine tail starts one index LATER than the rotation tail.  A length-equality
+  guard precedes the allclose so a mismatch fails loudly rather than broadcasting;
+  the structural length len(rot_returns) == len(bars) - 1 is also pinned.
+- WHY the seams are contiguous (confirmed in the inspection, proven by the test):
+  at each month-end D_k the bar appears EXACTLY ONCE in the stitched stream - as
+  the right endpoint (numerator) of period (D_{k-1}, D_k], and only as the anchor
+  DENOMINATOR of period (D_k, D_{k+1}] (excluded from its spine, dropped via [1:]).
+  No gap, no duplicate at any seam.  This contiguity is precisely what would have
+  broken if the (D_k, D_{k+1}] boundary or the anchor-drop were off by one - and
+  the equivalence test would have caught it.
+- Tight tolerance is not slack: both sides run the identical np.log on the
+  identical closes, so the values are bit-identical in principle; rtol=1e-12
+  catches any REAL drift (orders of magnitude larger than float noise) while
+  passing genuine equivalence.  A failure would have been a discovered arithmetic
+  bug to surface, NOT a tolerance to loosen.
+
+**Verification:**
+- Full suite 239 passed (was 238, +1).  Only tests/test_portfolio.py changed (one
+  test + two imports: Backtester from src.backtest.engine, SIGNAL_LONG from
+  src.strategies.base).  No production file touched - _per_bar_log_returns,
+  rotation_backtest, combine_period_returns, and engine.py all unchanged.  The
+  existing 17 portfolio tests unchanged in status.
+- The equivalence assertion passed on the first run at rtol=1e-12:
+  _per_bar_log_returns matches the engine's np.log(closes[1:]/closes[:-1])
+  convention bit-for-bit over the aligned held tail.
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- The transaction-cost model at the turnover seam: apply fees/slippage on
+  rebalance turnover (the set(held) - prev_holdings added / prev_holdings -
+  set(held) dropped differences already carried in the loop).  This is the brick
+  that finally lets a rotation number become a VERDICT rather than a cost-free
+  backtest - no strategy result is meaningful until costs are applied.
+- Then: the walk-forward bridge + rotation verdict through the existing harness
+  (walk-forward, overfitting tax, Sharpe/Sortino, drawdown, AFTER costs) vs an
+  equal-weight-basket buy-and-hold = the Arc C payoff.
+- Housekeeping (non-urgent): backfill the [fill in] time-spent placeholders in the
+  Day 29-39 entries.
+
+**Time spent:** 20 minutes
+
 ## Day 40
 
 **Worked on:**
