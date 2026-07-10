@@ -4,6 +4,115 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 39
+
+**Worked on:**
+- Added combine_period_returns(per_symbol_returns, weights, n_bars,
+  cash_per_bar_return=0.0) -> np.ndarray as a NEW module src/research/portfolio.py
+  (commit "Add portfolio period-return combination primitive"), plus 8 hermetic
+  tests in tests/test_portfolio.py.  This is the pure arithmetic core of the
+  portfolio rotation backtester: one period's already-computed per-symbol per-bar
+  return streams plus per-symbol weights go IN, one combined per-bar portfolio
+  return stream comes OUT.  Purely additive - nothing imports it yet. [+8 tests]
+- 229 tests green (was 221 at Day 38 close): +8.  Purely additive: no existing
+  file touched.
+- Locked the four architecture decisions for the portfolio backtester after a
+  read-only inspection of engine.py / result.py / metrics.py / walk_forward.py
+  (see Architectural note).
+
+**Why it matters:**
+- This is the first brick of the portfolio backtester, the centerpiece of Arc A
+  (the rotation strategy).  The combiner is the piece the future rebalance loop
+  calls once per period: at each month-end the loop will compute per-symbol returns
+  (trailing_returns_at), rank them (rank_by_trailing_return), turn the held top-N
+  into weights, and call this function to produce that period's portfolio return
+  stream.  Building the pure arithmetic core first - provable with hand-computed
+  numbers, touching no bars or engine - keeps the hard part (the rebalance loop and
+  its lookahead/turnover correctness) separate from the arithmetic.
+
+**Architectural note:**
+- FOUR decisions locked after inspecting the engine.  (A) NEW multi-asset
+  construct, NOT a wrap of the per-symbol Backtester.  Decisive reason: the engine's
+  cost/turnover model is per-symbol (turnover = |diff(held)| sees only ONE symbol's
+  position changes), so a per-symbol run() structurally CANNOT see cross-symbol
+  rebalance turnover - dropping symbol A and adding symbol B at a rebalance is
+  invisible to any single-symbol run().  Since every rotation verdict must
+  eventually be issued AFTER costs, and costs attach to portfolio turnover, an
+  architecture that cannot see portfolio turnover is disqualified.  Second strike:
+  N disjoint per-symbol mini-runs would each carry the engine's structural index-0
+  zero and a force-closed final trade, forcing seam-stripping N times per month (the
+  same tax _stitch_oos already pays).  The NEW construct reuses metrics.py and the
+  engine's ARITHMETIC CONVENTIONS (log returns np.log(closes[1:]/closes[:-1]), the
+  per_bar_cash_yield formula) but not the run() call.  Named risk: NEW reimplements
+  the log-return/cash arithmetic, so it must be pinned by an N=1 engine-equivalence
+  test (a single-symbol portfolio must equal run() on that symbol) when the
+  backtester is built - flagged, not built today; test 4 (single symbol, full
+  weight, nonzero cash rate that must not leak) is the anchor for that future test.
+- (B) Equal-weight (1/N), applied as an INPUT weight vector, not hard-coded in the
+  summation - so an alternative weighting (rank- or vol-weighted) later slots in as
+  a different weight vector, not a rewrite.  The combiner takes weights IN; WHO
+  computes them is the caller's job (same separation as the ranker taking returns
+  in).
+- (C) The cash path reuses the engine's EXACT per-bar cash treatment:
+  per_bar_cash_yield = log1p(annual_cash_yield)/annualization_factor, applied to the
+  cash fraction.  So a rotation that goes to cash (ranker returned empty, the Day-36
+  all-negative path) is scored on the identical cash convention the TSMOM verdict
+  used - otherwise the rotation-vs-buy-and-hold comparison would be dishonest
+  (different return on idle capital).  The combiner APPLIES a caller-supplied
+  per-bar cash rate; it does not compute the conversion.
+- (D) The turnover seam is RESERVED, not built.  The future rebalance loop will
+  carry prev_holdings period-to-period so turnover (the set difference between last
+  period's holdings and this period's) is computable, and the transaction-cost model
+  attaches there later without a rewrite.  Not built today.
+- The combiner's one unifying idea: cash_weight = 1.0 - sum(weights), seeded onto
+  every bar before the held-symbol contributions are added.  That single formula
+  handles full-invested (weights sum 1.0 -> no cash), all-cash (empty weights ->
+  every bar the cash rate), and partial-cash (weights sum < 1.0 -> remainder earns
+  cash) with NO branching.  It is a LINEAR combination in LOG-return space -
+  deliberately NOT converted to simple returns - to stay consistent with how the
+  engine, metrics.py, and _stitch_oos treat per-bar log returns as additive.
+- The walk-forward bridge (Arc C, not today): walk_forward_validate is hard-wired to
+  the single-symbol Strategy contract (generate_signals(list[OHLCVBar]) -> array).
+  A multi-symbol portfolio does not fit it; the future bridge is at the
+  per-fold-OOS-returns-array level (the portfolio emits a returns array, the same
+  currency _stitch_oos consumes), NOT the Strategy.generate_signals level.  Today's
+  slice does not preclude it - the combiner already produces exactly that currency.
+
+**Verification:**
+- Full suite 229 passed (was 221, +8).  Only two NEW files: src/research/portfolio.py
+  and tests/test_portfolio.py; no existing file modified (verified additive -
+  nothing imports the module yet, so no prior test could change status).
+- The 8 tests cover: equal-weight fully-invested weighted sum; all-cash period
+  earning the cash rate on every bar (empty holdings, no crash, length from n_bars);
+  partial-cash remainder earning cash; single-symbol full-weight identity with a
+  NONZERO cash rate that must not leak (the N=1 anchor); n_bars < 1 raises;
+  array-length mismatch raises; key-set-inequality raises in BOTH directions (weight
+  without returns, returns without weight); and the float64/length-n_bars output
+  contract.
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- Build the rebalance loop (the next brick): walk the month-end rebalance dates, and
+  at each one call trailing_returns_at -> rank_by_trailing_return -> compute equal
+  weights -> combine_period_returns, carrying prev_holdings so the turnover seam
+  exists.  Design questions to settle first (next session, before code): the exact
+  month-end rebalance schedule the loop iterates; and the partial-cash weighting
+  decision - when the ranker returns fewer than top_n symbols, do the held symbols
+  split full capital (1/held each) or does each get 1/top_n with the unfilled slots
+  sitting in cash.  Both are honest; it is a real weighting choice that changes
+  returns, so decide it deliberately.
+- Then: the N=1 engine-equivalence test (prove the NEW construct's per-bar
+  arithmetic matches run() on a single always-held symbol), the transaction-cost
+  model at the turnover seam, and finally the walk-forward bridge + rotation verdict
+  through the existing harness (walk-forward, overfitting tax, Sharpe/Sortino,
+  drawdown, AFTER costs) vs an equal-weight-basket buy-and-hold = the Arc C payoff.
+- Housekeeping (non-urgent): commit README.md separately; backfill the [fill in]
+  time-spent placeholders in the Day 29-38 entries.
+
+**Time spent:** 10 minutes
+
 ## Day 38
 
 **Worked on:**
