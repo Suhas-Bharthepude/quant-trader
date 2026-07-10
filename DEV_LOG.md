@@ -4,6 +4,119 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 40
+
+**Worked on:**
+- Added rotation_backtest(bars_by_symbol, reference_symbol, lookback, top_n,
+  price_field="close", cash_per_bar_return=0.0, hold_when_all_negative=False) ->
+  np.ndarray and its helper _per_bar_log_returns(bars, price_field="close") ->
+  np.ndarray to src/research/portfolio.py (commit "Add monthly cross-sectional
+  rotation rebalance loop"), plus 9 hermetic tests in tests/test_portfolio.py.
+  This is the orchestration core of the rotation backtester: it walks month-end
+  rebalances and at each one chains the full pipeline - trailing_returns_at
+  (as-of returns) -> rank_by_trailing_return (select top-N) -> equal weights per
+  rule (b) -> combine_period_returns (one period stream) - then stitches all
+  periods into ONE portfolio log-return stream. [+9 tests]
+- 238 tests green (was 229): +9.  Purely additive: combine_period_returns
+  untouched, no existing file modified.
+
+**Why it matters:**
+- This chains the whole rotation arc end-to-end for the first time: the ranking
+  primitive (Day 36), the returns-computer (Day 38), and the combination core
+  (Day 39) are now driven by one loop that produces a real portfolio return
+  stream from a basket of bars.  It is a working cross-sectional rotation
+  backtest - not yet cost-adjusted or walk-forward-validated, but the pipeline is
+  complete and provable on hand-computed numbers (the end-to-end test hand-traces
+  which symbol is held at each rebalance and its holding-period return).
+
+**Architectural note:**
+- TWO decisions locked before code (both real, both recorded).  SCHEDULE:
+  rebalance dates are the REFERENCE symbol's month-ends (SPY as the long-history
+  spine), giving ONE shared rebalance calendar across the ragged basket rather
+  than per-symbol month-ends; the loop walks adjacent month-end pairs and STOPS
+  at the last complete period (no trailing partial period, which would be a
+  variable-length segment that complicates later walk-forward stitching).
+  trailing_returns_at still resolves each OTHER symbol to its own most-recent
+  month-end at-or-before the shared date internally, so the shared calendar and
+  the per-symbol as-of logic coexist correctly.
+- WEIGHTING - rule (b): each held symbol gets a FIXED 1/top_n weight, and the
+  unfilled (top_n - h)/top_n sits in cash.  This de-risks into cash when fewer
+  than top_n names clear the momentum filter - the continuous extension of the
+  Day-36 all-negative -> empty -> cash discipline (zero qualifiers is all-cash
+  under both rules; rule (b) makes the partial case continuous with that).  The
+  alternative rule (a) - split full capital among survivors, 1/h each, always
+  fully invested - is a defensible always-in stance but creates a discontinuity
+  (one qualifier = 100% one name, zero = 100% cash) and concentrates risk exactly
+  when momentum is scarce.  Rule (b) is a WEIGHT-COMPUTATION choice only
+  (combine_period_returns handles any weights summing to <= 1 via the cash
+  remainder), so rule (a) remains a one-line swap later, not a rewrite.
+- NO-LOOKAHEAD BOUNDARY: the holding period is HALF-OPEN LEFT, CLOSED RIGHT - the
+  interval (D_k, D_{k+1}].  Ranking happens AS OF D_k (trailing_returns_at is
+  right-inclusive of D_k), and the holding-period returns are computed strictly
+  AFTER D_k: D_k's own bar is used only as the denominator anchor for the first
+  in-period return and is then dropped, so D_k's bar-to-bar return never appears
+  in the period it was selected at.  This is the rotation analogue of the
+  engine's one-bar lag (signals[:-1] * returns[1:]) - decide on D_k's
+  information, earn the return that begins accruing after D_k.
+- EQUAL-LENGTH GUARD (fail loud, never pad/truncate): the midnight-UTC-floor
+  dedup guarantees at most one bar per (symbol, date) but does NOT guarantee every
+  symbol has a bar on every trading day, so a held symbol with an interior data
+  gap could misalign against the shared spine.  The loop asserts each held
+  symbol's in-period dates match the reference spine exactly and RAISES (naming
+  the symbol and dates) on a mismatch - a misaligned return series would corrupt
+  the backtest silently, so it must fail loud.  A test pins this (a held symbol
+  missing an interior spine date raises).
+- PER-BAR RETURNS reuse the engine's arithmetic, not run(): _per_bar_log_returns
+  reproduces engine.py's asset_returns convention byte-for-byte (element 0 = 0.0;
+  element i = log(close[i]/close[i-1])) via getattr(bar, price_field), on the SAME
+  price_field used for ranking so both are on one basis.  This is the Day-39
+  Decision-A path; the helper is a SEPARATE, independently testable unit precisely
+  because it is the anchor the FUTURE N=1 engine-equivalence test will target (a
+  single held symbol at full weight must reproduce run()'s stream).  That
+  equivalence test is NOT built today.
+- TURNOVER SEAM reserved, not built: the loop carries prev_holdings across
+  iterations (empty before D_0, set to the current selection at each iteration
+  end) so the added/dropped set differences are computable at each rebalance for
+  the future transaction-cost model.  No cost is applied today.
+- The loop lives in src/research/portfolio.py alongside combine_period_returns
+  (which it calls once per period); imports portfolio -> cross_sectional ->
+  time_series_momentum, the same research -> strategies direction already used, no
+  circular import.
+
+**Verification:**
+- Full suite 238 passed (was 229, +9).  Only two files changed: portfolio.py (two
+  new functions + imports) and test_portfolio.py (9 tests + imports + a local bar
+  helper copied from test_cross_sectional.py to stay hermetic).
+  combine_period_returns byte-for-byte unchanged; no other file touched.
+- The 9 tests cover: _per_bar_log_returns matching the engine convention
+  (element 0 = 0.0, then log ratios) and rejecting empty bars; a two-symbol
+  end-to-end run hand-traced across four rebalances (warmup -> cash, then the
+  monthly winner alternating A/B/A with the absolute filter dropping a negative
+  name); an all-cash period earning the cash rate; a partial-cash period (top_n=2,
+  one qualifier) returning (1/2)*symbol + (1/2)*cash - THE test distinguishing
+  rule (b) from rule (a); a no-lookahead test proving D_k's own bar return never
+  enters the period; an interior-gap test proving the equal-length guard raises;
+  and the reference-absent and too-few-month-ends guards.
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- The N=1 engine-equivalence test: prove rotation_backtest on a single
+  always-held symbol (top_n=1, that symbol always positive) reproduces
+  Backtester.run's per-bar return stream on that symbol bit-for-bit - the test
+  that pins the reimplemented per-bar arithmetic against the engine and closes the
+  Day-39 named risk of NEW-not-wrap drift.
+- Then: the transaction-cost model at the turnover seam (fees/slippage on
+  rebalance turnover - every rotation verdict must be issued AFTER costs), and the
+  walk-forward bridge + rotation verdict through the existing harness
+  (walk-forward, overfitting tax, Sharpe/Sortino, drawdown, after costs) vs an
+  equal-weight-basket buy-and-hold = the Arc C payoff.
+- Housekeeping (non-urgent): backfill the [fill in] time-spent placeholders in the
+  Day 29-39 entries.
+
+**Time spent:** 20 minutes
+
 ## Day 39
 
 **Worked on:**
