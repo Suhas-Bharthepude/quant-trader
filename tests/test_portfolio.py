@@ -36,6 +36,15 @@ from src.research.portfolio import (
     rotation_backtest,
 )
 
+# Backtester is the production engine the N=1 equivalence test (test 18) drives on the SAME
+# bars as rotation_backtest: run() produces the per-bar return stream rotation must reproduce.
+from src.backtest.engine import Backtester
+
+# SIGNAL_LONG (== 1) is the constant the equivalence test fills its signal array with, so the
+# engine holds the symbol on every bar (an always-long run) — the single-symbol always-held
+# analogue of rotation_backtest holding one symbol at full weight on every non-warmup period.
+from src.strategies.base import SIGNAL_LONG
+
 
 # ---------------------------------------------------------------------------
 # 1. Equal-weight, fully invested — pure weighted sum, no cash.
@@ -487,3 +496,92 @@ def test_rotation_too_few_month_ends_raises():
     bars_by_symbol = {"A": make_month_end_bars(dates, [100.0], "A")}
     with pytest.raises(ValueError):
         rotation_backtest(bars_by_symbol, reference_symbol="A", lookback=1, top_n=1)
+
+
+# ---------------------------------------------------------------------------
+# 18. N=1 engine-equivalence: rotation on a single always-held symbol reproduces
+#     Backtester.run's per-bar stream over the aligned held tail.
+# ---------------------------------------------------------------------------
+
+
+def test_rotation_n1_equals_engine_run():
+    """Pins the Day-39 named risk CLOSED: rotation_backtest on a single always-held symbol
+    reproduces Backtester.run's per-bar return stream on that symbol over the aligned held
+    tail, proving the reimplemented per-bar arithmetic (_per_bar_log_returns) has NOT drifted
+    from the engine's np.log(closes[1:] / closes[:-1]) convention."""
+    # N = 6 bars, ONE bar per calendar month (Jan..Jun 2024, month-end dates).  One bar per
+    # month means EVERY bar is a month-end, so month_end_indices == [0..N-1] and the index
+    # arithmetic below is exact (each rebalance period spans exactly one bar).
+    dates = [
+        datetime(2024, 1, 31, tzinfo=timezone.utc),  # bar 0  (D_0, first month-end)
+        datetime(2024, 2, 29, tzinfo=timezone.utc),  # bar 1  (D_1)
+        datetime(2024, 3, 31, tzinfo=timezone.utc),  # bar 2  (D_2)
+        datetime(2024, 4, 30, tzinfo=timezone.utc),  # bar 3  (D_3)
+        datetime(2024, 5, 31, tzinfo=timezone.utc),  # bar 4  (D_4)
+        datetime(2024, 6, 30, tzinfo=timezone.utc),  # bar 5  (D_5, last month-end)
+    ]
+    # STRICTLY INCREASING, distinct-ratio closes: every trailing return is > 0 so the default
+    # absolute filter always keeps the symbol (always held after warmup), and the distinct
+    # ratios make every per-bar log return distinct (a misaligned slice cannot coincidentally
+    # match).
+    closes = [100.0, 108.0, 121.0, 130.0, 145.0, 160.0]
+    # A single-symbol basket; "SPY" is both the held symbol and the reference spine.
+    bars = make_month_end_bars(dates, closes, "SPY")
+
+    # --- Engine side: an always-LONG run on the SAME bars. -----------------
+    # A default Backtester is cost-free (fee_bps == slippage_bps == 0.0) and yield-free
+    # (annual_cash_yield == 0.0), so its per-bar stream is the pure asset log returns with
+    # no cost drag or cash term to perturb the comparison.
+    bt = Backtester()
+    # np.full(..., SIGNAL_LONG) holds the symbol on every bar; int64 satisfies the engine's
+    # integer-dtype signal guard.  engine_returns has length N and, for an always-long array,
+    # equals [0.0, log(c1/c0), log(c2/c1), ...] — a structural 0.0 at index 0, then the
+    # per-bar log returns.
+    engine_result = bt.run(bars, np.full(len(bars), SIGNAL_LONG, dtype=np.int64))
+    # The per-bar return stream the rotation must reproduce over its held tail.
+    engine_returns = engine_result.returns
+
+    # --- Rotation side: single symbol, top_n=1 => weight 1.0, no cash. -----
+    # lookback L = 1 => exactly ONE warmup period.  top_n = 1 with one symbol => weight
+    # 1/top_n = 1.0 and cash_weight = 0.0, so each held period is exactly the symbol's own
+    # per-bar stream (the N=1 identity).  rot_returns has length N-1 (one per adjacent pair).
+    rot_returns = rotation_backtest(
+        {"SPY": bars}, reference_symbol="SPY", lookback=1, top_n=1
+    )
+
+    # L is the warmup-period count (== lookback); named once so the alignment below reads
+    # symbolically rather than as a magic number.
+    L = 1
+
+    # STRUCTURAL LENGTH: with one bar per month, ref_mei = [0..N-1], so there are N-1
+    # adjacent-pair periods and each period is exactly one bar (the D_{k+1} month-end).  Pin
+    # the length so a structural change (extra/missing period) fails loudly here.
+    assert len(rot_returns) == len(bars) - 1
+
+    # WARMUP FRONT: at rebalance k < L the trailing return is warmup-NaN (shift(lookback) has
+    # no prior month-end), so trailing_returns_at omits the symbol, held is empty, and the
+    # period earns the default cash rate 0.0 — i.e. the first L entries are exactly 0.0.
+    assert np.all(rot_returns[:L] == 0.0)
+
+    # INDEX CORRESPONDENCE (load-bearing — do NOT hardcode): with one bar per month, period k
+    # spans the single bar at engine index k+1, so rot_returns[k] = log(close[k+1]/close[k])
+    # = engine_returns[k+1].  Therefore the held tail rot_returns[L:] aligns to
+    # engine_returns[L+1:].  The +1 on the ENGINE side is essential: rotation's period 0
+    # covers engine bar 1 (the bar AFTER D_0), never engine bar 0 or the pre-D_0 region,
+    # while the engine stream starts at index 0 with its structural zero — so the engine tail
+    # begins ONE index later than the rotation tail.  A wrong offset would break this.
+    rot_tail = rot_returns[L:]
+    engine_tail = engine_returns[L + 1:]
+
+    # SAME-LENGTH GUARD FIRST: assert the aligned slices are equal length BEFORE assert_allclose
+    # so a length mismatch fails with a clear message rather than allclose broadcasting or
+    # silently comparing a truncated overlap.
+    assert len(rot_tail) == len(engine_tail)
+
+    # ALIGNED-TAIL EQUIVALENCE: both sides are the identical np.log(close[i]/close[i-1]) on the
+    # identical closes, so the values are bit-identical in principle.  rtol=1e-12 / atol=1e-15
+    # is a hair of float safety, NOT slack — a REAL arithmetic drift between _per_bar_log_returns
+    # and the engine would be orders of magnitude larger.  A failure HERE is NOT a tolerance
+    # problem: it would be a genuine arithmetic divergence to surface (do not loosen this to
+    # force green).
+    np.testing.assert_allclose(rot_tail, engine_tail, rtol=1e-12, atol=1e-15)
