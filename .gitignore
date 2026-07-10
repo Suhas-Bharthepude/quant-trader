@@ -67,3 +67,6 @@ ehthumbs.db
 !.vscode/settings.json
 *.swp
 *.swo
+
+daily_prompt.md
+trading_explained.md
