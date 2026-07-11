@@ -221,6 +221,7 @@ def rotation_backtest(
     price_field: str = "close",
     cash_per_bar_return: float = 0.0,
     hold_when_all_negative: bool = False,
+    cost_rate: float = 0.0,
 ) -> np.ndarray:
     """Walk month-end rebalances, rank+hold the top-N, stitch one portfolio log-return stream.
 
@@ -248,6 +249,15 @@ def rotation_backtest(
         price_field:            "close" or "adj_close" — used for BOTH ranking and returns.
         cash_per_bar_return:    per-bar return on the cash fraction (see combine_period_returns).
         hold_when_all_negative: passed to rank_by_trailing_return (absolute-filter switch).
+        cost_rate:              the per-unit-turnover transaction cost as a FRACTION (e.g. 10 bps
+                                total fee+slippage == 0.001); the caller PRE-CONVERTS from bps,
+                                mirroring the engine's self.cost_rate == (fee_bps + slippage_bps)
+                                / 10000.0 and this function's own raw-fraction style
+                                (cash_per_bar_return is likewise a raw fraction, not bps).
+                                Charged per rebalance on the WEIGHT-SPACE turnover (see the loop),
+                                as a single-bar log-space LINEAR drag on the first bar of each
+                                holding period.  Defaults to 0.0 (cost-free, bit-for-bit identical
+                                to the pre-cost behaviour).
 
     Returns:
         One float64 ndarray: the per-bar portfolio log-return stream stitched across every
@@ -261,7 +271,14 @@ def rotation_backtest(
         ValueError: a held symbol's holding-period bars do not align to the reference spine
                     (missing/mismatched interior date) — fail loud, never pad/truncate.
         ValueError: (propagated) top_n < 1, from rank_by_trailing_return.
+        ValueError: cost_rate < 0 (a cost is never a credit; mirrors the engine's fee_bps>=0 guard).
     """
+    # GUARD — a transaction cost is a cost, never a credit: a negative cost_rate would PAY the
+    # portfolio to trade, inflating returns.  0.0 stays valid (the cost-free default); only
+    # strictly negative is rejected, mirroring the engine's fee_bps/slippage_bps >= 0 guards.
+    if cost_rate < 0:
+        raise ValueError(f"cost_rate must be >= 0, got {cost_rate}")
+
     # GUARD — the reference symbol must be present, since its month-ends ARE the schedule.
     # Echo the missing name so a typo'd or absent spine fails immediately and legibly.
     if reference_symbol not in bars_by_symbol:
@@ -294,13 +311,15 @@ def rotation_backtest(
     # be sliced by simple timestamp comparison against them.
     ref_timestamps = [bar.timestamp for bar in ref_bars]
 
-    # TURNOVER SEAM — prev_holdings carries the previous period's selection across
-    # iterations.  Initialized EMPTY so the first rebalance's "added" set is the whole
-    # initial selection.  At the END of each iteration we set prev_holdings = set(held);
-    # then set(held) - prev_holdings (added) and prev_holdings - set(held) (dropped) are
-    # computable HERE for the FUTURE transaction-cost model.  NO cost is applied today —
-    # this only reserves the seam.
-    prev_holdings: set[str] = set()
+    # TURNOVER SEAM — prev_weights carries the previous period's WEIGHT DICT (symbol -> fraction)
+    # across iterations, so the per-rebalance transaction cost can be measured as an L1 WEIGHT
+    # change between consecutive periods.  Initialized EMPTY = all-cash (no risky weights), so the
+    # first rebalance's turnover is the real entry-from-cash amount.  We carry the WEIGHT DICT
+    # (not just the held SET) so the turnover formula is RULE-AGNOSTIC: it stays correct if the
+    # weighting ever switches to rule (a) (1/len(held)), under which a RETAINED symbol's weight
+    # changes between periods and a set difference would miss it.  At the END of each iteration we
+    # set prev_weights = weights; the cost drag uses prev_weights, never a holdings set.
+    prev_weights: dict[str, float] = {}
 
     # Collect each complete period's combined per-bar stream; concatenated at the end into
     # the single stitched output.
@@ -390,6 +409,21 @@ def rotation_backtest(
         # any weights summing to <= 1.
         weights = {symbol: 1.0 / top_n for symbol in held}
 
+        # STEP 4b — TURNOVER at this rebalance = the L1 WEIGHT change over the RISKY symbols
+        # only, CASH EXCLUDED.  For every symbol appearing in EITHER period's weights, add the
+        # absolute change |w_k(s) - w_{k-1}(s)|; a symbol absent on one side contributes weight
+        # 0.0 there via .get(s, 0.0).  CASH IS DELIBERATELY EXCLUDED: the engine's turnover is
+        # |diff(held)| — notional traded, with NO separate cash leg — so including the cash
+        # weight's change would DOUBLE-COUNT on any entry-from-cash or exit-to-cash.  A full
+        # entry from cash must be turnover 1 (one name 0->1/top_n summed = 1), NOT 2; a full
+        # switch A->B is turnover 2 (A 1->0 plus B 0->1), matching the engine's long/short flip
+        # = 2; a retained holding at the same weight contributes 0.  Carrying prev_weights (the
+        # DICT, not a held set) is what makes this rule-agnostic — see the seam comment above.
+        turnover_k = sum(
+            abs(weights.get(s, 0.0) - prev_weights.get(s, 0.0))
+            for s in set(weights) | set(prev_weights)
+        )
+
         # STEP 5 — COMBINE this period into one per-bar stream.  For the empty-held case
         # per_symbol_returns and weights are both {} and the cash remainder (1.0) makes the
         # whole period earn cash_per_bar_return on each bar.
@@ -400,12 +434,22 @@ def rotation_backtest(
             cash_per_bar_return=cash_per_bar_return,
         )
 
+        # STEP 5b — APPLY the transaction-cost drag.  This matches the engine's cost convention
+        # EXACTLY: a LOG-SPACE LINEAR drag (turnover * cost_rate SUBTRACTED from the log return,
+        # NOT a multiplicative (1 - cost) factor), and a SINGLE-BAR hit at the rebalance boundary
+        # — the FIRST bar of the holding period, period_returns[0], which always exists because
+        # n_bars >= 1 is guaranteed above.  period_returns is freshly allocated by
+        # combine_period_returns each iteration, so mutating index 0 in place is local and safe.
+        # With cost_rate == 0.0 (the default) this subtracts 0.0 -> bit-for-bit identical to the
+        # pre-cost stream.
+        period_returns[0] = period_returns[0] - turnover_k * cost_rate
+
         # Record this period's stream for the chronological stitch.
         period_streams.append(period_returns)
 
-        # STEP 6 — advance the TURNOVER SEAM: this period's holdings become next period's
-        # prev_holdings.  (No cost applied — reserved for the future cost model.)
-        prev_holdings = set(held)
+        # STEP 6 — advance the TURNOVER SEAM: this period's weight dict becomes next period's
+        # prev_weights, so the next rebalance measures its turnover against these holdings.
+        prev_weights = weights
 
     # STITCH — concatenate every complete period's stream in chronological order into ONE
     # per-bar log-return array.  At least one pair exists (len(ref_mei) >= 2 guaranteed

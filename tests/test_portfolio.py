@@ -585,3 +585,200 @@ def test_rotation_n1_equals_engine_run():
     # problem: it would be a genuine arithmetic divergence to surface (do not loosen this to
     # force green).
     np.testing.assert_allclose(rot_tail, engine_tail, rtol=1e-12, atol=1e-15)
+
+
+# ---------------------------------------------------------------------------
+# 19. Transaction cost — the default cost_rate=0.0 is a TRUE no-op (regression pin).
+# ---------------------------------------------------------------------------
+
+
+def test_rotation_zero_cost_is_noop_regression():
+    """cost_rate=0.0 (and the default) must be BIT-FOR-BIT identical to the pre-cost stream."""
+    # Reuse the exact dates/closes of test 11 (test_rotation_two_symbols_hand_computed) so this
+    # is a known, multi-period scenario with real turnover at every rebalance.
+    dates = [
+        datetime(2024, 1, 31, tzinfo=timezone.utc),
+        datetime(2024, 2, 29, tzinfo=timezone.utc),
+        datetime(2024, 3, 31, tzinfo=timezone.utc),
+        datetime(2024, 4, 30, tzinfo=timezone.utc),
+        datetime(2024, 5, 31, tzinfo=timezone.utc),
+    ]
+    # Same A/B closes as test 11: the monthly winner alternates, so turnover is non-trivial.
+    bars_by_symbol = {
+        "A": make_month_end_bars(dates, [100.0, 110.0, 120.0, 130.0, 140.0], "A"),
+        "B": make_month_end_bars(dates, [100.0, 105.0, 130.0, 120.0, 200.0], "B"),
+    }
+    # Baseline: NO cost_rate passed at all -> exercises the default (0.0).
+    baseline = rotation_backtest(bars_by_symbol, reference_symbol="A", lookback=1, top_n=1)
+    # Explicit cost_rate=0.0 -> must land on the EXACT same bytes as the default path.
+    costed = rotation_backtest(
+        bars_by_symbol, reference_symbol="A", lookback=1, top_n=1, cost_rate=0.0
+    )
+    # assert_array_equal (NOT allclose): a zero drag subtracts exactly 0.0, so the two streams
+    # must be bit-for-bit equal.  This is the backward-compat pin — the existing 18 tests all run
+    # on the default, so a true no-op keeps them green.
+    np.testing.assert_array_equal(costed, baseline)
+
+
+# ---------------------------------------------------------------------------
+# 20. Transaction cost — the drag lands ONLY on the first bar of the charged period.
+# ---------------------------------------------------------------------------
+
+
+def test_rotation_cost_charged_at_first_bar_of_period():
+    """A multi-bar period's FIRST bar carries the turnover drag; LATER bars are untouched."""
+    # Reuse the intra-month scenario of test 14 (test_rotation_no_lookahead_excludes_Dk_bar):
+    # period 1 = (Feb29, Mar31] spans TWO bars (Mar15, Mar31), so we can prove the drag is a
+    # SINGLE-BAR hit on the first bar (index 2) and NOT on the later bar (index 3).
+    a_dates = [
+        datetime(2024, 1, 15, tzinfo=timezone.utc),
+        datetime(2024, 1, 31, tzinfo=timezone.utc),  # D_0
+        datetime(2024, 2, 15, tzinfo=timezone.utc),
+        datetime(2024, 2, 29, tzinfo=timezone.utc),  # D_1
+        datetime(2024, 3, 15, tzinfo=timezone.utc),
+        datetime(2024, 3, 31, tzinfo=timezone.utc),  # D_2
+    ]
+    a_closes = [50.0, 100.0, 200.0, 110.0, 121.0, 133.0]
+    # B stays below A's trailing return at Feb29 so A is the one held over period 1.
+    b_closes = [50.0, 100.0, 90.0, 95.0, 96.0, 97.0]
+    bars_by_symbol = {
+        "A": make_month_end_bars(a_dates, a_closes, "A"),
+        "B": make_month_end_bars(a_dates, b_closes, "B"),
+    }
+    # A distinctive cost so the drag is unmistakable in the arithmetic.
+    cost_rate = 0.01
+    # Cost-free baseline (default cost) and the costed run on the SAME bars.
+    baseline = rotation_backtest(bars_by_symbol, reference_symbol="A", lookback=1, top_n=1)
+    costed = rotation_backtest(
+        bars_by_symbol, reference_symbol="A", lookback=1, top_n=1, cost_rate=cost_rate
+    )
+    # Period 0 = (Jan31, Feb29] is warmup -> all cash -> turnover 0, so indices 0 and 1 (Feb15,
+    # Feb29) carry NO drag: they must be bit-identical to baseline.
+    np.testing.assert_array_equal(costed[:2], baseline[:2])
+    # Period 1 = (Feb29, Mar31] enters A from all-cash -> turnover 1.  Index 2 is that period's
+    # FIRST bar (Mar15), so it must be baseline minus 1 * cost_rate.
+    np.testing.assert_allclose(costed[2], baseline[2] - 1.0 * cost_rate, rtol=1e-12)
+    # Index 3 (Mar31) is the SECOND bar of that same period -> the drag is single-bar, so it must
+    # be bit-identical to baseline (assert_array_equal, no drag at all).
+    np.testing.assert_array_equal(costed[3], baseline[3])
+
+
+# ---------------------------------------------------------------------------
+# 21. Transaction cost — entry from all-cash is turnover 1 (NOT 0, NOT 2).
+# ---------------------------------------------------------------------------
+
+
+def test_rotation_first_rebalance_entry_turnover_is_one():
+    """A single always-held symbol entering from all-cash is charged turnover EXACTLY 1."""
+    # One symbol, strictly increasing closes so it is always held after the single warmup period
+    # — the test-18 shape.  top_n=1 -> weight 1.0, no cash, so the only turnover is the entry.
+    dates = [
+        datetime(2024, 1, 31, tzinfo=timezone.utc),
+        datetime(2024, 2, 29, tzinfo=timezone.utc),
+        datetime(2024, 3, 31, tzinfo=timezone.utc),
+        datetime(2024, 4, 30, tzinfo=timezone.utc),
+    ]
+    closes = [100.0, 108.0, 121.0, 130.0]
+    bars_by_symbol = {"SPY": make_month_end_bars(dates, closes, "SPY")}
+    # A distinctive, larger cost so the entry drag is easy to see.
+    cost_rate = 0.02
+    # Cost-free baseline and the costed run.
+    baseline = rotation_backtest(bars_by_symbol, reference_symbol="SPY", lookback=1, top_n=1)
+    costed = rotation_backtest(
+        bars_by_symbol, reference_symbol="SPY", lookback=1, top_n=1, cost_rate=cost_rate
+    )
+    # Period 0 (index 0) is warmup -> all cash -> turnover 0 -> unchanged (and 0.0).
+    np.testing.assert_array_equal(costed[0], baseline[0])
+    # Period 1 (index 1) ENTERS SPY from all-cash.  The cash-EXCLUDED weight-space formula gives
+    # turnover 1 (SPY 0 -> 1/top_n summed == 1), NOT 2 (which the cash-INCLUSIVE formula would
+    # wrongly give).  So the first held bar must be baseline minus 1 * cost_rate.
+    np.testing.assert_allclose(costed[1], baseline[1] - 1.0 * cost_rate, rtol=1e-12)
+    # Guard the boundary explicitly: a 2 * cost_rate drag (the double-count) would be a DIFFERENT
+    # number, so pin that the charged value is NOT the turnover-2 amount.
+    assert not np.isclose(costed[1], baseline[1] - 2.0 * cost_rate)
+
+
+# ---------------------------------------------------------------------------
+# 22. Transaction cost — a full name-for-name switch is turnover 2 (matches engine flip).
+# ---------------------------------------------------------------------------
+
+
+def test_rotation_full_switch_turnover_is_two():
+    """Selling one fully-held name and buying another (top_n=1) is charged turnover 2."""
+    # Reuse test 11's scenario: at period 2 = (Mar31, Apr30] the held name SWITCHES from A (held
+    # in period 1) to B, both fully held across the switch -> a full name-for-name rotation.
+    dates = [
+        datetime(2024, 1, 31, tzinfo=timezone.utc),
+        datetime(2024, 2, 29, tzinfo=timezone.utc),
+        datetime(2024, 3, 31, tzinfo=timezone.utc),
+        datetime(2024, 4, 30, tzinfo=timezone.utc),
+        datetime(2024, 5, 31, tzinfo=timezone.utc),
+    ]
+    bars_by_symbol = {
+        "A": make_month_end_bars(dates, [100.0, 110.0, 120.0, 130.0, 140.0], "A"),
+        "B": make_month_end_bars(dates, [100.0, 105.0, 130.0, 120.0, 200.0], "B"),
+    }
+    # Distinctive cost.
+    cost_rate = 0.01
+    # Cost-free baseline and the costed run.
+    baseline = rotation_backtest(bars_by_symbol, reference_symbol="A", lookback=1, top_n=1)
+    costed = rotation_backtest(
+        bars_by_symbol, reference_symbol="A", lookback=1, top_n=1, cost_rate=cost_rate
+    )
+    # Period 1 (index 1) held A; period 2 (index 2) holds B -> A goes 1->0 and B goes 0->1, an
+    # L1 weight change of 2 (cash unchanged).  This matches the engine's long->short flip = 2.
+    # Index 2 is that switching period's first (only) bar, so it must carry a 2 * cost_rate drag.
+    np.testing.assert_allclose(costed[2], baseline[2] - 2.0 * cost_rate, rtol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# 23. Transaction cost — a retained holding incurs ZERO cost (turnover 0).
+# ---------------------------------------------------------------------------
+
+
+def test_rotation_no_turnover_no_cost():
+    """Holding the SAME name across two consecutive periods charges no cost on the second."""
+    # A rises fastest every month, so A is held in BOTH period 1 and period 2 -> the period-2
+    # turnover is 0 (A retained at the same weight).  B is positive but always the weaker name.
+    dates = [
+        datetime(2024, 1, 31, tzinfo=timezone.utc),
+        datetime(2024, 2, 29, tzinfo=timezone.utc),
+        datetime(2024, 3, 31, tzinfo=timezone.utc),
+        datetime(2024, 4, 30, tzinfo=timezone.utc),
+    ]
+    bars_by_symbol = {
+        "A": make_month_end_bars(dates, [100.0, 110.0, 120.0, 130.0], "A"),
+        "B": make_month_end_bars(dates, [100.0, 101.0, 102.0, 103.0], "B"),
+    }
+    # A cost that WOULD bite if any turnover were (wrongly) charged on the retained period.
+    cost_rate = 0.01
+    # Cost-free baseline and the costed run.
+    baseline = rotation_backtest(bars_by_symbol, reference_symbol="A", lookback=1, top_n=1)
+    costed = rotation_backtest(
+        bars_by_symbol, reference_symbol="A", lookback=1, top_n=1, cost_rate=cost_rate
+    )
+    # Period 1 (index 1) ENTERS A from cash -> turnover 1 -> IS charged (sanity that the cost is
+    # actually live in this scenario, so the index-2 no-drag assertion is meaningful).
+    np.testing.assert_allclose(costed[1], baseline[1] - 1.0 * cost_rate, rtol=1e-12)
+    # Period 2 (index 2) RETAINS A at the same weight -> turnover 0 -> subtracts exactly 0.0, so
+    # it must be bit-for-bit identical to baseline (assert_array_equal, not allclose).
+    np.testing.assert_array_equal(costed[2], baseline[2])
+
+
+# ---------------------------------------------------------------------------
+# 24. Transaction cost — a negative cost_rate is rejected (mirrors engine's fee_bps>=0).
+# ---------------------------------------------------------------------------
+
+
+def test_rotation_negative_cost_rate_raises():
+    """cost_rate < 0 -> ValueError (a cost is never a credit)."""
+    dates = [
+        datetime(2024, 1, 31, tzinfo=timezone.utc),
+        datetime(2024, 2, 29, tzinfo=timezone.utc),
+    ]
+    bars_by_symbol = {"A": make_month_end_bars(dates, [100.0, 110.0], "A")}
+    # A strictly-negative cost_rate must fail loud before any scheduling work.
+    with pytest.raises(ValueError):
+        rotation_backtest(
+            bars_by_symbol, reference_symbol="A", lookback=1, top_n=1, cost_rate=-0.001
+        )
