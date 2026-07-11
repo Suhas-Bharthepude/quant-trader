@@ -4,6 +4,103 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 42
+
+**Worked on:**
+- Added a transaction-cost model to rotation_backtest in src/research/portfolio.py
+  (commit "Add transaction-cost model to rotation backtest"), plus 6 hermetic tests
+  in tests/test_portfolio.py.  A new cost_rate parameter (a fraction, fee+slippage
+  combined, defaulting to 0.0) charges each rebalance's turnover as a single-bar
+  log-space linear drag on the first bar of the holding period. [+6 tests]
+- 245 tests green (was 239).  Purely additive to behaviour: the cost_rate=0.0
+  default is a bit-for-bit no-op, so all 18 prior portfolio tests (and the rest of
+  the suite) are unchanged.
+
+**Why it matters:**
+- This is the brick that lets a rotation number become a VERDICT rather than a
+  cost-free backtest.  No strategy result is meaningful until costs are applied -
+  the standing discipline that has governed every verdict since TSMOM.  A monthly
+  rotation strategy trades on every rebalance, so friction eats directly into its
+  edge; a cost-free rotation Sharpe is not a number you can quote.  With the cost
+  model in place a rotation stream can now be charged against realistic
+  fees/slippage, and because the cost uses the engine's exact log-space convention,
+  a rotation Sharpe after costs is directly comparable to a TSMOM Sharpe after
+  costs - the comparability the Day-41 equivalence test established for returns now
+  extends to costs.
+
+**Architectural note:**
+- THE TURNOVER DEFINITION (the day's real design work, locked before code via a
+  read-only inspection).  Turnover at each rebalance is the L1 WEIGHT change over
+  the RISKY symbols only, CASH EXCLUDED: turnover_k = sum over (union of symbols in
+  prev_weights or current weights) of |w_k(s) - w_{k-1}(s)|.  Cash is deliberately
+  EXCLUDED because the engine's turnover is |diff(held)| - notional traded, with NO
+  separate cash leg - so including the cash weight's change would DOUBLE-COUNT on
+  any entry-from-cash or exit-to-cash.  The inspection proved this with three
+  reference cases: a full entry from cash must be turnover 1 (not 2); a full
+  name-for-name switch is turnover 2 (matching the engine's long/short flip = 2); a
+  retained holding at the same weight is turnover 0.  The cash-inclusive sum agrees
+  ONLY on the pure-switch case (where cash is unchanged) - it would have penalized
+  every de-risk-to-cash rebalance at double the true cost, making the strategy look
+  systematically worse than it is.  Halving the cash-inclusive sum does NOT fix it
+  (it would make the switch case 1, wrong).  The fix is exclude cash, not scale.
+- CARRYING prev_weights, not the held set: the turnover is computed from the actual
+  weight DICTS of consecutive periods (prev_weights, initialized empty = all-cash
+  prior, reassigned to the current weights each iteration), NOT from
+  (|added|+|dropped|)/top_n set arithmetic.  Under the current rule (b) with fixed
+  top_n those are equal, but carrying the weight dict is RULE-AGNOSTIC: if the
+  weighting ever switches to rule (a) (1/len(held)), a RETAINED symbol's weight
+  changes when len(held) changes, and a set-difference formula would silently
+  undercount.  The weight-space L1 sum stays correct either way, and it reads like
+  its definition rather than a coincidence-of-fixed-top_n shortcut.
+- THE DRAG matches the engine EXACTLY: period_returns[0] = period_returns[0] -
+  turnover_k * cost_rate.  A LOG-SPACE LINEAR drag (subtracted from the log return,
+  not a multiplicative (1 - cost) factor), a SINGLE-BAR hit at the rebalance
+  boundary (the first bar of the holding period, which always exists since
+  n_bars >= 1).  This mirrors the engine's cost_returns = turnover * cost_rate;
+  strategy_returns -= cost_returns, so rotation costs and single-symbol engine costs
+  are on ONE convention - the whole point of keeping the two comparable.
+- THE PARAMETER: cost_rate is a raw FRACTION (fee+slippage already combined and
+  divided by 10000), matching the engine's self.cost_rate and rotation's own
+  raw-fraction style (cash_per_bar_return is likewise a raw fraction).  Added as the
+  LAST parameter so no positional call site breaks.  Guards cost_rate < 0 ->
+  ValueError (a cost is never a credit; mirrors the engine's fee_bps>=0).  Defaults
+  to 0.0 (cost-free, bit-for-bit identical to pre-cost).
+- The cost attaches ENTIRELY inside rotation_backtest: combine_period_returns and
+  _per_bar_log_returns are untouched, and the function still returns a bare
+  np.ndarray (no total-cost field - reporting rotation's cumulative cost is a
+  separate additive decision for later).
+
+**Verification:**
+- Full suite 245 passed (was 239, +6).  Only two files changed: portfolio.py
+  (rotation_backtest only) and test_portfolio.py (6 tests).  combine_period_returns
+  and _per_bar_log_returns byte-for-byte unchanged; engine.py and all other files
+  untouched.  The 18 prior portfolio tests unchanged in status (the no-op default
+  confirmed by a bit-for-bit regression test).
+- The 6 tests: a zero-cost no-op regression (assert_array_equal, not allclose -
+  proves the default is bit-for-bit); a single-bar drag test (multi-bar period,
+  first bar charged, later bar untouched); entry-from-cash is turnover 1 (and
+  explicitly NOT 2 - the test that proves the cash-excluded definition, the one the
+  cash-inclusive formula would fail); a full name-for-name switch is turnover 2
+  (matches the engine flip); a retained holding is turnover 0 (no drag); a negative
+  cost_rate raises.
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- The walk-forward bridge + rotation verdict - the FINAL Arc A brick.  Run the
+  now-cost-adjusted rotation stream through the existing harness (walk-forward,
+  overfitting tax, Sharpe/Sortino, drawdown, AFTER costs) against an
+  equal-weight-basket buy-and-hold benchmark.  This is the Arc C payoff: the honest,
+  cost-adjusted answer to whether cross-sectional rotation beats holding the basket.
+  The Day-41 equivalence test and today's cost model are what make that verdict
+  legitimate - rotation's returns and costs are both on the same basis as the
+  benchmark's.
+- Housekeeping (non-urgent): backfill the [fill in] time-spent placeholders in the
+  Day 29-39 entries.
+
+**Time spent:** 20 minutes
+
 ## Day 41
 
 **Worked on:**
