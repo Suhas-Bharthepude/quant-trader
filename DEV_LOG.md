@@ -4,6 +4,133 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 43
+
+**Worked on:**
+- Added a NEW module src/research/rotation_verdict.py (commit "Add rotation
+  walk-forward bridge and verdict"), plus 9 hermetic tests in a NEW
+  tests/test_rotation_verdict.py.  It walk-forward-validates the cost-adjusted
+  rotation_backtest stream OUT-OF-SAMPLE against an equal-weight-basket
+  buy-and-hold benchmark, reusing the existing _stitch_oos scoring seam.  Four
+  functions: rotation_month_end_folds (the month-end-aligned splitter),
+  _rotation_fold_returns (per-fold test-span returns, warmed inside the train
+  span), _benchmark_fold_returns (the always-hold-everything benchmark), and
+  rotation_walk_forward (the orchestrator returning a RotationVerdict). [+9 tests]
+- 254 tests green (was 245).  Purely additive: two NEW files only, no existing
+  file touched (git status --porcelain shows only the two untracked files), so
+  the 245 existing tests are bit-for-bit unchanged.  This is the FIXED-PARAMETER
+  bridge (step A); per-fold hyperparameter search and the overfitting tax are
+  step B.
+
+**Why it matters:**
+- This is the foundation of the final Arc A brick: rotation can now be scored
+  OUT-OF-SAMPLE and AFTER COSTS against a FAIR benchmark.  The two prerequisites
+  for a legitimate verdict are both satisfied - Day 41 proved rotation's returns
+  are on the same log-return basis as the engine/benchmark, Day 42 made costs
+  correct - so the OOS rotation Sharpe/Sortino/drawdown are directly comparable
+  to the equal-weight-basket buy-and-hold's over the identical test spans.
+  Whatever the verdict turns out to be (rotation may or may not beat the basket),
+  it is now an HONEST, defensible number rather than a cost-free in-sample
+  backtest.
+
+**Architectural note:**
+- WHY A NEW MODULE, NOT walk_forward_validate: the generic harness is hard-wired
+  to single-symbol Strategy objects (it drives generate_signals + Backtester.run
+  on one symbol), and its walk_forward_splits cuts folds on BAR INDEX.  Rotation
+  is multi-symbol and its causality lives on the reference symbol's MONTH-END
+  grid, so a bar-index split could land a train/test boundary mid-holding-period
+  and score a test fold on a return whose ranking used training data - lookahead.
+  So the bridge REUSES only the pure scoring seam (_stitch_oos, and through it
+  metrics.py) and ADDS a rotation-specific month-end-aligned splitter.  Nothing
+  in walk_forward.py/portfolio.py/metrics.py/engine.py changed.
+- THE MONTH-END FOLD SPLITTER (the no-lookahead crux): rotation_month_end_folds
+  returns (train_start_me, test_start_me, test_end_me) triples that are INDICES
+  INTO THE MONTH-END ARRAY, not bar indices.  The split falls ON month-end
+  position test_start_me, so the test fold's first rank is as-of that month-end
+  (train-span data only) and the test holding returns are strictly after it - the
+  walk-forward analogue of walk_forward_splits' strict train/test adjacency.  A
+  test pins this with a winner that FLIPS at the boundary: the correct
+  as-of-boundary pick earns a different, detectable number than a lookahead bug
+  would.
+- GUARD CORRECTION (found during implementation, documented): a rotation test
+  "observation" is a HOLDING PERIOD between two month-ends, so a test span of
+  test_months decision month-ends needs one MORE closing month-end D_{test_end_me}
+  to terminate the last period (D_{test_end_me-1}, D_{test_end_me}].  The minimum
+  month-end count is therefore train_months + test_months + 1 (not +0), and the
+  tail rule is test_end_me <= M-1.  This +1 is also what makes consecutive
+  non-overlapping folds TILE with no gap and no overlap (fold i's last period ends
+  at D_{test_end_me}; fold i+1's first period starts there), preserving
+  walk_forward_splits' no-gap/no-overlap guarantee.  (The original plan omitted the
+  +1; the closing-boundary requirement makes it necessary.)
+- THE TEST-SPAN EXTRACTION (the alignment crux): each fold slices every symbol's
+  bars to [D_{train_start_me}, D_{test_end_me}] inclusive, runs rotation_backtest
+  over the slice (warm-up pairs + test pairs), and strips the warm-up prefix.  The
+  warm-up bar count is computed from the TELESCOPING reference spine
+  (ref_mei[test_start_me] - ref_mei[train_start_me]), NOT by assuming one bar per
+  pair - so it stays correct on multi-bar months.  A defensive invariant raises if
+  the slice stream length != warmup_bars + test_bars (fail loud on any spine
+  misalignment rather than silently mis-slice).
+- WARM-UP SUFFICIENCY - why train_months > lookback (STRICT): the test span's
+  first decision needs `lookback` prior month-ends, but the warm-up decision
+  IMMEDIATELY BEFORE the test span (which sets the test span's first-bar
+  entry-turnover cost) needs lookback+1, so train_months must strictly exceed
+  lookback for the test-span stream - including its entry cost - to match a
+  full-history rotation exactly.  Guarded, with a test.
+- THE PREPEND-ZERO STITCH REUSE: _stitch_oos does fr.returns[1:] per fold,
+  assuming the engine's structural index-0 zero.  Rotation streams have NO leading
+  zero, so each fold's returns get a single 0.0 prepended before wrapping in a
+  minimal BacktestResult - _stitch_oos's [1:] then strips the injected zero and
+  keeps every real return.  Confirmed _stitch_oos reads ONLY fr.returns (it
+  concatenates fr.returns[1:] and derives all metrics from that), so the other
+  BacktestResult fields on the minimal per-fold result are provably-unused safe
+  placeholders.  A test pins the stitched length == real return count (not one
+  fewer).
+- THE BENCHMARK - true always-hold-everything, charged fairly:
+  _benchmark_fold_returns reuses _rotation_fold_returns with top_n=len(basket) and
+  hold_when_all_negative=True (all symbols always held, no absolute filter - a real
+  buy-and-hold of the basket, NOT a momentum-filtered subset), same
+  lookback/folds/test-span extraction/cost_rate as the strategy.  So strategy and
+  benchmark are scored on byte-identical spans by identical code, differing ONLY in
+  top_n and the filter flag - a fair edge-vs-beta comparison.  A test pins the
+  benchmark == equal-weight blend (0.5*rA + 0.5*rB), distinct from the top_n=1
+  rotation.
+- NO OVERFITTING TAX under fixed parameters: RotationVerdict deliberately has no
+  tax field.  Under fixed parameters nothing is fit per fold, so a tax would be
+  hollow - it is deferred to step B (per-fold Optuna search), where the
+  in-sample-vs-OOS gap will measure real curve-fitting.
+
+**Verification:**
+- Full suite 254 passed (was 245, +9).  git status --porcelain shows ONLY the two
+  new untracked files - no existing file modified, so the 245 existing tests are
+  bit-for-bit unchanged.  _stitch_oos and metrics reused by import.
+- The 9 tests: fold basics (exact triples, non-overlapping tiling); step + ragged
+  tail; guards (train/test/step < 1, too-few-month-ends); the on-month-end
+  no-lookahead pin (winner flips at the boundary, lookahead bug would give a
+  detectably different number); prepend-zero keeps all real returns through
+  _stitch_oos; the whole-basket equal-weight benchmark distinct from top_n=1
+  rotation; cost monotonicity (costed total return <= free, both strategy and
+  benchmark); all verdict fields finite with correct n_folds; and the
+  train_months > lookback guard.
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- Step B: per-fold hyperparameter search + the meaningful overfitting tax.  On
+  each train span, search top_n/lookback to maximize in-sample Sharpe, score those
+  params on the test span, and report the in-sample-vs-OOS Sharpe gap as the
+  overfitting tax.  This layers onto the now-proven fixed-parameter bridge and
+  completes the rotation verdict - the Arc C payoff.  (The B search cannot reuse
+  the TSMOM Optuna fitter, which returns a Strategy for walk_forward_validate's
+  seam; it needs a rotation-specific per-fold search on the month-end-fold
+  returns.)
+- Then: run the verdict on the real 17-ETF basket and record the honest
+  rotation-vs-basket result (after costs, OOS).  Then the execution/autonomy arc.
+- Housekeeping (non-urgent): backfill the [fill in] time-spent placeholders in the
+  Day 29-39 entries.
+
+**Time spent:** 30 minutes
+
 ## Day 42
 
 **Worked on:**
