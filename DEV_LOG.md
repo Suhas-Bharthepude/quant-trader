@@ -4,6 +4,75 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 45
+
+**Worked on:**
+- Added scripts/rotation_verdict.py (commit "Add real-basket rotation verdict script")
+  plus a hermetic smoke test in a NEW tests/test_rotation_verdict_script.py.  A thin
+  research CLI that loads the real 17-ETF basket from DuckDB via the cli_common helpers
+  and runs the already-tested rotation_walk_forward_search ONCE on the whole basket
+  (rotation is multi-symbol - not a per-symbol loop), printing the fixed-vs-fitted-vs-B&H
+  OOS Sharpes, the overfitting tax, the secondary metrics (Sortino/MaxDD/TotalReturn),
+  and the per-fold chosen (top_n, lookback).  It adds NO production logic - all
+  fold/scoring/tax math lives in the tested src/research/rotation_verdict.py. [+1 test]
+- 263 tests green (was 262).  Two new files only; no existing file touched.
+- DATA-INTEGRITY GATE PASSED before trusting any number: all 17 symbols, identical 4638
+  rows, identical 2008-01-02 to 2026-06-09 span, ZERO duplicate (symbol,date) groups (the
+  historical tz-duplication bug is not present - the midnight-UTC floor in
+  duckdb_store._bar_to_tuple holds), longest zero-return run 2 bars.  SPY spine = 222
+  month-ends.  Verified on the REAL data before running the verdict.
+
+**The verdict** (recorded straight - grid/windows/cost LOCKED before the run, NOT retuned):
+- Config: grid = top_n in {1,2,3,5} x lookback in {3,6,9,12} months (16 candidates);
+  reference SPY; cost_rate 0.0010 (10 bps per unit turnover); all locked before the run.
+- Headline (train 24mo / test 12mo, 16 folds): Fitted OOS Sharpe +0.38 vs B&H +0.59 vs
+  Fixed +0.44.  Overfitting tax +0.72 (in-sample +1.10 - fitted OOS +0.38).  Fitted
+  Sortino +0.52 vs B&H +0.81; Fitted MaxDD 34.65% vs B&H 30.32%; Fitted total return
+  +187.35% vs B&H +270.10%.
+- Robustness cross-check (train 24mo / test 6mo, 32 folds): Fitted OOS Sharpe +0.40 vs
+  B&H +0.59 vs Fixed +0.44.  Overfitting tax +0.72 (identical).  Fitted MaxDD 29.10% vs
+  B&H 30.32%; Fitted total return +220.06% vs B&H +270.10%.
+- FINDING: cross-sectional rotation on this basket does NOT beat equal-weight
+  buy-and-hold out-of-sample after costs - it loses on Sharpe, Sortino, and total return,
+  with drawdown roughly a wash (marginally worse on the 12mo window, marginally better on
+  the 6mo).  Per-fold search also did NOT beat its own fixed-parameter baseline, so the
+  tuning subtracted value.  The +0.72 tax - stable across BOTH windows - shows roughly
+  two-thirds of the in-sample Sharpe was curve-fitting that did not survive OOS.  The
+  per-fold picks thrash across the grid with no stable winner (fold 7 even scores negative
+  in-sample), which is the visible mechanism behind the tax.
+
+**Why it matters:**
+- This is the honest-outcome principle delivering the product.  The value of Arc A was
+  never a winning strategy - it was a validated pipeline that can take a plausible
+  strategy, test it genuinely out-of-sample with a proven no-leak in-sample fit, charge
+  realistic costs, and QUANTIFY how much apparent edge is self-deception.  The +0.72 tax,
+  stable across two window layouts, is that quantification.  This corroborates the TSMOM
+  verdict (no broad money-making edge on this basket); here even the drawdown benefit
+  bonds gave TSMOM does not robustly appear for rotation.  Being able to SHOW - not assert
+  - that momentum-style strategies do not produce durable cost-surviving OOS edge on this
+  basket is the actual portfolio-grade result and the skill a research interview tests for.
+
+**Verification:**
+- Full suite 263 passed (was 262, +1 smoke test).  git status --porcelain: only the two
+  new files.  Data-integrity gate passed on the real basket before the run (see above).
+  Both verdict windows agree, and the tax is identical (+0.72) across them.
+
+**Blocked on:**
+- Nothing.  Arc A (the cross-sectional rotation arc) is COMPLETE: ranker (36), returns
+  (38), combiner (39), rebalance loop (40), engine-equivalence (41), costs (42),
+  walk-forward bridge (43), per-fold search + tax (44), real-basket verdict (45).
+
+**Next up:**
+- The execution/autonomy arc: wire AlpacaBroker so the base bot can run autonomously
+  (paper) - the v1 milestone (a working, honestly-validated base bot a serious quant would
+  respect), NOT a profit claim.
+- Then the writeup/polish arc: a README/writeup presenting the TSMOM and rotation verdicts
+  and the overfitting-tax methodology as the project's distinctive contribution.
+- Housekeeping (non-urgent): backfill the [fill in] time-spent placeholders in the
+  Day 29-39 entries.
+
+**Time spent:** 20 minutes
+
 ## Day 44
 
 **Worked on:**
