@@ -4,6 +4,116 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 44
+
+**Worked on:**
+- Added a rotation-specific per-fold GRID SEARCH to src/research/rotation_verdict.py
+  (commit "Add rotation per-fold search and overfitting tax"), plus 8 hermetic tests
+  in a NEW tests/test_rotation_search.py.  Per outer fold it searches (top_n,
+  lookback) candidates for best IN-SAMPLE Sharpe (after costs) on the TRAIN span,
+  applies the winner to the TEST span, and reports the overfitting tax via the SAME
+  summarize_tax helper the TSMOM CLI uses.  New: the RotationSearchVerdict dataclass,
+  _rotation_train_span_returns, _search_fold, and rotation_walk_forward_search. [+8 tests]
+- 262 tests green (was 254).  Purely additive: 470 insertions / 0 deletions in
+  rotation_verdict.py (the Day-43 functions are byte-for-byte unchanged) plus the new
+  test file, so all 254 existing tests are unchanged.
+
+**Why it matters:**
+- This gives the rotation verdict its distinctive measure.  The fixed-parameter bridge
+  (Day 43) produced a legitimate OOS number but no overfitting tax - nothing was fit
+  per fold, so a tax would be hollow.  The per-fold search fits (top_n, lookback) on
+  each train span and scores the winner OOS, so the in-sample-minus-OOS Sharpe gap is
+  now a REAL measurement of how much the per-fold tuning was curve-fitting rather than
+  genuine edge.  The tax is the project's signature contribution to rigor; computing it
+  via the SAME summarize_tax the TSMOM path uses makes the rotation tax directly
+  comparable to the TSMOM tax - by construction, not by careful matching.
+
+**Architectural note:**
+- THE NO-LEAK IN-SAMPLE STREAM (the crux): _rotation_train_span_returns produces a
+  candidate's in-sample stream by DELEGATING to the unchanged Day-43
+  _rotation_fold_returns with an INNER triple (train_start_me, train_start_me +
+  lookback + 1, test_start_me).  The inner closing boundary is test_start_me - the
+  OUTER split boundary - so the inner scoring window's last period is (..., D_{test_start_me}]
+  and its ranking uses D_{test_start_me - 1}; both endpoints are <= the boundary, so
+  the in-sample stream uses ONLY train-span data.  NO bar strictly after D_{test_start_me}
+  (no outer test return) can enter the in-sample score - the walk-forward-search analogue
+  of the Day-40/43 boundary discipline, one level deeper.  A test PROVES it
+  experimentally: mutating a test-span bar (strictly after the boundary) leaves the
+  in-sample stream BYTE-IDENTICAL (assert_array_equal) - if the fit cannot see a changed
+  test bar, no test data leaked in.  The +1 in the inner triple warms the candidate's
+  lookback inside the train span (inner train = lookback+1 > lookback), so the in-sample
+  stream (including its entry-turnover cost) matches a full-history rotation.
+- THE TAX = summarize_tax, REUSED not reimplemented: the tax is computed by calling
+  scripts.overfitting_tax.summarize_tax (the SAME helper the TSMOM overfitting-tax CLI
+  uses), so tax = mean(per-fold in-sample Sharpes) - stitched fitted OOS Sharpe,
+  identical definition to TSMOM.  RotationSearchVerdict carries the parallel fields
+  (fixed_oos / fitted_oos / bh / mean_in_sample / tax) so a rotation row reads like a
+  TSMOM TaxRow.  fixed_oos comes from running the Day-43 fixed-parameter
+  rotation_walk_forward once on the baseline candidate, matching the TSMOM CLI's
+  fixed-vs-fitted structure.
+- COST-AWARE IN-SAMPLE OBJECTIVE - a DELIBERATE divergence from TSMOM (recorded so it
+  is a choice, not an inconsistency): the rotation in-sample search scores candidates
+  AFTER costs (same cost_rate threaded to both the in-sample train-span stream and the
+  OOS test-span stream).  The TSMOM fitter deliberately searches FRICTIONLESS (its
+  comment: in-sample stays frictionless so the tax isolates parameter-selection
+  overfitting, not cost modeling).  Rotation diverges because its turnover - and thus
+  cost - IS a function of the searched params (top_n and lookback change rebalance
+  frequency), so a frictionless in-sample search would pick params that ignore their own
+  turnover cost and then be penalised OOS, inflating the tax with a COST ARTIFACT rather
+  than genuine parameter-selection overfitting.  Scoring both sides after costs keeps the
+  rotation tax honest for a strategy whose parameter choice drives its trading frequency.
+- THE DETERMINISTIC TIEBREAK: _search_fold sorts candidates by (lookback, top_n)
+  ascending and uses a strictly-greater argmax update, so on an in-sample Sharpe tie the
+  FIRST (smallest lookback, then smallest top_n) wins - reproducible, no
+  np.argmax-on-ties nondeterminism.  A grid (not Optuna) was chosen for two
+  low-cardinality params: exhaustive (true argmax, not sampled), deterministic, no
+  dependency, no seed.  A test pins the tiebreak with two identical-stream candidates.
+- THE L_max WARMUP GUARD: rotation_walk_forward_search raises if train_months <=
+  L_max + 1 where L_max is the grid's LARGEST candidate lookback - the inner in-sample
+  scoring window for L_max is train_months - L_max - 1 month-ends, so <= L_max + 1 leaves
+  zero (a degenerate len<2 -> 0.0 in-sample Sharpe).  Recommends train_months >=
+  L_max + 3 for a meaningful in-sample Sharpe.  Guard is on the whole grid's max, not a
+  single lookback.
+- THE BENCHMARK is UNCHANGED from Day 43 and lookback-invariant (it holds every symbol
+  regardless of rank), so it is produced via the existing _benchmark_fold_returns at the
+  grid's smallest lookback and is the SAME bar the fixed-parameter bridge measures.  A
+  test asserts the searched run's bh_sharpe / bh_total_return equal the Day-43
+  rotation_walk_forward's on the same basket - the bar the strategy must clear did not move.
+- ADDITIVE: the winner's OOS stream uses the unchanged Day-43 _rotation_fold_returns
+  (outer triple); both strategy and benchmark are stitched via the reused _stitch_oos.
+  rotation_walk_forward and RotationVerdict stay byte-for-byte as the no-search baseline
+  (470 insertions, 0 deletions).
+
+**Verification:**
+- Full suite 262 passed (was 254, +8).  git diff --numstat shows 470/0 on
+  rotation_verdict.py (purely additive; git diff | grep '^-[^-]' empty -> no existing
+  Day-43 line changed) plus the new tests/test_rotation_search.py.  No file outside the
+  two touched; no existing test changed status.
+- The 8 tests: the no-leak proof (mutate a post-boundary test bar -> in-sample stream
+  byte-identical); the search picks the clear in-sample winner; the deterministic
+  tiebreak (identical-stream candidates -> smaller (lookback, top_n)); the L_max guard
+  raises; the empty-grid guard raises; the searched verdict fields populated with tax ==
+  mean(in_sample) - fitted_oos (the summarize_tax formula); the benchmark equals the
+  Day-43 benchmark; and a Day-43-path-unchanged smoke test.
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- The real-basket verdict run: run rotation_walk_forward_search on the actual 17-ETF
+  basket and record the honest OOS, after-costs, tax-reported answer to whether
+  cross-sectional rotation beats holding the basket.  This is the Arc C payoff - the
+  question the entire rotation arc was built to answer.  Keep the honest-outcome
+  principle: given the TSMOM verdict (edge concentrated in bonds, drawdown reduction the
+  durable value), a result where rotation does NOT clearly beat buy-and-hold is entirely
+  plausible and is a legitimate, reportable finding - the machinery makes either answer
+  trustworthy.
+- Then: the execution/autonomy arc (wire AlpacaBroker) = v1 base bot; writeup/polish arc.
+- Housekeeping (non-urgent): backfill the [fill in] time-spent placeholders in the
+  Day 29-39 entries.
+
+**Time spent:** 20 minutes
+
 ## Day 43
 
 **Worked on:**
