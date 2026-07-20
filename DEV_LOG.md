@@ -4,6 +4,80 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 46
+
+**Worked on:**
+- Added 3 hermetic, mocked tests to tests/test_alpaca_broker.py (commit "Add hermetic
+  mocked tests for AlpacaBroker read path and paper-only guard").  They exercise
+  AlpacaBroker.get_account() (string->float parsing of the money fields, "PA"-prefix paper
+  detection) and the inherited verify_paper_account() guard - with NO network and NO
+  credentials - by monkeypatching the Alpaca SDK client classes (TradingClient /
+  StockHistoricalDataClient) as imported into src.brokers.alpaca_broker's namespace, so
+  __init__ builds fakes and never connects. [+3 tests]
+- Test-only, purely additive: 160 insertions / 0 deletions in tests/test_alpaca_broker.py;
+  no src/ file touched (base.py and alpaca_broker.py byte-for-byte unchanged).  The
+  existing integration smoke test is intact and still deselected in CI.
+- 262 tests green under the CI selection (259 non-integration baseline + 3 new), with 4
+  integration tests deselected.  The count is reported as the non-integration total
+  because that is what CI runs; the broker file now carries both the deselected
+  integration smoke test and the 3 new hermetic tests.
+
+**Why it matters:**
+- The execution arc has a different enemy than the research arc: in research it was
+  self-deception; here it is an unintended order.  So the first brick deliberately hardens
+  the safety guarantee BEFORE any order path exists.  Read-only inspection found the broker
+  was ALREADY fully implemented and safety-conscious - three independent paper-only guards
+  (the __init__ assert paper is True, from_env hardcoding paper=True, and
+  verify_paper_account raising on a non-paper account), credentials from env vars via
+  load_dotenv, and .gitignore already covering .env/.env.local/.env.live/.env.paper.  The
+  real gap was CI-safe COVERAGE: the sole existing broker test was @pytest.mark.integration
+  (needs live keys + network), so it is deselected in CI and the paper-only guard's
+  REJECTION path had never been tested at all - an integration test runs against a real
+  paper account, which is is_paper True by construction and can only exercise the PASS path.
+  The new live-rejection test (a numeric, non-"PA" account -> verify_paper_account must
+  raise RuntimeError) is the offline proof of the paper-only property, and it now runs on
+  every push.  The guarantee is enforced, not merely asserted.
+
+**Architectural note:**
+- THE MOCK TARGET (the crux): the tests monkeypatch src.brokers.alpaca_broker.TradingClient
+  and ...StockHistoricalDataClient - the names AS IMPORTED INTO the broker's namespace,
+  where the attribute lookup actually happens - NOT alpaca's own module path.  That is why
+  AlpacaBroker.__init__ constructs fakes and makes no network call.  The fake account holds
+  the money fields as STRINGS (buying_power="94321.50" etc.), mirroring the real Alpaca API,
+  so the test genuinely exercises get_account's str->float conversion rather than passing
+  trivially.  monkeypatch.setattr auto-reverts per test so patches never leak.
+- SCOPE - deferred deliberately: NO order submission today, and NO get_positions.  The
+  Broker ABC exposes get_account (balances) only - there is no positions method anywhere.
+  Adding get_positions would mean a new abstract method on base.py + a new PositionSnapshot
+  dataclass + the Alpaca impl; that is its own scoped increment and gets its own commit, not
+  a bolt-on to a test-hardening day.  Today touched only tests/.
+
+**Verification:**
+- uv run pytest -q -m "not integration": 262 passed, 4 deselected (259 baseline unchanged
+  + 3 new).  No network, no credentials.  git diff --numstat tests/test_alpaca_broker.py:
+  160/0 (additions only).  No src/ file in the diff; the integration smoke test present and
+  unchanged at its original lines.
+- The 3 tests: get_account parses a faked paper snapshot (types, str->float, is_paper True);
+  verify_paper_account passes on a "PA" account (returns None); verify_paper_account RAISES
+  RuntimeError on a numeric non-"PA" account (the offline paper-only proof).
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- The order path, built incrementally and each brick tested: (a) get_positions - a new
+  abstract method + PositionSnapshot dataclass + Alpaca impl + hermetic tests (its own
+  commit, touches base.py); (b) a hermetic mocked test of submit_order (mapping OrderRequest
+  -> alpaca request, parsing the response) with NO live submission in CI; (c) later, wiring
+  strategy target positions to orders behind the paper-only guard.  Never let a code path
+  reach a live account by default or by accident.
+- Then the writeup/polish arc: a README presenting the TSMOM and rotation verdicts and the
+  overfitting-tax methodology as the project's distinctive contribution.
+- Housekeeping (non-urgent): backfill the [fill in] time-spent placeholders in the
+  Day 29-39 entries.
+
+**Time spent:** 20 minutes
+
 ## Day 45
 
 **Worked on:**
