@@ -14,9 +14,11 @@ run_rebalance. Because that guard raises RuntimeError on a live account, an
 order can never be reached on a live account -- the structure of the function,
 not a runtime check buried later, is what makes this safe.
 
-Prices are passed in rather than fetched. Wiring broker.get_latest_price into
-the runner is a deliberately deferred increment, which keeps this first version
-fully hermetic (no data-client dependency) and its test offline.
+Prices are FETCHED by the runner via broker.get_latest_price -- only the
+positively-weighted target symbols are priced (a symbol being sold to zero
+needs no price, so it is never fetched). The paper guard remains the first
+statement, before any price fetch, so a live account triggers no market-data
+I/O at all.
 """
 
 # Modern type-hint syntax on the signature without quoting.
@@ -34,7 +36,6 @@ from src.execution.rebalance import reconcile_to_target
 def run_rebalance(
     broker: Broker,                    # any Broker implementation (a paper AlpacaBroker in practice)
     target_weights: dict[str, float],  # symbol -> desired weight fraction (same shape the pure fn takes)
-    prices: dict[str, float],          # symbol -> price, passed in (live fetch is a later increment)
 ) -> list[OrderResult]:
     """
     Reconcile the account to the target allocation and submit the orders.
@@ -43,8 +44,9 @@ def run_rebalance(
     1. Verify the account is paper (raises on a live account) -- FIRST, always.
     2. Read the account for its portfolio_value.
     3. Read current positions and reduce them to a symbol -> shares dict.
-    4. Compute the orders with the pure reconciliation function.
-    5. Submit each order and collect the broker's results.
+    4. Fetch a latest price for each positively-weighted target symbol.
+    5. Compute the orders with the pure reconciliation function.
+    6. Submit each order and collect the broker's results.
 
     Parameters
     ----------
@@ -52,8 +54,6 @@ def run_rebalance(
         The brokerage connection. Must be a paper account or step 1 raises.
     target_weights : dict[str, float]
         Desired weight per symbol (see reconcile_to_target).
-    prices : dict[str, float]
-        Latest price per symbol, supplied by the caller.
 
     Returns
     -------
@@ -80,7 +80,18 @@ def run_rebalance(
     positions = broker.get_positions()
     current_positions = {p.symbol: p.qty for p in positions}
 
-    # 4. PURE step: compute the orders needed to reach the target. No I/O here.
+    # 4. Fetch a latest price ONLY for symbols with a positive target weight.
+    #    A weight-0 or dropped symbol sells to zero and needs no price, so we
+    #    never fetch it -- this makes the minimum number of price calls and
+    #    satisfies reconcile_to_target's "positive weight needs a positive
+    #    price" guard by construction.
+    prices = {
+        sym: broker.get_latest_price(sym)
+        for sym, weight in target_weights.items()
+        if weight > 0
+    }
+
+    # 5. PURE step: compute the orders needed to reach the target. No I/O here.
     order_requests = reconcile_to_target(
         target_weights,
         current_positions,
@@ -88,7 +99,7 @@ def run_rebalance(
         account.portfolio_value,
     )
 
-    # 5. Submit each order in turn, collecting the broker's confirmation for each.
+    # 6. Submit each order in turn, collecting the broker's confirmation for each.
     results = [broker.submit_order(request) for request in order_requests]
 
     # Return the per-order results (empty list if nothing needed changing).

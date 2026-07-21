@@ -156,12 +156,20 @@ class _FakeBroker(Broker):
     call ordering; submitted OrderRequests are recorded in `self.submitted`.
     """
 
-    def __init__(self, *, is_paper: bool, portfolio_value: float, positions: list[PositionSnapshot]):
+    def __init__(
+        self,
+        *,
+        is_paper: bool,
+        portfolio_value: float,
+        positions: list[PositionSnapshot],
+        prices: dict[str, float] | None = None,
+    ):
         self.calls: list[str] = []            # ordered log of method names invoked
         self.submitted: list[OrderRequest] = []  # every OrderRequest passed to submit_order
         self._is_paper = is_paper             # drives the real guard's pass/raise
         self._portfolio_value = portfolio_value
         self._positions = positions
+        self._prices = prices or {}           # symbol -> price the runner will fetch
 
     # --- Methods the runner actually uses ---------------------------------
 
@@ -197,6 +205,11 @@ class _FakeBroker(Broker):
             submitted_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
         )
 
+    def get_latest_price(self, symbol: str) -> float:
+        # Log per-symbol so tests can assert EXACTLY which symbols were priced.
+        self.calls.append(f"get_latest_price:{symbol}")
+        return self._prices[symbol]
+
     # --- Abstract methods the runner never calls (stubbed to satisfy ABC) --
 
     def get_order(self, order_id: str) -> OrderResult:  # pragma: no cover - unused by runner
@@ -211,18 +224,12 @@ class _FakeBroker(Broker):
     def is_market_open(self) -> bool:  # pragma: no cover - unused by runner
         raise NotImplementedError
 
-    def get_latest_price(self, symbol: str) -> float:  # pragma: no cover - unused by runner
-        raise NotImplementedError
-
 
 def test_run_rebalance_paper_places_orders():
     """On a paper account, the runner submits exactly the orders the pure fn computes."""
-    broker = _FakeBroker(is_paper=True, portfolio_value=10000.0, positions=[])
-    results = run_rebalance(
-        broker,
-        target_weights={"SPY": 1.0},
-        prices={"SPY": 100.0},
-    )
+    # Prices now live on the broker: the runner fetches them via get_latest_price.
+    broker = _FakeBroker(is_paper=True, portfolio_value=10000.0, positions=[], prices={"SPY": 100.0})
+    results = run_rebalance(broker, target_weights={"SPY": 1.0})
     # Exactly one order recorded: SPY BUY 100 (10000/100).
     assert len(broker.submitted) == 1
     req = broker.submitted[0]
@@ -234,26 +241,50 @@ def test_run_rebalance_paper_places_orders():
 
 
 def test_run_rebalance_live_raises_before_any_order():
-    """SAFETY PROOF: on a live account the guard raises and NO order is submitted."""
+    """SAFETY PROOF: on a live account the guard raises before any order OR price fetch."""
     # is_paper False -> the real verify_paper_account raises RuntimeError.
-    broker = _FakeBroker(is_paper=False, portfolio_value=10000.0, positions=[])
+    broker = _FakeBroker(is_paper=False, portfolio_value=10000.0, positions=[], prices={"SPY": 100.0})
     with pytest.raises(RuntimeError):
-        run_rebalance(
-            broker,
-            target_weights={"SPY": 1.0},
-            prices={"SPY": 100.0},
-        )
+        run_rebalance(broker, target_weights={"SPY": 1.0})
     # The guard blocked before any submission: zero orders reached the broker.
     assert broker.submitted == []
+    # And before any market-data I/O: get_latest_price was never called.
+    assert not any(c.startswith("get_latest_price") for c in broker.calls)
 
 
 def test_run_rebalance_calls_guard_first():
     """The guard is the runner's first broker interaction (ordering proof)."""
-    broker = _FakeBroker(is_paper=True, portfolio_value=10000.0, positions=[])
-    run_rebalance(
-        broker,
-        target_weights={"SPY": 1.0},
-        prices={"SPY": 100.0},
-    )
+    broker = _FakeBroker(is_paper=True, portfolio_value=10000.0, positions=[], prices={"SPY": 100.0})
+    run_rebalance(broker, target_weights={"SPY": 1.0})
     # verify_paper_account is logged first, before get_account/get_positions/submit_order.
     assert broker.calls[0] == "verify_paper_account"
+
+
+def test_run_rebalance_skips_price_for_sold_symbol():
+    """A symbol being sold to zero is NOT priced: only positive-weight targets are fetched."""
+    # Hold TLT (not in the target) and target SPY only. TLT must sell without a price fetch.
+    held_tlt = PositionSnapshot(
+        symbol="TLT", qty=100, side="long", market_value=5000.0, avg_entry_price=50.0, unrealized_pl=0.0
+    )
+    # Note: NO price supplied for TLT -- if the runner tried to price it, get_latest_price
+    # would KeyError on self._prices["TLT"], which would itself fail the test.
+    broker = _FakeBroker(
+        is_paper=True, portfolio_value=10000.0, positions=[held_tlt], prices={"SPY": 100.0}
+    )
+    run_rebalance(broker, target_weights={"SPY": 1.0})
+    # SPY (positive weight) was priced; TLT (sold to zero) was not.
+    assert "get_latest_price:SPY" in broker.calls
+    assert "get_latest_price:TLT" not in broker.calls
+    # TLT was still sold to zero (100 shares), proving the sale needs no price.
+    tlt_orders = [r for r in broker.submitted if r.symbol == "TLT"]
+    assert len(tlt_orders) == 1
+    assert (tlt_orders[0].side, tlt_orders[0].qty) == (OrderSide.SELL, 100)
+
+
+def test_run_rebalance_prices_only_positive_weights():
+    """An explicit weight-0 target symbol is not priced (filtered by weight > 0)."""
+    # Only SPY has a price; TLT is weight 0.0. Pricing TLT would KeyError -> test failure.
+    broker = _FakeBroker(is_paper=True, portfolio_value=10000.0, positions=[], prices={"SPY": 100.0})
+    run_rebalance(broker, target_weights={"SPY": 1.0, "TLT": 0.0})
+    assert "get_latest_price:SPY" in broker.calls
+    assert "get_latest_price:TLT" not in broker.calls
