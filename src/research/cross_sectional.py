@@ -205,3 +205,59 @@ def trailing_returns_at(
     # Only eligible symbols with finite returns remain; ineligible/warmup symbols
     # are absent, so the ranker's NaN backstop stays defense-in-depth, not primary.
     return result
+
+
+def single_date_weights(
+    bars_by_symbol: dict[str, list[OHLCVBar]],
+    as_of_date: datetime,
+    lookback: int,
+    top_n: int,
+    price_field: str = "close",
+    hold_when_all_negative: bool = False,
+) -> dict[str, float]:
+    """The SINGLE birthplace of rotation target weights for ONE decision date.
+
+    Composes the two existing cross-sectional primitives — trailing_returns_at (the
+    as-of returns-computer) then rank_by_trailing_return (the ranker/selector) — and
+    turns the selected top-N symbols into an equal-weight target: each held symbol
+    gets a FIXED 1/top_n (rule (b)), so h held symbols invest h/top_n and the
+    remaining (top_n - h)/top_n is implicitly cash.  An empty selection (all-cash)
+    returns {}.
+
+    This is the ONE place rotation weights are computed.  Both the backtest path
+    (rotation_backtest, which walks month-ends and calls this per decision date) and
+    the future live-target path consume THIS function, so the two CANNOT diverge on
+    how a decision date's weights are formed — the same reasoning behind sharing
+    month_end_indices and trailing_return_series across the stack.
+
+    It is PURE: no I/O, no printing, no DuckDB, no global state — a deterministic
+    function of its arguments only, exactly like the two primitives it composes.
+
+    Args:
+        bars_by_symbol:         symbol -> that symbol's time-ordered OHLCVBar list.
+        as_of_date:             the decision timestamp; weights are formed as of here
+                                (trailing_returns_at resolves strictly at-or-before it,
+                                so there is no lookahead).
+        lookback:               trailing formation window in month-end observations.
+        top_n:                  how many symbols to hold AND the fixed weight denominator
+                                (each held symbol gets 1/top_n).
+        price_field:            which price field to rank on — "close" or "adj_close".
+        hold_when_all_negative: absolute-filter switch passed through to the ranker.
+
+    Returns:
+        A dict mapping each held symbol to its equal-weight 1/top_n fraction; {} when
+        nothing qualifies (the all-cash target).  Weights need NOT sum to 1.0 — the
+        remainder is cash (see combine_period_returns' cash-remainder rule).
+    """
+    # STEP 1 — as-of trailing returns for every eligible symbol at the decision date.
+    # trailing_returns_at resolves at-or-before as_of_date, so no future bar is read.
+    tr = trailing_returns_at(bars_by_symbol, as_of_date, lookback, price_field)
+
+    # STEP 2 — rank those returns and select the top-N (empty when nothing qualifies).
+    held = rank_by_trailing_return(tr, top_n, hold_when_all_negative)
+
+    # STEP 3 — equal-weight 1/top_n over the held names (rule (b)); {} stays all-cash.
+    weights = {symbol: 1.0 / top_n for symbol in held}
+
+    # The single per-date target weight vector, shared by backtest and live paths.
+    return weights

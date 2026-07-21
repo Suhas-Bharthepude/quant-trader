@@ -782,3 +782,64 @@ def test_rotation_negative_cost_rate_raises():
         rotation_backtest(
             bars_by_symbol, reference_symbol="A", lookback=1, top_n=1, cost_rate=-0.001
         )
+
+
+# ---------------------------------------------------------------------------
+# Golden-master equivalence: pins the CURRENT rotation_backtest output byte-for-byte.
+# ---------------------------------------------------------------------------
+
+
+def test_rotation_backtest_goldenmaster_equivalence():
+    # GOLDEN MASTER capturing PRE-refactor rotation_backtest output; if this fails after the Day 55 seam extraction, the refactor changed behavior and must be fixed - never edit the expected array to match.
+    # Eight month-end dates (Jan-Aug 2024), all midnight UTC, one bar per month-end so
+    # each holding period is exactly one bar (trivially deterministic).
+    DATES = [
+        datetime(2024, 1, 31, tzinfo=timezone.utc),  # month-end 0 (warm-up start)
+        datetime(2024, 2, 29, tzinfo=timezone.utc),  # month-end 1
+        datetime(2024, 3, 31, tzinfo=timezone.utc),  # month-end 2
+        datetime(2024, 4, 30, tzinfo=timezone.utc),  # month-end 3 (first non-warmup rank at lookback=3)
+        datetime(2024, 5, 31, tzinfo=timezone.utc),  # month-end 4
+        datetime(2024, 6, 30, tzinfo=timezone.utc),  # month-end 5
+        datetime(2024, 7, 31, tzinfo=timezone.utc),  # month-end 6
+        datetime(2024, 8, 31, tzinfo=timezone.utc),  # month-end 7 (closing boundary)
+    ]
+    # Per-symbol close paths; each value becomes open=high=low=close=adj_close for that bar.
+    # Four distinct, crossing paths so the top-2 selection actually differentiates.
+    CLOSES = {
+        "A": [100.0, 105.0, 110.0, 116.0, 123.0, 130.0, 138.0, 146.0],  # steady riser (reference spine)
+        "B": [100.0, 120.0, 140.0, 130.0, 125.0, 150.0, 160.0, 155.0],  # fast then dip
+        "C": [100.0, 98.0, 102.0, 108.0, 130.0, 140.0, 135.0, 170.0],   # slow start, big finish
+        "D": [100.0, 110.0, 95.0, 90.0, 115.0, 105.0, 125.0, 140.0],    # volatile
+    }
+    # Build the multi-symbol bar dict via the module-level helper (no second copy defined).
+    bars_by_symbol = {
+        sym: make_month_end_bars(DATES, closes, sym) for sym, closes in CLOSES.items()
+    }
+    # Run rotation_backtest with the exact pinned params the golden array was captured under.
+    result = rotation_backtest(
+        bars_by_symbol,           # the deterministic 4-symbol / 8-month-end fixture
+        reference_symbol="A",     # "A" is the long-history spine defining the month-end schedule
+        lookback=3,               # 3-month-end trailing formation window
+        top_n=2,                  # hold the top 2 ranked symbols (fixed 1/top_n weight each)
+        price_field="close",      # rank and return on the close field
+        hold_when_all_negative=False,  # apply the absolute (>0) filter -> cash when nothing qualifies
+    )
+    # The captured PRE-refactor output: first three periods are warm-up cash (0.0), then the
+    # four real top-2 holding-period log returns. DO NOT recompute or "fix" these numbers.
+    expected = np.array(
+        [
+            0.0,                    # P0 (Jan->Feb): as-of Jan warm-up -> cash
+            0.0,                    # P1 (Feb->Mar): as-of Feb warm-up -> cash
+            0.0,                    # P2 (Mar->Apr): as-of Mar warm-up -> cash
+            0.009686725556385771,  # P3 (Apr->May): first non-warmup top-2 period
+            0.06472903361844337,   # P4 (May->Jun)
+            0.011675795265373722,  # P5 (Jun->Jul)
+            0.1719261719594178,    # P6 (Jul->Aug)
+        ]
+    )
+    # Exact-value equivalence: zero relative tolerance, 1e-12 absolute floor for float noise.
+    np.testing.assert_allclose(result, expected, rtol=0, atol=1e-12)
+    # Structural fingerprint: 8 month-ends -> 7 adjacent-pair holding periods.
+    assert result.shape == (7,)
+    # Structural fingerprint: the stitched stream is float64, matching the engine's convention.
+    assert result.dtype == np.float64

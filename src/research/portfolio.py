@@ -52,7 +52,11 @@ from src.strategies.time_series_momentum import month_end_indices
 # returns, then rank+select.  This portfolio->cross_sectional->time_series_momentum import
 # is the SAME research->strategies direction cross_sectional.py and optuna_fit.py already
 # use, so there is no circular-import risk (nothing in those modules imports portfolio.py).
-from src.research.cross_sectional import trailing_returns_at, rank_by_trailing_return
+from src.research.cross_sectional import (
+    trailing_returns_at,
+    rank_by_trailing_return,
+    single_date_weights,
+)
 
 
 def combine_period_returns(
@@ -407,7 +411,15 @@ def rotation_backtest(
         # NOTE: switching to rule (a) later is a ONE-LINE change to {s: 1.0/len(held) ...}
         # (guarding len(held) > 0), NOT a rewrite — combine_period_returns already handles
         # any weights summing to <= 1.
-        weights = {symbol: 1.0 / top_n for symbol in held}
+        # Weights come from the SINGLE shared birthplace, passing the DECISION date d_k
+        # (never d_next / the holding-period end).  single_date_weights re-runs the same
+        # trailing_returns_at + rank_by_trailing_return + equal-weight 1/top_n composition
+        # internally, so the backtest and the live-target path cannot diverge on weight
+        # formation.  `held` above is retained for STEP 3 (the per-symbol return-array loop);
+        # only the weight literal moves here, so rotation_backtest holds NO weight arithmetic.
+        weights = single_date_weights(
+            bars_by_symbol, d_k, lookback, top_n, price_field, hold_when_all_negative
+        )
 
         # STEP 4b — TURNOVER at this rebalance = the L1 WEIGHT change over the RISKY symbols
         # only, CASH EXCLUDED.  For every symbol appearing in EITHER period's weights, add the
