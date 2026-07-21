@@ -86,8 +86,6 @@ Running log of development work. Most recent entry first.
 - Housekeeping (non-urgent): backfill the [fill in] time-spent placeholders in the
   Day 29-39 entries.
 
-**Time spent:** 1 hour
-
 ## Day 48
 
 **Worked on:**
@@ -166,8 +164,6 @@ Running log of development work. Most recent entry first.
   overfitting-tax methodology as the project's distinctive contribution.
 - Housekeeping (non-urgent): backfill the [fill in] time-spent placeholders in the
   Day 29-39 entries.
-
-**Time spent:** 20 minutes
 
 ## Day 47
 
@@ -249,8 +245,6 @@ Running log of development work. Most recent entry first.
 - Housekeeping (non-urgent): backfill the [fill in] time-spent placeholders in the
   Day 29-39 entries.
 
-**Time spent:** 20 minutes
-
 ## Day 46
 
 **Worked on:**
@@ -323,8 +317,6 @@ Running log of development work. Most recent entry first.
 - Housekeeping (non-urgent): backfill the [fill in] time-spent placeholders in the
   Day 29-39 entries.
 
-**Time spent:** 20 minutes
-
 ## Day 45
 
 **Worked on:**
@@ -391,8 +383,6 @@ Running log of development work. Most recent entry first.
   and the overfitting-tax methodology as the project's distinctive contribution.
 - Housekeeping (non-urgent): backfill the [fill in] time-spent placeholders in the
   Day 29-39 entries.
-
-**Time spent:** 20 minutes
 
 ## Day 44
 
@@ -501,8 +491,6 @@ Running log of development work. Most recent entry first.
 - Then: the execution/autonomy arc (wire AlpacaBroker) = v1 base bot; writeup/polish arc.
 - Housekeeping (non-urgent): backfill the [fill in] time-spent placeholders in the
   Day 29-39 entries.
-
-**Time spent:** 20 minutes
 
 ## Day 43
 
@@ -629,8 +617,6 @@ Running log of development work. Most recent entry first.
 - Housekeeping (non-urgent): backfill the [fill in] time-spent placeholders in the
   Day 29-39 entries.
 
-**Time spent:** 30 minutes
-
 ## Day 42
 
 **Worked on:**
@@ -726,8 +712,6 @@ Running log of development work. Most recent entry first.
 - Housekeeping (non-urgent): backfill the [fill in] time-spent placeholders in the
   Day 29-39 entries.
 
-**Time spent:** 20 minutes
-
 ## Day 41
 
 **Worked on:**
@@ -818,8 +802,6 @@ Running log of development work. Most recent entry first.
   equal-weight-basket buy-and-hold = the Arc C payoff.
 - Housekeeping (non-urgent): backfill the [fill in] time-spent placeholders in the
   Day 29-39 entries.
-
-**Time spent:** 20 minutes
 
 ## Day 40
 
@@ -932,8 +914,6 @@ Running log of development work. Most recent entry first.
 - Housekeeping (non-urgent): backfill the [fill in] time-spent placeholders in the
   Day 29-39 entries.
 
-**Time spent:** 20 minutes
-
 ## Day 39
 
 **Worked on:**
@@ -1041,8 +1021,6 @@ Running log of development work. Most recent entry first.
 - Housekeeping (non-urgent): commit README.md separately; backfill the [fill in]
   time-spent placeholders in the Day 29-38 entries.
 
-**Time spent:** 10 minutes
-
 ## Day 38
 
 **Worked on:**
@@ -1127,8 +1105,6 @@ Running log of development work. Most recent entry first.
   Sharpe/Sortino, drawdown, after costs) vs an equal-weight-basket buy-and-hold.
 - Housekeeping (non-urgent): commit README.md separately; backfill the [fill in]
   time-spent placeholders in the Day 29-37 entries.
-
-**Time spent:** 20 minutes
 
 ## Day 37
 
@@ -1218,8 +1194,6 @@ Running log of development work. Most recent entry first.
 - Housekeeping (non-urgent): commit README.md separately; backfill the [fill in]
   time-spent placeholders in the Day 29-36 entries.
 
-**Time spent:** 10 minutes
-
 ## Day 36
 
 **Worked on:**
@@ -1297,8 +1271,6 @@ Running log of development work. Most recent entry first.
   drawdown, after costs) vs an equal-weight-basket buy-and-hold.
 - Housekeeping (non-urgent): commit README.md separately; backfill the [fill in]
   time-spent placeholders in the Day 29-32 entries.
-
-**Time spent:** 30 minutes
 
 ## Day 35
 
@@ -1378,8 +1350,6 @@ Running log of development work. Most recent entry first.
   backtester, a real architectural step up and likely a multi-day effort.
 - Housekeeping (non-urgent): commit README.md separately; backfill the [fill in]
   time-spent placeholders in the Day 29-32 entries.
-
-**Time spent:** 1 hour
 
 ## Day 34
 
@@ -1477,8 +1447,6 @@ Running log of development work. Most recent entry first.
 - Housekeeping (non-urgent): commit README.md separately; backfill the [fill in]
   time-spent placeholders in recent DEV_LOG entries.
 
-**Time spent:** 30 mins
-
 ## Day 33
 
 **Worked on:**
@@ -1575,8 +1543,6 @@ Running log of development work. Most recent entry first.
   MaxDD only today); cross-sectional sector / cross-asset rotation (needs a
   portfolio-level backtester).
 
-**Time spent:** 1 hour
-
 ## Day 32
 
 **Worked on:**
@@ -1668,8 +1634,6 @@ Running log of development work. Most recent entry first.
   MaxDD only today); cross-sectional sector / cross-asset rotation (needs a
   portfolio-level backtester).
 
-**Time spent:** [fill in]
-
 ## Day 31
 
 **Worked on:**
@@ -1752,8 +1716,6 @@ Running log of development work. Most recent entry first.
   downside, not just Sharpe.
 - SMA crossover price_field for a consistent basis across strategies.
 
-**Time spent:** [fill in]
-
 ## Day 30
 
 **Worked on:**
@@ -1831,8 +1793,6 @@ Running log of development work. Most recent entry first.
   lookback, judged on drawdown and downside, not just Sharpe.
 - SMA crossover price_field for a consistent basis across strategies.
 
-**Time spent:** [fill in]
-
 ## Day 29
 
 **Worked on:**
@@ -1895,8 +1855,6 @@ Running log of development work. Most recent entry first.
   tax + buy-and-hold), folds sized against the 12-month lookback, judged on
   drawdown and downside, not just Sharpe.
 
-**Time spent:** [fill in]
-
 ## Day 28 — 2026-06-23
 
 ## Day 28
@@ -1956,8 +1914,6 @@ Running log of development work. Most recent entry first.
   walk-forward + Optuna + overfitting-tax + B&H run, folds sized against the
   12-month lookback.
 
-**Time spent:** 1 hour
-
 ## Day 27 — 2026-06-22
 
 **Worked on:** Added CI via GitHub Actions (.github/workflows/ci.yml) — runs `uv run pytest -q -m "not integration"` on every push and PR to main in a clean Ubuntu environment, excluding the 4 live-API/network integration tests (152 hermetic tests run in CI). Added a project CLAUDE.md encoding the engineering conventions (Strategy contract, verify-on-disk discipline, two-commit git flow, untracked-docs rule, scope limits).
@@ -1969,8 +1925,6 @@ Running log of development work. Most recent entry first.
 **Blocked on:** None.
 
 **Next up:** Wire TimeSeriesMomentumStrategy into the walk-forward / Optuna / overfitting-tax / buy-and-hold harness; add a transaction-cost model before any verdict.
-
-**Time spent:** 1.5 hours
 
 
 ## Day 26 — 2026-06-21
@@ -1997,8 +1951,6 @@ Running log of development work. Most recent entry first.
 
 **Next up:** Before any TSMOM-vs-B&H verdict, make the comparison honest: (1) total-return accounting — switch the signal AND the engine to adj_close together, never just one; (2) credit cash yield on flat periods (currently 0); (3) the transaction-cost model. Raw-close plus zero-cash currently flatters TSMOM vs an always-invested B&H. Then run TSMOM through walk-forward + Optuna + overfitting-tax + B&H, sizing folds against the 12-month lookback (a test fold needs multiple years to clear the 12-month warmup with usable post-warmup signal). Cross-sectional rotation stays a separate later phase (it breaks the per-symbol contract).
 
-**Time spent:** 1 hour
-
 ---
 
 ## Day 25 — 2026-06-19
@@ -2012,8 +1964,6 @@ Running log of development work. Most recent entry first.
 **Blocked on:** None.
 
 **Next up:** The SMA crossover is now conclusively edgeless on this basket — both as a fixed rule and tuned per fold — and the pipeline has proven it can identify a no-edge strategy as no-edge while quantifying the overfitting tax. The methodology vehicle has done its job. The next phase is to test a strategy with an actual economic alpha hypothesis (not a moving-average rule with no reason to work), running it through the same seam + walk-forward + tax harness, which now exists and is validated.
-
-**Time spent:** ~3 hours
 
 ---
 
@@ -2029,8 +1979,6 @@ Running log of development work. Most recent entry first.
 
 **Next up:** Step 3 — wire make_sma_optuna_fit_fn into compare_walkforward (or a sibling script), run across all 17 etf_basket symbols, and pair record[i] (warm-only in-sample Sharpe) with per_fold[i] (realized OOS Sharpe) to print the overfitting tax alongside the fixed-baseline OOS and the buy-and-hold line. Honest expectation: fitted OOS lands back near the fixed-SMA baseline and stays under buy-and-hold — the clean non-result that proves tuning a no-edge signal does not manufacture OOS edge.
 
-**Time spent:** ~3 hours
-
 ---
 
 ## Day 23 — 2026-06-17
@@ -2044,8 +1992,6 @@ Running log of development work. Most recent entry first.
 **Blocked on:** None.
 
 **Next up:** Day 24 — the fit_fn seam integration that Day 22 earmarked for Day 23, pushed one slot by this content-validation work. Replace `fold_strategy = strategy` with `fold_strategy = fit_fn(train_bars)` running an Optuna sweep per train window, evaluated across the now content-validated etf_basket OOS sample to measure the overfitting tax against the fixed-strategy baseline.
-
-**Time spent:** ~2 hours
 
 ---
 
@@ -2061,8 +2007,6 @@ Running log of development work. Most recent entry first.
 
 **Next up:** The originally-forecast fit_fn seam integration (now Day 23) — replace `fold_strategy = strategy` with `fold_strategy = fit_fn(train_bars)` running an Optuna sweep per train window, now evaluated across the deeper, broader etf_basket OOS sample to measure the overfitting tax against the fixed-strategy baseline.
 
-**Time spent:** ~2 hours
-
 ---
 
 ## Day 21 — 2026-06-08
@@ -2076,8 +2020,6 @@ Running log of development work. Most recent entry first.
 **Blocked on:** None.
 
 **Next up:** Day 22 — fit_fn seam integration: replace fold_strategy = strategy with fold_strategy = fit_fn(train_bars) where fit_fn runs an Optuna sweep over the train window and returns an optimized SMACrossoverStrategy. First genuine out-of-sample test: fit on train, evaluate on test, aggregate OOS Sharpe across folds, compare to today's fixed-strategy baseline to measure the overfitting tax.
-
-**Time spent:** ~3 hours
 
 ---
 
@@ -2093,8 +2035,6 @@ Running log of development work. Most recent entry first.
 
 **Next up:** The walk-forward validator — run a strategy (or the full parameter grid) through each fold via BacktestRunner, training/selecting on the train window and recording performance only on the test window, then aggregate out-of-sample metrics across folds. It reuses the splitter built today plus the existing runner and cli_common.load_bars_for_symbols, so it is orchestration over proven parts rather than new plumbing.
 
-**Time spent:** 45 minutes
-
 ---
 
 ## Day 19 — 2026-06-04
@@ -2108,8 +2048,6 @@ Running log of development work. Most recent entry first.
 **Blocked on:** None.
 
 **Next up:** The walk-forward validator. The runner's stateless design plus the now-extracted load_bars_for_symbols helper mean the validator can slice each symbol's bars into train/test windows and call the existing runner methods inside a sliding-window loop, with no re-plumbing of data loading. This is the overfitting defense the Day 16-18 findings made concrete.
-
-**Time spent:** 45 minutes
 
 ---
 
@@ -2125,8 +2063,6 @@ Running log of development work. Most recent entry first.
 
 **Next up:** Phase 2 begins — parameter optimization and walk-forward validation. The matrix is the data structure Optuna-driven sweeps will populate (hundreds of parameter combinations × symbols), and walk-forward validation will defend against the overfitting this week's findings made concrete. First Phase 2 task: extract the shared load-and-run helper now that three CLIs justify it, then build the walk-forward splitter on top of the runner.
 
-**Time spent:** - 30mins
-
 ---
 
 ## Day 17 — 2026-05-26
@@ -2140,8 +2076,6 @@ Running log of development work. Most recent entry first.
 **Blocked on:** None. Tooling friction during the day (VS Code save behavior corrupted the test file mid-edit, requiring a git checkout and a clean re-paste of the Claude Code generated tests) cost time but did not affect the final artifact.
 
 **Next up:** Day 18 — strategy × symbol cross-product matrix (run_matrix on BacktestRunner, compare_matrix.py CLI). Same primitives, one more layer of orchestration. This is the building block Phase 2's Optuna parameter optimization will feed on.
-
-**Time spent:** - 1 hour
 
 ---
 
@@ -2159,8 +2093,6 @@ Running log of development work. Most recent entry first.
 
 **Next up:** Day 17 — multi-symbol comparison. Same runner, but the dimension being compared shifts from "one symbol × many strategies" to "many symbols × one strategy." This is the first step toward portfolio-level analysis where you'll see which sectors/stocks the strategy actually works on.
 
-**Time spent:** — 20 minutes
-
 ---
 
 
@@ -2173,8 +2105,6 @@ Running log of development work. Most recent entry first.
 **Blocked on / Bugs:** One sharp edge caught and fixed during testing: numpy's std(ddof=1) is undefined for samples of size <= 1 and produces NaN, which the original `if std_return == 0.0` guard didn't catch. This surfaced as 8 RuntimeWarnings when running the 2-bar unit tests. Fixed by short-circuiting on len(active_returns) < 2 before computing std. Lesson: sample-size guards belong before the math, not after.
 
 **Next up:** Day 16 — strategy comparison and reporting. Build a small CLI that runs multiple strategies (or one strategy across multiple parameter combos) and produces a comparison table. Foundation for the parameter optimization work in Phase 2.
-
-**Time spent:** —
 
 ---
 
@@ -2189,8 +2119,6 @@ Running log of development work. Most recent entry first.
 
 **Next up:** Day 15 — first backtester. Build src/backtest/ that takes (bars, signals) and simulates what the strategy would have earned over the historical period. Compute realistic metrics: total return, Sharpe ratio, max drawdown, win rate. This is where strategies prove (or disprove) edge.
 
-**Time spent:** — 30 minutes
-
 ---
 
 
@@ -2203,8 +2131,6 @@ Running log of development work. Most recent entry first.
 **Blocked on / Bugs:** One subtle issue caught and fixed during development. The first RSI implementation used pandas.ewm(alpha=1/period, adjust=False), which runs the Wilder recursion from the first observation rather than seeding with a simple mean of the first `period` deltas. The two methods converge after ~3× period bars but diverge noticeably on the very first emitted RSI values — meaning values would not match TradingView, ta-lib, Bloomberg, or StockCharts on short series. Replaced with explicit two-phase implementation: simple arithmetic mean of first `period` gain/loss values at index `period`, then Wilder recursion for all subsequent indices. Verified against canonical Wilder reference series — agreement within 0.006 of published values [70.46, 66.25, 66.48, 69.35, 66.30, 57.92]. Test suite expanded from 8 to 18 tests.
 
 **Next up:** Day 14 — first signal generation. Build src/strategies/ with a crossover strategy (e.g. SMA(50) vs SMA(200)) that takes bars, runs indicators, and emits buy/sell/hold signals as a numpy array aligned to the input bars.
-
-**Time spent:** — 1 hour
 
 ---
 
@@ -2221,8 +2147,6 @@ Running log of development work. Most recent entry first.
 
 **Next up:** Day 13 — first technical indicators (SMA, RSI, returns). Build src/features/ with vectorized pandas/numpy implementations operating on lists of OHLCVBar.
 
-**Time spent:** — 1 hour
-
 ---
 
 
@@ -2236,8 +2160,6 @@ Running log of development work. Most recent entry first.
 
 **Next up:** Day 12 — daily incremental update script (only fetch the latest N days, not full history), gap detection (find missing dates per symbol), and a "data health" diagnostic script.
 
-**Time spent:** —
-
 ---
 
 
@@ -2246,7 +2168,6 @@ Running log of development work. Most recent entry first.
 **Why it matters:** Before this, the bot had no memory of what prices did in the past. This day gave it a database — a local file that stores the open, high, low, close, and volume for any stock, for any day. Think of it as building the library the bot will read before making any decision. The design is also "safe to re-run": if the daily download job runs twice by accident, it won't create duplicate entries or corrupt the numbers.
 **Blocked on / Bugs:** None.
 **Next up:** Day 11 — extend fetcher to support batch fetching across the S&P 500, add a "universe" config file listing tickers, build a backfill script that ingests N years of history for the full universe.
-**Time spent:** —
 
 ---
 
@@ -2255,7 +2176,6 @@ Running log of development work. Most recent entry first.
 **Why it matters:** This confirmed that none of the trading scripts need to know they're using Alpaca anymore — they just say "place this order" and the broker layer handles the rest. That means if we ever want to switch to a different broker, only one file changes and every strategy works without modification. It also means we can plug in a fake "paper broker" for testing strategies without any internet connection at all.
 **Blocked on / Bugs:** None.
 **Next up:** Day 10 — start Phase 1 of the roadmap. Build `src/data/` layer: yfinance + Alpaca historical data fetcher, DuckDB schema, basic OHLCV storage and retrieval.
-**Time spent:** — 1 hour
 
 ---
 
@@ -2264,7 +2184,6 @@ Running log of development work. Most recent entry first.
 **Why it matters:** This is the foundation that everything else builds on. The bot now speaks a common language for placing orders — it says "buy 10 shares of SPY" and doesn't care how that gets executed. Alpaca is just one possible answer. This makes the bot portable: swap in a different broker, a simulator, or a backtester, and the strategies don't change at all. Without this layer, every strategy would be glued to Alpaca's specific code and impossible to test offline.
 **Blocked on / Bugs:** None.
 **Next up:** Day 9 — refactor `first_order.py`, `limit_order.py`, `cancel_order.py`, and `order_history.py` to use `AlpacaBroker`.
-**Time spent:** — 30 mins
 
 ---
 
@@ -2273,7 +2192,6 @@ Running log of development work. Most recent entry first.
 **Why it matters:** Market orders just buy at whatever price is available — limit orders let the bot say "only buy if the price drops to X." That's essential for any real strategy. This day also added the ability to cancel an order that hasn't filled yet, and to look up a full history of what the bot has done. Without that history, there's no way to know if a trade actually went through or why it didn't.
 **Blocked on / Bugs:** None.
 **Next up:** Day 8 — design the broker abstraction layer in `src/brokers/`. Refactor shared credential loading and paper-account safety check out of scripts into a reusable module.
-**Time spent:** — 30 mins
 
 ---
 
@@ -2282,7 +2200,6 @@ Running log of development work. Most recent entry first.
 **Why it matters:** This was the first proof that the bot can actually do the one thing it exists to do — place a trade. Everything before this was setup; this was the moment it became real. The multiple safety checks (paper-mode lock, account verification, typing "yes" twice) are deliberate: one mistaken click in a live trading system can cost real money instantly, so the guards have to be there from the very first order.
 **Blocked on / Bugs:** API key accidentally visible in a dashboard screenshot — immediately regenerated keys and updated `.env`.
 **Next up:** Day 7 — limit orders, order cancellation, querying order history.
-**Time spent:** — 1 hour
 
 ---
 
@@ -2291,5 +2208,4 @@ Running log of development work. Most recent entry first.
 **Why it matters:** Getting the foundation right means not having to redo it later. Keeping API keys out of the code means they can never accidentally end up on GitHub. Separating strategy code from scripts and data means the project stays navigable as it grows. These decisions feel invisible when they're done right — and extremely painful to fix after the fact when they're skipped.
 **Blocked on / Bugs:** None.
 **Next up:** First commit. Begin Phase 1 — data ingestion layer (Alpaca bar fetch, DuckDB schema, yfinance backfill).
-**Time spent:** — 30 minutes
 
