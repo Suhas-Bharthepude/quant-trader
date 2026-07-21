@@ -4,6 +4,70 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 51
+
+**Worked on:**
+- Added scripts/rebalance_smoke.py (commit "Add live-paper rebalance smoke script"): a
+  standalone, manual live-paper smoke check (a minimal end-to-end run confirming the
+  wired-together system works, versus a hermetic unit test).  It builds
+  AlpacaBroker.from_env(), calls verify_paper_account() explicitly, prints the account
+  snapshot and current positions, then either DRY-RUNs (default: computes and prints orders
+  via reconcile_to_target, submits nothing) or, with --submit, calls the real run_rebalance
+  and prints each OrderResult.  Target is a hardcoded tiny {"SPY": 0.01}.  It is a tracked
+  script in scripts/ (matching the existing paper-hitting scripts hello_alpaca.py /
+  first_order.py); it is NOT a pytest test, so tests/ stays hermetic and CI is untouched.  No
+  src/ change, no test change.
+- Ran it live against the real Alpaca PAPER account.  Dry run and --submit agreed: paper
+  account confirmed (PA3XE1TLPR93, is_paper True, portfolio value ~$100,067); observed an
+  existing 2-share SPY position; target 1% of ~$100,067 at SPY ~$741.85 sized to 1 target
+  share; delta from held 2 to target 1 produced a SELL 1 SPY market/day order.  --submit
+  placed it: order accepted by Alpaca (order id recorded), confirmed in the dashboard.
+
+**Why it matters:**
+- This is the first time the assembled loop touched the real API.  Everything through Day 50
+  was hermetically tested against fakes; this run proves the SAME run_rebalance /
+  reconcile_to_target, unchanged, works end-to-end against real Alpaca paper: it observed
+  real account value and real positions, fetched a real price, computed the correct order,
+  and placed it.  The floor sizing, delta filter, guard-first ordering, and minimal price
+  fetch all behaved in the wild exactly as the unit tests said.  "I think it works" is now "I
+  watched it work."
+- The success criterion was MECHANICAL, not profit: the order placed matched what
+  reconcile_to_target computed (SELL 1 SPY), and it appeared in the dashboard.  By the honest
+  research verdicts this strategy has no durable edge; a correct bot faithfully executing an
+  edgeless target is the point, not a P&L claim.
+
+**Architectural note:**
+- DRY-RUN-BY-DEFAULT: the script submits nothing unless --submit is passed.  The dry-run
+  reproduces the runner's read path (build current_positions, fetch prices for positive-weight
+  targets, call reconcile_to_target) and prints the computed orders, so the exact orders can
+  be eyeballed BEFORE any real order exists.  First contact with the API placed zero orders
+  until the computation was verified.
+- The run happened to exercise the SELL/trim path (held 2 SPY, target 1 -> sell 1), not the
+  open-from-flat path, because the paper account carried a pre-existing 2-share SPY position
+  from earlier scripts.  Both paths are unit-tested; the live run confirmed the trim path
+  specifically.
+- The three paper guards held in the wild: from_env hardcodes paper=True, __init__ asserts
+  it, and verify_paper_account confirmed the PA-prefixed account before any read or order.
+
+**Verification:**
+- Dry run: printed PAPER ACCOUNT CONFIRMED, account fields, SPY price ~$741.85, and one
+  computed order (SELL 1 SPY market day), submitting nothing.
+- --submit: same reads, then run_rebalance placed the order; Alpaca returned status
+  "accepted" with an order id; confirmed present in the Alpaca paper dashboard.
+- No committed code or tests changed by the RUN itself; the only tracked change is the new
+  scripts/rebalance_smoke.py.  Full non-integration suite unaffected (282 with integration,
+  278 non-integration), since nothing in src/ or tests/ changed.
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- Sells-before-buys ordering in reconcile_to_target (so a rotation's funding SELLs execute
+  before the BUYs they fund) - the last deferred execution limitation.
+- The writeup/polish arc: a README presenting the TSMOM and rotation verdicts and the
+  overfitting-tax methodology as the project's distinctive contribution.  This is the
+  highest-leverage remaining work for the portfolio goal.
+
 ## Day 50
 
 **Worked on:**
