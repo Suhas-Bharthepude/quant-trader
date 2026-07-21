@@ -4,6 +4,70 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 50
+
+**Worked on:**
+- Changed run_rebalance to fetch its own prices (commit "Fetch prices inside run_rebalance
+  via get_latest_price"): the signature dropped the prices parameter and is now
+  run_rebalance(broker, target_weights) -> list[OrderResult].  The runner builds the prices
+  dict internally by calling broker.get_latest_price only for positively-weighted target
+  symbols.  The pure reconcile_to_target is UNCHANGED (still takes prices as its 3rd arg);
+  only WHO builds that dict moved from caller to runner. [+2 tests]
+- Updated tests/test_rebalance.py: _FakeBroker gained a prices dict and a real
+  get_latest_price (was a NotImplementedError stub) that logs f"get_latest_price:{symbol}"
+  per call; the three existing runner tests drop the prices= kwarg.  Two new tests added.
+  test_rebalance.py went 10 -> 12 tests; full non-integration 276 -> 278, all green, 4
+  integration deselected.  Scope: only runner.py + test_rebalance.py; rebalance.py untouched.
+
+**Why it matters:**
+- This makes run_rebalance(broker, target_weights) the COMPLETE production entry point: it
+  observes (get_account, get_positions), prices (get_latest_price), computes
+  (reconcile_to_target), and acts (submit_order) - all behind the paper guard, with no
+  caller-supplied prices.  That is exactly what makes the upcoming manual live-paper smoke
+  check meaningful: it will run THIS function against the real paper account, not a
+  stripped-down variant that needs prices hand-fed.
+
+**Architectural note:**
+- STRENGTHENED SAFETY PROPERTY: the guard now precedes ALL I/O, market data included.
+  verify_paper_account() remains the first statement, before any get_latest_price call, so a
+  live account triggers no market-data fetch AND no order.
+  test_run_rebalance_live_raises_before_any_order now asserts BOTH broker.submitted == [] AND
+  that get_latest_price was never called (no c.startswith("get_latest_price") in the call
+  log) - proving the guard blocks before any network activity, not just before submission.
+- MINIMAL FETCH: only positively-weighted targets are priced - {sym: broker.get_latest_price
+  (sym) for sym, weight in target_weights.items() if weight > 0}.  A symbol being sold to
+  zero (dropped from the target, or weight 0) needs no price, so it is never fetched.  This
+  makes the minimum number of price calls and satisfies reconcile_to_target's "positive
+  weight requires a positive price" guard by construction.  Two tests pin it:
+  test_run_rebalance_skips_price_for_sold_symbol (a dropped holding is sold without being
+  priced) and test_run_rebalance_prices_only_positive_weights (an explicit weight-0 symbol is
+  not priced - and would KeyError if the runner tried, a built-in failure signal).
+- The _FakeBroker's get_latest_price moved from the "abstract methods the runner never calls"
+  block into the used-methods section, since the runner now calls it - keeping the class
+  comment honest.
+
+**Verification:**
+- uv run pytest -q -m "not integration": 278 passed, 4 deselected (276 baseline + 2 new).  No
+  network, no credentials.  Only src/execution/runner.py and tests/test_rebalance.py
+  modified; rebalance.py untouched.
+- The 12 tests in test_rebalance.py: 7 pure-fn (unchanged), 5 runner - paper places orders,
+  live raises before any order (now also asserts no price fetch), guard called first, sold
+  symbol not priced, only positive weights priced.
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- A manual live-paper smoke check: run run_rebalance against the real Alpaca paper account (a
+  standalone local script, NOT a committed test) to confirm the assembled loop works
+  end-to-end and orders appear in the Alpaca dashboard.  This is the first time the runner
+  touches the real API - everything so far is hermetically tested but the assembled machine
+  has never run live.
+- Sells-before-buys ordering in the pure fn (so a rotation's funding SELLs execute before the
+  BUYs they fund).
+- Then the writeup/polish arc: a README presenting the TSMOM and rotation verdicts and the
+  overfitting-tax methodology as the project's distinctive contribution.
+
 ## Day 49
 
 **Worked on:**
