@@ -4,6 +4,71 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 55
+
+**Worked on:**
+- Factored the single-date rotation weight logic out of rotation_backtest into
+  single_date_weights(bars_by_symbol, as_of_date, lookback, top_n, price_field,
+  hold_when_all_negative) -> dict[str,float] in cross_sectional.py (commit "Factor
+  single_date_weights seam out of rotation_backtest (behavior-preserving)").  It composes the
+  existing trailing_returns_at + rank_by_trailing_return primitives and applies the
+  equal-weight 1/top_n rule (rule b); rotation_backtest now calls it at the decision date d_k
+  and holds NO weight arithmetic.  The tr/held locals are retained in the loop because held
+  still feeds STEP 3 (the per-symbol return-array loop at line 362); only the weight-birth
+  line moved into the shared function. [+1 test]
+- Added test_rotation_backtest_goldenmaster_equivalence: a golden-master array captured from
+  the pre-refactor code on a fixed 4-symbol / 8-month-end synthetic fixture (lookback=3,
+  top_n=2), asserted equal post-refactor via np.testing.assert_allclose(rtol=0, atol=1e-12)
+  plus shape/dtype fingerprints.  280 non-integration green (was 279).
+
+**Why it matters:**
+- This is the shared seam guaranteeing the future live-target path and the validated backtest
+  compute target weights with byte-identical logic - they call ONE function, so the strategy
+  cannot silently drift between research and live.  Proven behavior-preserving: the 1/top_n
+  literal now exists in exactly ONE place (verified by grep - one hit in cross_sectional.py,
+  zero in portfolio.py) and rotation_backtest's output is bit-for-bit unchanged on the golden
+  fixture.
+
+**Architectural note:**
+- Pure extraction only - rotation_backtest's returned array is identical for all inputs;
+  single_date_weights does zero I/O.  Placed in cross_sectional.py alongside the two
+  primitives it composes, keeping portfolio.py as the backtest driver.  No behavior, no new
+  strategy, no month-end / live code today.  Diff touched exactly three files
+  (cross_sectional.py, portfolio.py, test_portfolio.py).
+- DESIGNATED LIVE CONFIG (recorded, not yet consumed by code): lookback=3, top_n=1,
+  price_field="close", hold_when_all_negative=False, cost_rate=0.0010.  This is the ONLY
+  rotation config validated as a static whole out-of-sample in the record - it is the
+  sorted(candidates)[0] baseline (min lookback 3, min top_n 1) whose fixed-parameter OOS
+  Sharpe +0.44 is recorded in Day 45 and the README.  The per-fold search picks are explicitly
+  disqualified (per-fold winners, never validated as one static tuple).  HONEST CAVEAT: this
+  config's fixed OOS Sharpe +0.44 LOSES to equal-weight buy-and-hold (+0.59); its Sortino/MaxDD
+  were never captured for the fixed baseline.  It is shipped to run the validated strategy
+  end-to-end, NOT because it is a proven edge - the honest negative result is the project
+  thesis.
+- COST-RATE WIRING NOTE: rotation_backtest and rotation_walk_forward both default
+  cost_rate=0.0, but the validated run used 0.0010 (10 bps).  single_date_weights takes no
+  cost_rate (costs are an execution concern, not weight formation), so this does not affect
+  the Day 56 live-target function - but any live performance report/reconciliation must
+  explicitly use 10 bps to stay comparable to the validated number.
+
+**Verification:**
+- uv run pytest -q -m "not integration": 280 passed, 4 deselected (279 + 1 new goldenmaster).
+  grep confirms one 1/top_n birthplace (cross_sectional.py) and zero in portfolio.py.  git
+  diff --stat: only the three intended files.  Golden-master test passes with the SAME
+  baked-in array post-refactor - bit-for-bit proof.
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- most_recent_completed_month_end helper (drop the incomplete current month; month_end_indices
+  sets mask[-1]=True unconditionally, so "last grid element" on bars-through-today is unsafe
+  live) and the pure live_target_weights(bars_by_symbol, today, config) that composes it with
+  single_date_weights, reading the designated config above as a pinned constant.
+- Then the daily runner (market-open + rebalance-day guards, compute target, rebalance) with
+  logging and notifications, then a scheduler.  The daily runner's cost accounting must use
+  cost_rate=0.0010 to match the validated verdict.
+
 ## Day 53
 
 **Worked on:**
