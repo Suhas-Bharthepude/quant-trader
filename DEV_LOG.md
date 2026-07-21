@@ -4,6 +4,90 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 49
+
+**Worked on:**
+- First real code in src/execution/ (commit "Add rebalance reconciliation function and
+  guarded runner"): a PURE reconcile_to_target(target_weights, current_positions, prices,
+  portfolio_value) -> list[OrderRequest] in src/execution/rebalance.py (zero broker calls,
+  zero I/O), and a thin run_rebalance(broker, target_weights, prices) -> list[OrderResult]
+  in src/execution/runner.py that calls verify_paper_account() FIRST, reads account and
+  positions, delegates the sizing to the pure fn, and submits.  Plus tests/test_rebalance.py
+  with 10 hermetic tests (7 for the pure fn, 3 for the runner). [+10 tests]
+- 266 non-integration tests + 10 new = 276 passing under the CI selection (uv run pytest -q
+  -m "not integration"), 4 integration tests deselected.  Purely additive: three NEW files,
+  zero existing files modified.
+
+**Why it matters:**
+- This is the payoff of the execution arc: it turns the tested broker READ/WRITE toolkit
+  (Days 46-48: get_account, get_positions, submit_order, all hermetically covered) into an
+  actual rebalance LOOP - observe current holdings, compute the orders that close the gap to
+  a target allocation, act.  The pure-vs-IO split keeps all the sizing arithmetic (weight ->
+  target dollars -> floored whole shares -> share delta) in a function with zero I/O,
+  testable with plain dicts, mirroring the discipline of combine_period_returns in
+  src/research/portfolio.py.  The paper-only guard is now a LOAD-BEARING gate at a real call
+  site: verify_paper_account() is the first executable statement in run_rebalance, so the
+  function structurally cannot place an order without confirming paper.  This is the v1
+  paper base-bot milestone: observe, compute, act-behind-guard, all hermetically proven
+  offline.
+
+**Architectural note:**
+- TARGET REPRESENTATION REUSED, NOT REINVENTED: the rebalance target is a dict[str, float]
+  of symbol -> weight fraction - the SAME "weight per symbol" concept the rotation
+  backtester already produces (weights need not sum to 1.0; the remainder is implicitly cash
+  and places no order).  No parallel allocation concept was introduced.
+- THE SAFETY PROOF IS STRONGER THAN A MOCK: the runner test's _FakeBroker SUBCLASSES the
+  real Broker ABC, so verify_paper_account() runs the GENUINE base-class guard
+  (super().verify_paper_account() -> real get_account() -> real is_paper check -> real
+  raise), not a fake stand-in.  test_run_rebalance_live_raises_before_any_order asserts BOTH
+  that RuntimeError is raised AND that zero submit_order calls were recorded (broker.submitted
+  == []), and test_run_rebalance_calls_guard_first asserts the call-log's first entry is
+  "verify_paper_account".  So the live-account rejection is proven against the actual guard
+  logic, offline.
+- SIZING: target dollars = weight * portfolio_value; target shares = int(target_dollars /
+  price) - int() floors toward zero so a target never over-buys past its dollar budget.  A
+  symbol already at its target share count emits no order (delta filtering); a held symbol
+  dropped from the target (weight 0) is closed to zero.  Orders are market + DAY for v1.
+- TWO DEFERRED LIMITATIONS (long/flat v1 only, both safe today): (1) orders are emitted
+  alphabetically by symbol, so a BUY can precede the SELL that funds it - hermetic tests do
+  not care, but on live paper a fully-invested rotation could see an early BUY rejected for
+  insufficient buying power before the funding SELL executes; fix later by submitting sells
+  before buys.  (2) the runner builds current_positions from position qty and ignores
+  PositionSnapshot.side, so it assumes no short positions - safe now because the guard
+  rejects negative target weights (long/flat only), but note it before any short-enabled
+  version.  Live-price fetch is also deferred: prices are passed into run_rebalance as an
+  argument rather than fetched via get_latest_price, which keeps this first version fully
+  hermetic (no data-client dependency).
+
+**Verification:**
+- uv run pytest -q -m "not integration": 276 passed, 4 deselected (266 baseline unchanged +
+  10 new).  No network, no credentials.  Three new files only (src/execution/rebalance.py,
+  src/execution/runner.py, tests/test_rebalance.py); zero existing files modified.  The pure
+  fn imports only OrderRequest/OrderSide/OrderType/TimeInForce from src.brokers.base (no
+  broker, no alpaca, no network).
+- The 10 tests: pure fn - opens new positions, closes a dropped symbol while topping up a
+  held one, skips a symbol already at target (empty list), floors fractional shares (33 not
+  34 for 10000/300), flattens on empty target, rejects negative weight, rejects
+  over-allocation; runner - paper account places the computed orders, live account raises
+  before any order (submitted == []), guard is called first.
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- Sells-before-buys ordering in the pure fn (so a rotation's funding SELLs execute before
+  the BUYs they fund) - the first deferred limitation above.
+- Wiring get_latest_price into the runner (so the caller need not supply prices) - would add
+  a get_stock_latest_trade stand-in to the broker test fake.
+- A manual live-paper smoke check (run run_rebalance locally against the real paper account,
+  NOT a committed test).
+- Then the writeup/polish arc: a README presenting the TSMOM and rotation verdicts and the
+  overfitting-tax methodology as the project's distinctive contribution.
+- Housekeeping (non-urgent): backfill the [fill in] time-spent placeholders in the
+  Day 29-39 entries.
+
+**Time spent:** 1 hour
+
 ## Day 48
 
 **Worked on:**
