@@ -8,6 +8,10 @@ from datetime import datetime, timezone
 # json pre-writes / reads the tiny state file directly in the run_daily tests.
 import json
 
+# logging + caplog: the notify tests assert on log records (INFO acted/no-op, ERROR
+# failed / "notifier failed") captured hermetically via pytest's caplog fixture.
+import logging
+
 # Path types the tmp_path-based state file location.
 from pathlib import Path
 
@@ -24,6 +28,10 @@ from src.data.schema import OHLCVBar
 
 # The units under test: the pure decision core, the IO shell, and the result type.
 from src.execution.daily_runner import decide_rebalance, run_daily, RebalanceDecision
+
+# Notification payload type (for isinstance/attribute assertions) and the policy enum
+# (to exercise the ALL policy override on a no-op).
+from src.execution.notify import Notification, NotifyPolicy
 
 
 # ---------------------------------------------------------------------------
@@ -375,4 +383,178 @@ def test_run_daily_missing_reference_raises(tmp_path):
             reference_symbol="NOPE",
             state_path=state_path,
             is_open_fn=lambda: True,
+        )
+
+
+# ===========================================================================
+# run_daily LOGGING + NOTIFICATION tests (caplog for logs; a list-appending fake
+# notifier for delivery -- no real logging sink, no network).
+# ===========================================================================
+
+
+def test_run_daily_acted_logs_and_notifies(tmp_path, caplog):
+    """11. ACTED LOGS + NOTIFIES: INFO acted record + exactly one 'acted' Notification."""
+    # Paper fake, market open, no current holdings -> a BUY is generated.
+    broker = _RunnerFakeBroker(is_open=True, prices=_PRICES)
+    # Fresh state file under the per-test tmp dir.
+    state_path = tmp_path / "rebalance_state.json"
+    # A tiny fake notifier: a list whose append IS the injected callable.
+    sent: list[Notification] = []
+    notifier = sent.append
+    # Capture INFO+ records for the duration of the run (module logger has no handlers,
+    # so records propagate to the root logger caplog attaches to).
+    with caplog.at_level(logging.INFO):
+        decision = run_daily(
+            broker,
+            _bars(),
+            _TODAY,
+            state_path=state_path,
+            is_open_fn=lambda: True,
+            notify_fn=notifier,
+        )
+    # It acted on Aug 28.
+    assert decision.should_act is True
+    # An INFO log record for the acted outcome was emitted.
+    assert any(r.levelname == "INFO" and "ACTED" in r.getMessage() for r in caplog.records)
+    # Exactly one Notification was delivered.
+    assert len(sent) == 1
+    assert isinstance(sent[0], Notification)
+    # It is the acted payload with the correct month-end, orders, and target weights.
+    assert sent[0].outcome == "acted"
+    assert sent[0].as_of_month_end == _AUG_ME
+    assert len(sent[0].orders) >= 1
+    assert sent[0].orders[0][0] == "A"        # (symbol, side, qty) -> symbol is the winner "A"
+    assert sent[0].target_weights == {"A": 1.0}
+
+
+def test_run_daily_noop_logs_but_does_not_notify_default_policy(tmp_path, caplog):
+    """12. NO-OP LOGS, DOES NOT NOTIFY (default policy): INFO no-op record, sent stays empty."""
+    # Market closed -> the runner no-ops.
+    broker = _RunnerFakeBroker(is_open=False, prices=_PRICES)
+    # Fresh state file.
+    state_path = tmp_path / "rebalance_state.json"
+    # Fake notifier list.
+    sent: list[Notification] = []
+    # Capture INFO+ during the run.
+    with caplog.at_level(logging.INFO):
+        decision = run_daily(
+            broker,
+            _bars(),
+            _TODAY,
+            state_path=state_path,
+            is_open_fn=lambda: False,
+            notify_fn=sent.append,
+        )
+    # No action taken.
+    assert decision.should_act is False
+    # The no-op WAS logged at INFO.
+    assert any(r.levelname == "INFO" and "NO-OP" in r.getMessage() for r in caplog.records)
+    # But under the default ACTED_AND_FAILED policy the notifier did NOT fire.
+    assert sent == []
+
+
+def test_run_daily_noop_notifies_under_all_policy(tmp_path):
+    """13. NO-OP NOTIFIES UNDER ALL POLICY: exactly one 'no-op' Notification is delivered."""
+    # Market closed -> no-op, but the ALL policy fires on every outcome.
+    broker = _RunnerFakeBroker(is_open=False, prices=_PRICES)
+    # Fresh state file.
+    state_path = tmp_path / "rebalance_state.json"
+    # Fake notifier list.
+    sent: list[Notification] = []
+    # Run with the ALL policy override.
+    decision = run_daily(
+        broker,
+        _bars(),
+        _TODAY,
+        state_path=state_path,
+        is_open_fn=lambda: False,
+        notify_fn=sent.append,
+        notify_policy=NotifyPolicy.ALL,
+    )
+    # Still a no-op...
+    assert decision.should_act is False
+    # ...but the notifier fired exactly once with the no-op payload.
+    assert len(sent) == 1
+    assert sent[0].outcome == "no-op"
+
+
+def test_run_daily_failed_logs_and_notifies_before_raising(tmp_path, caplog):
+    """14. FAILED LOGS + NOTIFIES BEFORE RAISING (crux): ERROR log + one 'failed' Notification, state unwritten."""
+    # Fake whose FIRST submit_order raises -> mid-rebalance failure.
+    broker = _RunnerFakeBroker(is_open=True, prices=_PRICES, raise_on_nth=1)
+    # Fresh state file.
+    state_path = tmp_path / "rebalance_state.json"
+    # Fake notifier list.
+    sent: list[Notification] = []
+    # Capture INFO+ (covers ERROR); the failed rebalance must propagate as RuntimeError.
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(RuntimeError):
+            run_daily(
+                broker,
+                _bars(),
+                _TODAY,
+                state_path=state_path,
+                is_open_fn=lambda: True,
+                notify_fn=sent.append,
+            )
+    # An ERROR log record for the failed outcome was emitted before the raise.
+    assert any(r.levelname == "ERROR" and "FAILED" in r.getMessage() for r in caplog.records)
+    # Exactly one failed Notification was delivered, with the error set.
+    assert len(sent) == 1
+    assert sent[0].outcome == "failed"
+    assert sent[0].error is not None
+    # Day-57 crux still holds: no state was written on the failed rebalance.
+    assert not state_path.exists()
+
+
+def test_run_daily_raising_notifier_does_not_mask_acted_result(tmp_path, caplog):
+    """15. RAISING NOTIFIER DOES NOT MASK RESULT: acted result + state write survive a notifier that raises."""
+    # Paper fake, market open -> a successful rebalance.
+    broker = _RunnerFakeBroker(is_open=True, prices=_PRICES)
+    # Fresh state file.
+    state_path = tmp_path / "rebalance_state.json"
+
+    # A notifier that itself raises on delivery.
+    def raising_notifier(_n):
+        raise ValueError("notifier boom")
+
+    # Capture INFO+ during the run; the raising notifier must NOT break the trade.
+    with caplog.at_level(logging.INFO):
+        decision = run_daily(
+            broker,
+            _bars(),
+            _TODAY,
+            state_path=state_path,
+            is_open_fn=lambda: True,
+            notify_fn=raising_notifier,
+        )
+    # The acted result is unchanged despite the notifier raising.
+    assert decision.should_act is True
+    # State WAS written (the trade succeeded; only the notification failed).
+    assert state_path.exists()
+    # The delivery failure was contained and logged as a separate ERROR record.
+    assert any(r.levelname == "ERROR" and "notifier failed" in r.getMessage() for r in caplog.records)
+
+
+def test_run_daily_raising_notifier_on_failed_path_preserves_original_error(tmp_path):
+    """16. RAISING NOTIFIER ON FAILED PATH: the ORIGINAL rebalance error propagates, not the notifier's."""
+    # Fake whose first submit_order raises the rebalance error.
+    broker = _RunnerFakeBroker(is_open=True, prices=_PRICES, raise_on_nth=1)
+    # Fresh state file.
+    state_path = tmp_path / "rebalance_state.json"
+
+    # A notifier that ALSO raises (a different exception type/message).
+    def raising_notifier(_n):
+        raise ValueError("notifier boom")
+
+    # The propagated exception must be the ORIGINAL RuntimeError ("simulated broker
+    # rejection"), NOT the notifier's ValueError -- the delivery failure cannot mask it.
+    with pytest.raises(RuntimeError, match="simulated broker rejection"):
+        run_daily(
+            broker,
+            _bars(),
+            _TODAY,
+            state_path=state_path,
+            is_open_fn=lambda: True,
+            notify_fn=raising_notifier,
         )

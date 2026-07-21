@@ -32,10 +32,27 @@ before recording the month-end is a documented later refinement, not done here.
 
 cost_rate deliberately does NOT appear in this module: it is an execution/accounting
 concern (later performance reporting), never part of the act/no-act decision logic.
+
+LOGGING + NOTIFICATIONS: logging is stdlib (log = logging.getLogger(__name__)); this
+module configures NO handlers/format (the caller owns that).  The notifier is INJECTED
+into run_daily (notify_fn, default None = no notification) and gated by a NotifyPolicy
+(default ACTED_AND_FAILED).  A failed rebalance is logged (with traceback) and notified
+BEFORE the exception propagates; a raising notifier is caught and logged separately, so a
+notification-delivery failure can NEVER mask the trading result or the original error.
+The missing-reference config error is logged but does NOT fire the notifier (a config bug
+is not a trading alert).
 """
 
 # Modern type-hint syntax (datetime | None, dict[str, float]) without quoting.
 from __future__ import annotations
+
+# Standard-library logging: this module uses a module-level logger named `log`
+# (defined below), matching cli_common.py's `log = logging.getLogger(__name__)` idiom.
+# It configures NO handlers/format; the caller (scheduler/entry point) owns that.
+import logging
+
+# Callable types the injected notifier parameter (notify_fn) on run_daily's signature.
+from typing import Callable
 
 # dataclass builds the frozen RebalanceDecision result; frozen=True makes each
 # decision an immutable value, matching LiveRotationConfig / OrderResult.
@@ -65,9 +82,24 @@ from src.execution.live_target import LIVE_CONFIG, LiveRotationConfig, live_targ
 # weight dict and submits the orders; run_daily orchestrates it, never re-does its work.
 from src.execution.runner import run_rebalance
 
+# Notification payload, policy, and pure helpers from the notify seam.  The actual delivery
+# backend is an INJECTED callable owned by the caller; this module only builds the payload,
+# applies the policy (should_notify), and formats the human line (format_notification).
+from src.execution.notify import (
+    Notification,
+    NotifyPolicy,
+    should_notify,
+    format_notification,
+)
+
 # most_recent_completed_month_end is the LIVE right-edge resolver: it drops an
 # in-progress current month so the decision never rests on a partial-month window.
 from src.strategies.time_series_momentum import most_recent_completed_month_end
+
+
+# Module-level logger, named `log` per cli_common.py's idiom; getLogger(__name__) ties
+# records to this module so the caller's log config can filter them without extra setup.
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +203,61 @@ def _write_state(path: Path, dt: datetime) -> None:
 
 
 # ---------------------------------------------------------------------------
+# _emit — log the outcome and (policy-gated) fire the injected notifier.
+# ---------------------------------------------------------------------------
+
+def _emit(
+    outcome: str,                                   # "acted" | "no-op" | "failed"
+    decision: RebalanceDecision,                    # the decision this run produced
+    orders: tuple[tuple[str, str, int], ...],       # (symbol, side, qty) per submitted order
+    target: dict[str, float],                       # the target weights when acting, else {}
+    error: str | None,                              # str(exception) on failure, else None
+    notify_fn,                                       # injected Callable[[Notification], None] | None
+    notify_policy: NotifyPolicy,                     # gates WHEN notify_fn fires
+) -> None:
+    """Log the run outcome and, if the policy allows, deliver it to the injected notifier.
+
+    Logging always happens; notification is gated by should_notify(outcome, policy) and only
+    fires when a notifier is injected.  A notifier that RAISES is caught and logged
+    separately so it can never propagate or mask the caller's trading result / exception.
+    """
+    # Build the immutable payload once for both the log line and the notifier.  On a
+    # failure the human-facing `reason` is the short failure summary (str(exc)); otherwise
+    # it is the decision's own reason (matching Notification.reason's documented contract).
+    notification = Notification(
+        outcome=outcome,
+        reason=(error if outcome == "failed" else decision.reason),
+        as_of_month_end=decision.as_of_month_end,
+        orders=orders,
+        target_weights=target,
+        error=error,
+    )
+
+    # Render the compact one-line human summary shared by the log record and the notifier.
+    line = format_notification(notification)
+
+    # LOG at the level matching the outcome.
+    if outcome == "failed":
+        # log.exception is invoked from within the except block (see run_daily's failure
+        # wiring), so it records at ERROR level AND attaches the active traceback.
+        log.exception(line)
+    else:
+        # "acted" and "no-op" are both routine INFO records.
+        log.info(line)
+
+    # NOTIFY only when a notifier is injected AND the policy says to fire for this outcome.
+    if notify_fn is not None and should_notify(outcome, notify_policy):
+        # Deliver inside its OWN try/except so a raising notifier is CONTAINED: the delivery
+        # failure is logged separately and swallowed, never re-raised, so it cannot change
+        # the trading outcome or mask the caller's original exception.
+        try:
+            notify_fn(notification)
+        except Exception as exc:  # noqa: BLE001 - delivery failure must never affect trading
+            # Separate ERROR record; deliberately swallowed (no re-raise) per the invariant.
+            log.error("notifier failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # run_daily — the THIN IO SHELL (all I/O lives here, nothing else).
 # ---------------------------------------------------------------------------
 
@@ -182,6 +269,11 @@ def run_daily(
     state_path: Path = Path("logs/rebalance_state.json"),
     config: LiveRotationConfig = LIVE_CONFIG,
     is_open_fn=None,
+    # INJECTED notifier (default None = no notification), mirroring the is_open_fn seam so
+    # the network/secrets stay at the caller's impure edge and tests can pass a fake.
+    notify_fn: Callable[[Notification], None] | None = None,
+    # Policy gating WHEN notify_fn fires (default: acted + failed only, no daily no-op spam).
+    notify_policy: NotifyPolicy = NotifyPolicy.ACTED_AND_FAILED,
 ) -> RebalanceDecision:
     """Wake, decide, and (only if a new completed month-end appeared) rebalance.
 
@@ -196,6 +288,10 @@ def run_daily(
         state_path:       JSON file holding the last acted-on month-end (default under logs/).
         config:           rotation parameters passed to live_target_weights (default LIVE_CONFIG).
         is_open_fn:        optional injected market-open callable; None -> broker.is_market_open.
+        notify_fn:         optional injected notifier called with a Notification; None -> no
+                           notification (logging still happens).  Owned by the caller, so all
+                           network/secrets stay at the impure edge.
+        notify_policy:     when notify_fn fires (default ACTED_AND_FAILED: acted + failed only).
 
     Returns:
         The RebalanceDecision made this run.  On a no-op path no state is written and no
@@ -219,6 +315,13 @@ def run_daily(
     # STEP c — GUARD: the reference symbol must be present, since its month-ends ARE the
     # schedule.  Echo the missing name so an absent/typo'd spine fails loud and legibly.
     if reference_symbol not in bars_by_symbol:
+        # LOG the config error at ERROR level.  A missing reference is a CONFIG bug, not a
+        # trading event, so the notifier is deliberately NOT fired here.
+        log.error(
+            "reference_symbol %r not in bars_by_symbol (keys: %s)",
+            reference_symbol,
+            sorted(bars_by_symbol.keys()),
+        )
         raise ValueError(
             f"reference_symbol {reference_symbol!r} not in bars_by_symbol "
             f"(keys: {sorted(bars_by_symbol.keys())})"
@@ -233,24 +336,63 @@ def run_daily(
         is_open,
     )
 
-    # STEP e — NO-OP PATH: if we are not acting, return the decision unchanged.  No state
-    # write, no broker calls beyond the market-open check above.
+    # STEP e — NO-OP PATH: if we are not acting, log + (policy-gated) notify, then return the
+    # decision unchanged.  No state write, no broker calls beyond the market-open check above.
     if not decision.should_act:
+        # No-op emit: empty orders, empty target, no error; decision.reason carries why.
+        _emit(
+            outcome="no-op",
+            decision=decision,
+            orders=(),
+            target={},
+            error=None,
+            notify_fn=notify_fn,
+            notify_policy=notify_policy,
+        )
         return decision
 
     # STEP f — ACT: form today's target weights through the SHARED seam (live and backtest
     # cannot drift), then reconcile the account to them via the already-built runner.
     target = live_target_weights(bars_by_symbol, today, reference_symbol, config)
 
-    # run_rebalance is the IO shell that prices, sizes, and submits the orders.  If it
-    # raises (a rejected/partial rebalance), the exception propagates out of run_daily and
-    # the state write below is skipped -> the month-end is retried next run.
-    run_rebalance(broker, target)
+    # run_rebalance is the IO shell that prices, sizes, and submits the orders.  Wrap it so a
+    # failure is logged + (policy-gated) notified BEFORE the exception propagates; the bare
+    # raise below keeps the Day-57 crux intact (state is NOT written on a failed rebalance).
+    try:
+        # Capture the per-order results so the SUCCESS notification can list the orders.
+        results = run_rebalance(broker, target)
+    except Exception as exc:  # noqa: BLE001 - re-raised below after logging + notifying
+        # FAILURE emit: reason/error carry str(exc); _emit logs via log.exception (capturing
+        # the active traceback) and fires the notifier per policy.  No state write here.
+        _emit(
+            outcome="failed",
+            decision=decision,
+            orders=(),
+            target=target,
+            error=str(exc),
+            notify_fn=notify_fn,
+            notify_policy=notify_policy,
+        )
+        # Bare raise: preserve the original traceback and propagate, so the month-end is
+        # retried next run and the state file stays untouched (the Day-57 crux holds).
+        raise
 
     # STEP g — STATE WRITE ONLY AFTER SUCCESS: reached ONLY because run_rebalance returned
     # without raising.  We record the acted-on month-end so subsequent runs this month
     # no-op (idempotency).  A failed rebalance never reaches this line.
     _write_state(state_path, decision.as_of_month_end)
+
+    # SUCCESS emit: AFTER state is durably written, log + (policy-gated) notify, listing the
+    # submitted orders as (symbol, side, qty) tuples for the human-readable summary.
+    _emit(
+        outcome="acted",
+        decision=decision,
+        orders=tuple((r.symbol, r.side.value, r.qty) for r in results),
+        target=target,
+        error=None,
+        notify_fn=notify_fn,
+        notify_policy=notify_policy,
+    )
 
     # STEP h — return the decision we acted on.
     return decision
