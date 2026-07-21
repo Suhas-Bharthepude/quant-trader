@@ -24,7 +24,7 @@ from src.brokers.alpaca_broker import AlpacaBroker
 
 # Also import our base types so we can assert on the returned dataclasses
 # without needing alpaca-py types in this test file.
-from src.brokers.base import AccountSnapshot, OrderResult
+from src.brokers.base import AccountSnapshot, OrderResult, PositionSnapshot
 
 
 @pytest.mark.integration
@@ -153,6 +153,51 @@ class _FakeAccount:
         self.portfolio_value = portfolio_value
 
 
+class _FakeSide:
+    """Minimal stand-in for alpaca-py's PositionSide str-Enum.
+
+    AlpacaBroker._to_position_snapshot reads position.side.value, so the fake
+    only needs a .value attribute holding the plain "long"/"short" string.
+    """
+
+    # __init__ stores the single .value attribute the conversion reads.
+    def __init__(self, value: str) -> None:
+        # Save the side string verbatim ("long" or "short").
+        self.value = value
+
+
+class _FakePosition:
+    """Minimal stand-in for an alpaca-py Position model from get_all_positions().
+
+    Alpaca returns qty and monetary values as STRINGS; we mirror that here so the
+    test genuinely exercises AlpacaBroker's str->int / str->float conversions and
+    the .side.value extraction.
+    """
+
+    # __init__ stores exactly the attributes _to_position_snapshot reads.
+    def __init__(
+        self,
+        symbol: str,            # ticker, e.g. "SPY" — a plain string
+        qty: str,               # shares as a string (e.g. "10"), mirroring the real API
+        side: str,              # "long"/"short"; wrapped in _FakeSide to expose .value
+        market_value: str,      # money field as a string, mirroring the real API
+        avg_entry_price: str,   # money field as a string, mirroring the real API
+        unrealized_pl: str,     # money field as a string, mirroring the real API
+    ) -> None:
+        # Save the symbol verbatim (passed through unchanged by the conversion).
+        self.symbol = symbol
+        # Save qty as a string; _to_position_snapshot will int(float()) it.
+        self.qty = qty
+        # Wrap the side string so position.side.value works like the real str-Enum.
+        self.side = _FakeSide(side)
+        # Save market_value as a string; the conversion will float() it.
+        self.market_value = market_value
+        # Save avg_entry_price as a string; the conversion will float() it.
+        self.avg_entry_price = avg_entry_price
+        # Save unrealized_pl as a string; the conversion will float() it.
+        self.unrealized_pl = unrealized_pl
+
+
 class _FakeTradingClient:
     """Fake TradingClient: accepts the real constructor args, makes no network call.
 
@@ -164,6 +209,11 @@ class _FakeTradingClient:
     # Set by each test (e.g. _FakeTradingClient.account = _FakeAccount(...)).
     account: "_FakeAccount"
 
+    # Class-level slot for the positions list get_all_positions() should return.
+    # Defaults to [] (a flat account) so tests that never set it see the common
+    # empty state; each position test sets it explicitly to avoid cross-test leakage.
+    positions: "list[_FakePosition]" = []
+
     # __init__ mirrors the real signature (api_key, api_secret, paper=...) and
     # ignores every argument — no client is created, no endpoint is contacted.
     def __init__(self, api_key: str, api_secret: str, paper: bool = True) -> None:
@@ -174,6 +224,11 @@ class _FakeTradingClient:
     def get_account(self) -> "_FakeAccount":
         # Hand back whatever account the test assigned to the class attribute.
         return type(self).account
+
+    # get_all_positions() returns the pre-set list, standing in for GET /v2/positions.
+    def get_all_positions(self) -> "list[_FakePosition]":
+        # Hand back whatever positions the test assigned to the class attribute.
+        return type(self).positions
 
 
 class _FakeDataClient:
@@ -278,3 +333,101 @@ def test_verify_paper_account_raises_on_live_hermetic(monkeypatch) -> None:
     # The guard must raise RuntimeError rather than allow a live account through.
     with pytest.raises(RuntimeError):
         broker.verify_paper_account()
+
+
+def test_get_positions_parses_holdings_hermetic(monkeypatch) -> None:
+    """get_positions() maps faked Alpaca positions to PositionSnapshots, offline.
+
+    Pins the str->int qty conversion, the str->float money conversions, and the
+    .side.value extraction, with no network call and no credentials.
+    """
+    # A minimal paper account so _build_broker_with_fake_account can construct cleanly;
+    # get_positions never reads it, but the builder sets the account class attr.
+    account = _FakeAccount(
+        account_number="PA3XYZABC",   # paper account, irrelevant to get_positions
+        buying_power="94321.50",      # unused by get_positions
+        cash="88000.00",             # unused by get_positions
+        portfolio_value="102345.67",  # unused by get_positions
+    )
+    # Two fake holdings with STRING fields, exactly as the real API delivers them.
+    spy = _FakePosition(
+        symbol="SPY",              # first holding
+        qty="10",                  # must convert to int 10
+        side="long",               # must surface as "long" via .value
+        market_value="4500.00",    # must convert to float 4500.00
+        avg_entry_price="440.00",  # must convert to float 440.00
+        unrealized_pl="100.00",    # must convert to float 100.00
+    )
+    tlt = _FakePosition(
+        symbol="TLT",              # second holding
+        qty="5",                   # must convert to int 5
+        side="long",               # must surface as "long" via .value
+        market_value="450.00",     # must convert to float 450.00
+        avg_entry_price="88.00",   # must convert to float 88.00
+        unrealized_pl="-10.00",    # must convert to float -10.00 (negative PL)
+    )
+    # Set the positions class attr EXPLICITLY for this test to avoid cross-test leakage.
+    _FakeTradingClient.positions = [spy, tlt]
+    # Build the broker with faked SDK clients (also sets the account class attr).
+    broker = _build_broker_with_fake_account(monkeypatch, account)
+    # Exercise the read path — this calls the fake TradingClient.get_all_positions().
+    positions = broker.get_positions()
+
+    # Two holdings in, two snapshots out — a plain list of the correct length.
+    assert isinstance(positions, list)
+    assert len(positions) == 2
+
+    # Every item must be our dataclass, not a raw alpaca object.
+    for position in positions:
+        assert isinstance(position, PositionSnapshot), (
+            f"Each position should be PositionSnapshot, got {type(position)}"
+        )
+
+    # First snapshot: SPY, with the string fields converted to their typed values.
+    first = positions[0]
+    assert first.symbol == "SPY"
+    # qty must be the converted numeric value AND a genuine int (str was converted).
+    assert first.qty == 10
+    assert type(first.qty) is int
+    # side must be the plain string pulled from _FakeSide.value.
+    assert first.side == "long"
+    # market_value must equal the converted numeric value and be a genuine float.
+    assert first.market_value == 4500.00
+    assert type(first.market_value) is float
+    # avg_entry_price must equal the converted numeric value.
+    assert first.avg_entry_price == 440.00
+    # unrealized_pl must equal the converted numeric value.
+    assert first.unrealized_pl == 100.00
+
+    # Second snapshot: TLT, confirming a second row and a negative unrealized_pl.
+    second = positions[1]
+    assert second.symbol == "TLT"
+    assert second.qty == 5
+    assert type(second.qty) is int
+    assert second.unrealized_pl == -10.00
+
+
+def test_get_positions_empty_account_returns_empty_list_hermetic(monkeypatch) -> None:
+    """get_positions() returns [] for a flat account — the common real state.
+
+    A brand-new/flat paper account holds nothing, so get_all_positions() returns
+    an empty list; get_positions must surface [] cleanly, not None and no crash.
+    """
+    # A minimal paper account so the builder can construct the broker.
+    account = _FakeAccount(
+        account_number="PA3XYZABC",   # paper account, irrelevant here
+        buying_power="94321.50",      # unused
+        cash="88000.00",             # unused
+        portfolio_value="102345.67",  # unused
+    )
+    # Set positions EXPLICITLY to empty for this test (guards against leakage from
+    # the holdings test, since class attributes persist across tests otherwise).
+    _FakeTradingClient.positions = []
+    # Build the broker with faked SDK clients serving no positions.
+    broker = _build_broker_with_fake_account(monkeypatch, account)
+    # Exercise the flat-account read path.
+    positions = broker.get_positions()
+
+    # Must be an actual empty list — not None, no exception.
+    assert positions == []
+    assert isinstance(positions, list)

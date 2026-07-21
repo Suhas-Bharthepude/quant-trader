@@ -60,6 +60,7 @@ from src.brokers.base import (
     OrderResult,
     OrderSide,  # our enum — values "buy" / "sell"
     OrderType,  # our enum — values "market" / "limit"
+    PositionSnapshot,  # our dataclass — one open position (symbol, qty, side, values)
 )
 
 
@@ -215,6 +216,62 @@ class AlpacaBroker(Broker):
         )
 
     # ------------------------------------------------------------------
+    # Private helper — converts one Alpaca position object into our PositionSnapshot
+    # ------------------------------------------------------------------
+
+    def _to_position_snapshot(self, position: object) -> PositionSnapshot:
+        """
+        Map an alpaca-py Position object to our broker-agnostic PositionSnapshot.
+
+        Called by get_positions so the conversion logic lives in exactly one place,
+        mirroring how _to_order_result serves the order-returning methods.
+
+        Parameters
+        ----------
+        position : alpaca-py Position model returned by get_all_positions().
+
+        Returns
+        -------
+        PositionSnapshot
+            Our internal representation — no alpaca types leak out.
+        """
+        # position.symbol is already a plain str (e.g. "SPY") — pass through verbatim.
+        symbol: str = position.symbol
+
+        # position.qty is a STRING from Alpaca (e.g. "10" or "10.0"). This codebase
+        # never places fractional orders, so float() first so "10.0" parses cleanly,
+        # then int() to land on the whole-shares assumption our OrderResult also uses.
+        qty: int = int(float(position.qty))
+
+        # position.side is a PositionSide str-Enum ("long" / "short"); .value gives
+        # the plain string we store, mirroring how _to_order_result reads .value.
+        side: str = position.side.value
+
+        # position.market_value is Optional[str] on Alpaca (may be None). Convert the
+        # string to float when present; default to 0.0 rather than crash if absent.
+        market_value: float = (
+            float(position.market_value) if position.market_value is not None else 0.0
+        )
+
+        # position.avg_entry_price is a STRING that is always present — float() it directly.
+        avg_entry_price: float = float(position.avg_entry_price)
+
+        # position.unrealized_pl is Optional[str] on Alpaca (may be None). Convert when
+        # present; default to 0.0 if absent so downstream risk code never sees None.
+        unrealized_pl: float = (
+            float(position.unrealized_pl) if position.unrealized_pl is not None else 0.0
+        )
+
+        return PositionSnapshot(
+            symbol=symbol,
+            qty=qty,
+            side=side,
+            market_value=market_value,
+            avg_entry_price=avg_entry_price,
+            unrealized_pl=unrealized_pl,
+        )
+
+    # ------------------------------------------------------------------
     # Abstract method implementations
     # ------------------------------------------------------------------
 
@@ -342,6 +399,22 @@ class AlpacaBroker(Broker):
         # Convert every alpaca Order to our OrderResult using the private helper.
         # List comprehension keeps this one logical line.
         return [self._to_order_result(o) for o in orders]
+
+    def get_positions(self) -> list[PositionSnapshot]:
+        """
+        Return every currently open position, newest state as of the last query.
+
+        Wraps GET /v2/positions via self._trading.get_all_positions(). A flat or
+        brand-new paper account has no positions, so this returns [] cleanly —
+        never None and never a crash — which is the common real state.
+        """
+        # API call: GET /v2/positions — returns a List[Position], or an empty
+        # list when the account holds nothing (the flat/new-account case).
+        positions = self._trading.get_all_positions()
+
+        # Convert every alpaca Position to our PositionSnapshot using the private
+        # helper. Same list-comprehension shape as list_recent_orders; [] stays [].
+        return [self._to_position_snapshot(p) for p in positions]
 
     def is_market_open(self) -> bool:
         """

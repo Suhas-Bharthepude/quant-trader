@@ -110,6 +110,22 @@ class AccountSnapshot:
     is_paper: bool           # True = paper/simulated account; False = real money
 
 
+@dataclass
+class PositionSnapshot:
+    """
+    A point-in-time view of one open position. qty is positive whole shares;
+    `side` carries the long/short direction, mirroring OrderResult's
+    positive-qty + side convention.
+    """
+
+    symbol: str            # ticker, e.g. "SPY"
+    qty: int               # whole shares held (positive; direction is in `side`)
+    side: str              # "long" or "short" (from Alpaca PositionSide.value)
+    market_value: float    # current dollar value of the holding
+    avg_entry_price: float  # average entry (fill) price of the position
+    unrealized_pl: float   # unrealized profit/loss in dollars
+
+
 # ---------------------------------------------------------------------------
 # Abstract base class — the contract every broker must fulfil
 # ---------------------------------------------------------------------------
@@ -212,6 +228,18 @@ class Broker(ABC):
         -------
         list[OrderResult]
             Orders sorted by submitted_at descending.
+        """
+        ...
+
+    @abstractmethod
+    def get_positions(self) -> list[PositionSnapshot]:
+        """
+        Return all currently open positions.
+
+        Returns
+        -------
+        list[PositionSnapshot]
+            One entry per open position; an empty list if the account is flat.
         """
         ...
 
