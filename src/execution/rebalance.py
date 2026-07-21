@@ -21,6 +21,12 @@ Design decisions locked for this first version (v1):
 - Orders are market + DAY: the simplest execution style, no limit price.
 - A symbol with weight 0 (or absent from targets) but currently held is closed
   to zero. A symbol already at its target share count produces no order.
+- Orders are emitted sells-first: all SELLs precede all BUYs in the returned
+  list, with deterministic alphabetical order preserved within each group. This
+  is an ordering choice at the emission level so exit orders come before entry
+  orders on a fully-invested rebalance; it does NOT guarantee the broker settles
+  the sell cash before the buy executes (fill/settlement sequencing is a
+  separate, future runner-level concern).
 """
 
 # Allow modern type-hint syntax (list[OrderRequest], dict[str, float]) on the
@@ -139,5 +145,16 @@ def reconcile_to_target(
             )
         )
 
-    # Possibly empty, if every symbol was already at its target share count.
-    return orders
+    # Partition the alphabetical order list so all SELLs precede all BUYs.
+    # WHY: on a fully-invested rebalance, a BUY emitted before the SELL that
+    # funds it can be rejected by a live broker for insufficient buying power.
+    # Emitting exits first frees the cash the entries need. The list
+    # comprehensions are STABLE (they preserve the source order), and the source
+    # list is already alphabetical by symbol, so sells stay A->Z and buys stay
+    # A->Z within each group. The SET of orders is identical to before - same
+    # symbols, sides, quantities; only their SEQUENCE changes.
+    sells = [order for order in orders if order.side == OrderSide.SELL]
+    buys = [order for order in orders if order.side == OrderSide.BUY]
+
+    # sells + buys: possibly empty, if every symbol was already at its target.
+    return sells + buys

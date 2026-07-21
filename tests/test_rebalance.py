@@ -65,7 +65,11 @@ def test_reconcile_opens_new_positions():
 
 
 def test_reconcile_closes_dropped_symbol():
-    """A held symbol dropped from the target is sold to zero; a held target is topped up."""
+    """A held symbol dropped from the target is sold to zero; a held target is topped up.
+
+    Also documents sells-before-buys ordering: the TLT SELL is emitted BEFORE the
+    SPY BUY, even though SPY sorts first alphabetically.
+    """
     # SPY target 100 shares but only 50 held -> buy 50. TLT not in target -> sell all 100.
     orders = reconcile_to_target(
         target_weights={"SPY": 1.0},
@@ -74,9 +78,41 @@ def test_reconcile_closes_dropped_symbol():
         portfolio_value=10000.0,
     )
     assert len(orders) == 2
-    spy, tlt = orders
-    assert (spy.symbol, spy.side, spy.qty) == ("SPY", OrderSide.BUY, 50)
+    # Sells-before-buys: TLT SELL now precedes SPY BUY (was [SPY-buy, TLT-sell] pre-Day-53).
+    tlt, spy = orders
     assert (tlt.symbol, tlt.side, tlt.qty) == ("TLT", OrderSide.SELL, 100)
+    assert (spy.symbol, spy.side, spy.qty) == ("SPY", OrderSide.BUY, 50)
+
+
+def test_reconcile_emits_all_sells_before_all_buys():
+    """Every SELL precedes every BUY, even when alphabetical order would interleave them.
+
+    Setup is chosen so the OLD alphabetical ordering would put a BUY between two
+    SELLs: hold AAA and ZZZ (both dropped -> sells), target BBB and YYY from flat
+    (both buys). Alphabetical would be AAA-sell, BBB-buy, YYY-buy, ZZZ-sell; the
+    fix must group all sells ahead of all buys.
+    """
+    orders = reconcile_to_target(
+        target_weights={"BBB": 0.5, "YYY": 0.5},
+        current_positions={"AAA": 10, "ZZZ": 10},
+        prices={"BBB": 100.0, "YYY": 100.0},
+        portfolio_value=10000.0,
+    )
+    # Four orders: sell AAA, sell ZZZ, buy BBB (50 shares), buy YYY (50 shares).
+    assert len(orders) == 4
+    # The key property: the last SELL comes before the first BUY.
+    sides = [o.side for o in orders]
+    last_sell_index = max(i for i, s in enumerate(sides) if s == OrderSide.SELL)
+    first_buy_index = min(i for i, s in enumerate(sides) if s == OrderSide.BUY)
+    assert last_sell_index < first_buy_index
+    # The SET of orders is correct regardless of sequence.
+    by_symbol = {o.symbol: (o.side, o.qty) for o in orders}
+    assert by_symbol == {
+        "AAA": (OrderSide.SELL, 10),
+        "ZZZ": (OrderSide.SELL, 10),
+        "BBB": (OrderSide.BUY, 50),
+        "YYY": (OrderSide.BUY, 50),
+    }
 
 
 def test_reconcile_skips_already_at_target():
