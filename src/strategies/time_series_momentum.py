@@ -36,6 +36,11 @@ The backtester applies the one and only one-bar lag (signals[:-1] *
 returns[1:]); adding a shift here would double-lag and diverge from SMA.
 """
 
+# datetime types the `today` right-edge argument and the return value of
+# most_recent_completed_month_end below. It is passed IN (never read from a
+# clock), so the resolver stays a pure function of its arguments.
+from datetime import datetime
+
 # numpy backs the final positional int8 signal array we return, matching the
 # return-type contract every strategy in this project obeys.
 import numpy as np
@@ -113,6 +118,90 @@ def month_end_indices(bars: list[OHLCVBar]) -> np.ndarray:
     # np.where(mask)[0] returns the ascending positional indices where mask is
     # True — exactly the month-end bar positions, in order.
     return np.where(mask)[0]
+
+
+def most_recent_completed_month_end(
+    bars: list[OHLCVBar],
+    today: datetime,
+) -> datetime | None:
+    """The LIVE right-edge resolver: the most recent COMPLETED month-end as of today.
+
+    Answers the only question a live run must ask before ranking: "as of `today`,
+    what is the most recent month-end whose month has demonstrably ended?"  It DROPS
+    an incomplete current month so a live rebalance never ranks on a partial-month
+    formation window — the Day 54 lookahead risk.  That risk is real because
+    month_end_indices flags its FINAL bar as a month-end unconditionally
+    (mask[-1] = True), so naively taking the last grid element on bars-through-today
+    would treat an in-progress current month as a decision date.
+
+    On the actual last trading day of a month the resolver returns the PRIOR
+    month-end until the next month's first bar appears — a deliberate one-session lag
+    that is SAFE (it can only resolve LATE, never early and never on a partial month)
+    and immaterial for a monthly-rebalanced strategy.
+
+    It shares month_end_indices' definition of what a month-end IS, so the live path
+    and the backtest agree exactly on the month-end grid — no second, drifting notion.
+
+    Pure: no I/O, no clock, no printing.  `today` is passed IN by the caller (the
+    runner reads the wall clock; this function never does), so it is a deterministic
+    function of (bars, today) alone.
+
+    Args:
+        bars:  the symbol's (or reference spine's) time-ordered OHLCVBar list.
+        today: the live "as of" instant; bars strictly after it are never read.
+
+    Returns:
+        The datetime TIMESTAMP of the most recent completed month-end at-or-before
+        today, or None when none exists (today precedes the first bar, or only an
+        incomplete current month is visible).
+    """
+    # STEP 1 — VISIBLE SLICE: keep only bars at-or-before today.  A live run must
+    # never read a bar dated after "today", so anything strictly later is dropped
+    # here before any month-end logic runs.
+    visible = [bar for bar in bars if bar.timestamp <= today]
+
+    # STEP 2 — EMPTY GUARD: today precedes the first bar, so there is no history at
+    # all to resolve a month-end from.  None means "no completed month-end yet".
+    if not visible:
+        return None
+
+    # STEP 3 — MONTH-END GRID under the SHARED definition, on the visible slice only.
+    # Its LAST element is either a true month-boundary (a later-month bar follows it)
+    # OR the unconditional final-bar flag (mask[-1] = True) — STEP 4 handles the
+    # suspect final-bar case by checking the month against today.
+    mei = month_end_indices(visible)
+
+    # The timestamp of the LAST month-end in the visible slice — the candidate that
+    # might be an incomplete current month.  int(...) coerces the numpy index.
+    last_me_ts = visible[int(mei[-1])].timestamp
+
+    # STEP 4 — INCOMPLETE-MONTH DROP.  Compare the last month-end's (year, month) to
+    # today's.  Because the visible slice contains no bar after today, the last
+    # month-end can only be in today's month or an EARLIER one — never a later one.
+    if (last_me_ts.year, last_me_ts.month) == (today.year, today.month):
+        # SAME (year, month) as today: the current month has NOT demonstrably ended
+        # (today is inside it, and no later-month bar proves the boundary), so this
+        # trailing month-end is dropped and we step to the PREVIOUS month-end
+        # position.  month_end_indices yields at most one month-end per calendar
+        # month, so that previous position is necessarily an earlier, completed month
+        # — a single step is enough, no re-check needed.
+
+        # STEP 5 — NOTHING-LEFT GUARD: the dropped month-end was the ONLY one (e.g.
+        # just a partial current month visible), so no completed month-end remains.
+        if len(mei) < 2:
+            return None
+
+        # The previous month-end's timestamp — a strictly-earlier, completed month.
+        surviving_ts = visible[int(mei[-2])].timestamp
+    else:
+        # STRICTLY BEFORE today's (year, month): we are already in a later month, so
+        # this month-end's month has ended — KEEP it (a completed month-end
+        # at-or-before today includes itself when today is in a later month).
+        surviving_ts = last_me_ts
+
+    # STEP 6 — return the surviving month-end's TIMESTAMP (a datetime), NOT a bar
+    # index: callers rank "as of" this instant via trailing_returns_at / the seam.
+    return surviving_ts
 
 
 # ---------------------------------------------------------------------------

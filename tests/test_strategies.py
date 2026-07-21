@@ -51,6 +51,7 @@ from src.strategies.sma_crossover import SMACrossoverStrategy
 from src.strategies.time_series_momentum import (
     TimeSeriesMomentumStrategy,
     month_end_indices,
+    most_recent_completed_month_end,
     trailing_return_series,
 )
 
@@ -902,3 +903,120 @@ def test_trailing_return_series_computes_simple_month_end_returns():
     # PINS the ARITHMETIC: at month-end index 2 the trailing return is
     # close[2]/close[0] - 1 = 120/100 - 1 = 0.20 (simple return, ratio minus 1).
     assert result.iloc[2] == pytest.approx(120.0 / 100.0 - 1.0)
+
+
+# ---------------------------------------------------------------------------
+# 14. most_recent_completed_month_end (live right-edge resolver)
+#
+# These reuse the module-level make_bars helper, which anchors every series at
+# 2024-01-01 UTC and lays down one bar PER CALENDAR DAY.  2024 is a leap year, so
+# the daily indices land as: Jan 1 = index 0 ... Jan 31 = index 30 (31 days);
+# Feb 1 = index 31 ... Feb 29 = index 59 (29 days); Mar 1 = index 60 ...
+# Mar 12 = index 71.  Prices are irrelevant to the resolver (it reads only
+# timestamps), so a flat constant close is used throughout.
+# ---------------------------------------------------------------------------
+
+
+def test_most_recent_completed_month_end_mid_month_drops_partial():
+    """MID-MONTH (no-lookahead crux): today inside March -> the FEB month-end, not any March date."""
+
+    # 72 daily bars: 2024-01-01 (index 0) through 2024-03-12 (index 71).  The visible
+    # month-ends are Jan 31 (index 30), Feb 29 (index 59), and the forced final bar
+    # Mar 12 (index 71) — Mar 12 is NOT a calendar month end, only the mask[-1] flag.
+    bars = make_bars([100.0] * 72)
+
+    # "Today" is the last bar's date, 2024-03-12 — squarely inside an in-progress March.
+    today = datetime(2024, 3, 12, tzinfo=timezone.utc)
+
+    # Resolve the most recent COMPLETED month-end as of today.
+    result = most_recent_completed_month_end(bars, today)
+
+    # The trailing month-end (Mar 12) is in today's (2024, 3), so March has NOT
+    # demonstrably ended and it is DROPPED; the resolver steps back to Feb 29.  This
+    # proves the partial current month never becomes a decision date (the live risk).
+    assert result == datetime(2024, 2, 29, tzinfo=timezone.utc)
+
+
+def test_most_recent_completed_month_end_today_in_later_month_keeps_prior():
+    """TODAY IN A LATER MONTH: today = Mar 1, Feb 29 is the last completed month-end -> Feb 29."""
+
+    # 60 daily bars: 2024-01-01 (index 0) through 2024-02-29 (index 59).  Visible
+    # month-ends are Jan 31 (index 30) and the forced final bar Feb 29 (index 59).
+    bars = make_bars([100.0] * 60)
+
+    # "Today" is 2024-03-01 — we are already in a LATER month than the last month-end,
+    # so February has demonstrably ended.  (Reframed from an exact-on-Feb-29 today:
+    # with no March bar visible, a pure (bars, today) rule cannot know Feb 29 is the
+    # calendar-last day of Feb, so the completed-month case is tested from March 1.)
+    today = datetime(2024, 3, 1, tzinfo=timezone.utc)
+
+    # Resolve as of today.
+    result = most_recent_completed_month_end(bars, today)
+
+    # Feb 29's (2024, 2) is strictly BEFORE today's (2024, 3), so it is a completed
+    # month-end and is KEPT — a completed month-end at-or-before today is returned.
+    assert result == datetime(2024, 2, 29, tzinfo=timezone.utc)
+
+
+def test_most_recent_completed_month_end_before_first_bar_is_none():
+    """TODAY BEFORE THE FIRST BAR: no visible history at all -> None."""
+
+    # 72 daily bars starting 2024-01-01; their exact extent does not matter here.
+    bars = make_bars([100.0] * 72)
+
+    # "Today" precedes the first bar (2023-12-31 < 2024-01-01), so the visible slice
+    # is empty — there is no history from which to resolve any month-end.
+    today = datetime(2023, 12, 31, tzinfo=timezone.utc)
+
+    # An empty visible slice yields None (no completed month-end yet).
+    assert most_recent_completed_month_end(bars, today) is None
+
+
+def test_most_recent_completed_month_end_before_first_completed_month_end_is_none():
+    """TODAY AFTER THE FIRST BAR BUT BEFORE ANY COMPLETED MONTH-END: resolves to None."""
+
+    # 72 daily bars available (through 2024-03-12), but today clips the visible slice
+    # to 2024-01-01 .. 2024-01-15 — only in-progress January is visible.
+    bars = make_bars([100.0] * 72)
+
+    # "Today" is 2024-01-15: after the first bar, but January has not ended and no
+    # earlier month exists.
+    today = datetime(2024, 1, 15, tzinfo=timezone.utc)
+
+    # The only visible month-end is the forced final bar (Jan 15), which is in today's
+    # (2024, 1) and is therefore dropped as an incomplete month; nothing earlier
+    # remains, so the rule resolves to None.  EXPECTED VALUE: None.
+    assert most_recent_completed_month_end(bars, today) is None
+
+
+def test_most_recent_completed_month_end_today_far_future_keeps_last_bar_month_end():
+    """TODAY AFTER THE LAST BAR: all bars historical -> the data's last true month-end is kept."""
+
+    # 72 daily bars: 2024-01-01 through 2024-03-12 (index 71, the forced final bar).
+    bars = make_bars([100.0] * 72)
+
+    # "Today" is far in the future (2030-01-01), so every bar is historical and the
+    # final bar's month (March 2024) has long since ended relative to today.
+    today = datetime(2030, 1, 1, tzinfo=timezone.utc)
+
+    # The last month-end is the final bar, Mar 12 2024.  Its (2024, 3) is strictly
+    # before today's (2030, 1), so the month has ended and it is KEPT — the resolver
+    # returns the data's last month-end, not None.
+    result = most_recent_completed_month_end(bars, today)
+    assert result == datetime(2024, 3, 12, tzinfo=timezone.utc)
+
+
+def test_most_recent_completed_month_end_only_partial_current_month_is_none():
+    """ONLY A PARTIAL CURRENT MONTH visible: an in-progress first month, today inside it -> None."""
+
+    # 10 daily bars: 2024-01-01 through 2024-01-10 — a single, in-progress January and
+    # nothing before it.  (make_bars anchors at Jan 1, so the partial current month
+    # here is January; the property under test is "only a partial current month".)
+    bars = make_bars([100.0] * 10)
+
+    # "Today" is 2024-01-10, inside that same in-progress January.
+    today = datetime(2024, 1, 10, tzinfo=timezone.utc)
+
+    # The only month-end is the forced final bar (Jan 10) in today's month, so it is
+    # dropped as incomplete and nothing earlier remains -> None (no completed month-end).
+    assert most_recent_completed_month_end(bars, today) is None
