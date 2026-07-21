@@ -4,6 +4,66 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 53
+
+**Worked on:**
+- Changed reconcile_to_target to emit all SELL orders before all BUY orders (commit "Emit
+  sells before buys in reconcile_to_target").  The order-building loop is unchanged (same
+  sizing, guards, delta logic, alphabetical iteration); only the final return changed - a
+  stable partition (sells = [o for o in orders if o.side == SELL]; buys = [...BUY]; return
+  sells + buys).  Because the source list is already alphabetical and the comprehensions are
+  stable, sells stay A-Z and buys stay A-Z within each group. [+1 test]
+- Updated one positional test (test_reconcile_closes_dropped_symbol) whose unpacking flipped
+  (the TLT sell now precedes the SPY buy); its asserted CONTENT is unchanged (same SPY BUY 50
+  and TLT SELL 100), only the positions swapped.  Added
+  test_reconcile_emits_all_sells_before_all_buys, which builds a mix (two drops -> sells, two
+  opens -> buys) whose alphabetical interleaving would have put a buy before a sell under the
+  old ordering, and asserts last-sell-index < first-buy-index.  test_reconcile_opens_new_positions
+  was NOT modified and still passes (two buys, alphabetical order preserved).  test_rebalance.py
+  12 -> 13; full non-integration 278 -> 279, all green.
+
+**Why it matters:**
+- This closes the first of the two deferred limitations recorded on Day 49: orders were
+  emitted alphabetically, so on a fully-invested rebalance a BUY could precede the SELL that
+  funds it, and a live broker could reject the buy for insufficient buying power.  Emitting
+  all exits before all entries means the cash freed by sells is available in list order
+  before the buys that need it.  This is a prerequisite for running the rebalance loop
+  unattended, where a buy-before-sell rejection would silently break a rebalance with no one
+  watching to rerun it.
+
+**Architectural note:**
+- HONEST SCOPE: this is an ORDERING fix at the emission level only.  It guarantees sells
+  appear before buys in the returned list; it does NOT guarantee the broker settles the sell
+  cash before the buy executes - that depends on broker fill and settlement sequencing (T+1)
+  and would require the runner to confirm sell fills before submitting buys.  That
+  fill-confirmation sequencing is a separate, future runner-level refinement and remains on
+  the Next-up list.  For the current paper bot with market orders it is sufficient in
+  practice; the docstring states this boundary explicitly rather than overclaiming.
+- The set of orders reconcile_to_target produces is bit-for-bit identical to before (same
+  symbols, sides, quantities); only their sequence changed.  The change was kept to the
+  single return statement so the sizing/guard/delta logic is provably untouched.
+
+**Verification:**
+- uv run pytest -q -m "not integration": 279 passed, 4 deselected (278 + 1 new).  Only
+  src/execution/rebalance.py and tests/test_rebalance.py changed; runner.py and all other
+  files untouched.
+- The 13 tests in test_rebalance.py all green, including the new sells-before-buys property
+  test and the flipped closes_dropped_symbol.
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- Fill-confirmation sequencing at the runner level (confirm sell fills before submitting
+  buys) - the remaining, more-robust half of the buy-funding concern, deferred as a future
+  refinement.
+- The autopilot arc: a live-target function (data as of today -> target weights from the
+  momentum ranking), then a daily runner (wake, check market-open and rebalance-day, compute
+  target, rebalance) with logging and trade notifications, then a scheduler on an always-on
+  host so it runs each market day unattended.
+- Continued edge search: new hypotheses tested one at a time through the harness, accepting
+  each verdict.
+
 ## Day 51
 
 **Worked on:**
