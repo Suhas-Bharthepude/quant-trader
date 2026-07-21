@@ -4,6 +4,72 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 56
+
+**Worked on:**
+- Added most_recent_completed_month_end(bars, today) -> datetime | None below
+  month_end_indices in time_series_momentum.py (the shared grid owner), and the pure
+  live-target module src/execution/live_target.py with LiveRotationConfig (frozen), the
+  LIVE_CONFIG singleton, and live_target_weights(bars_by_symbol, today, reference_symbol,
+  config=LIVE_CONFIG) -> dict[str,float] (commit "Add live-target layer:
+  most_recent_completed_month_end resolver and live_target_weights"). [+12 tests]
+- most_recent_completed_month_end is the LIVE right-edge resolver: it filters to bars
+  at-or-before today, runs the shared month_end_indices, and DROPS the trailing month-end
+  when it is in the same (year, month) as today - so an in-progress current month is never
+  treated as a decision date.  Returns the as-of TIMESTAMP (composes directly with
+  single_date_weights' as_of_date).  6 tests including the no-lookahead crux (today
+  2024-03-12 resolves to 2024-02-29, never a March date).
+- live_target_weights resolves the as-of date via that helper then DELEGATES to
+  single_date_weights - it contains no ranking, no trailing-return math, no 1/top_n.  6
+  tests including a delegation-equivalence assertion (live_target_weights ==
+  single_date_weights called directly at the resolved date) proving no second logic path.
+
+**Why it matters:**
+- This is the whole autopilot bridge from research to execution: given data as of today, it
+  produces the exact target-weight dict reconcile_to_target consumes, with NO adapter (Day 54
+  contract match).  Because live weights are formed through the SAME single_date_weights seam
+  the validated backtest uses, the shipped live strategy provably cannot drift from the
+  validated one - the delegation-equivalence test pins that structurally.
+- The incomplete-month drop closes the STOP-level lookahead risk identified Day 54
+  (month_end_indices flags its final bar unconditionally, so a naive "last grid element" on
+  bars-through-today would rank on a partial-month formation window).  The resolver's
+  one-session lag on the actual month-end day is deliberate and safe - it can only resolve
+  late, never early, and is immaterial for a monthly-rebalanced strategy.
+
+**Architectural note:**
+- Placement: the resolver lives with month_end_indices (shared grid definition, so live and
+  backtest agree on what a month-end IS); the config and live_target_weights live in
+  src/execution/live_target.py (the research-to-execution bridge, beside rebalance.py),
+  importing single_date_weights from research rather than living inside it.
+- LIVE_CONFIG is a frozen dataclass singleton = LiveRotationConfig(lookback=3, top_n=1,
+  price_field="close", hold_when_all_negative=False) - the one config validated as a static
+  whole OOS (fixed Sharpe +0.44, loses to buy-and-hold +0.59).  cost_rate is deliberately
+  ABSENT from the config: it is an execution/accounting concern, not weight formation
+  (verified by grep - cost_rate appears only in explanatory comments, never in code).
+- All functions are pure: no DuckDB, no broker, no printing, no clock.  today is passed in
+  (expected tz-aware UTC to match bar timestamps).  This keeps the layer unit-testable with
+  plain dicts, mirroring reconcile_to_target's pure/IO split.
+
+**Verification:**
+- uv run pytest -q -m "not integration": 292 passed, 4 deselected (was 286; +6 resolver +6
+  live-target).  Greps confirm no ranking/weighting/trailing math and no cost_rate code in
+  live_target.py.  git diff --cached --stat: four files (resolver + its tests, live_target
+  module + its tests).  Docstring-only change to the resolver did not alter behavior (32
+  strategy tests unchanged).
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- The daily runner: wake, check market-open and rebalance-day, call live_target_weights for
+  today's target, feed it to run_rebalance (already built), with logging and trade
+  notifications.  Cost accounting in any live performance report must use cost_rate=0.0010 to
+  stay comparable to the validated verdict.
+- Then a scheduler on an always-on host so the runner fires each market day unattended.
+- Open design question for the runner day: how "is today a rebalance day" is decided live
+  (compare most_recent_completed_month_end against the last acted-on month-end, so the runner
+  rebalances once per new completed month-end and no-ops otherwise).
+
 ## Day 55
 
 **Worked on:**
