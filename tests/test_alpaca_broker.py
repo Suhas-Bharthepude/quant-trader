@@ -14,17 +14,35 @@ Skip in CI by filtering out the integration mark:
     pytest -m "not integration"
 """
 
+# datetime + timezone build the fixed, timezone-aware timestamp our fake Order
+# hands back as submitted_at (mirroring alpaca's tz-aware datetimes).
+from datetime import datetime, timezone
+
 # pytest is the test runner.  The mark decorator is used to tag this test
 # so CI pipelines can skip it without modifying this file.
 import pytest
+
+# alpaca's REAL request classes — submit_order builds one of these before the
+# broker's submit call, so our fake captures a genuine instance and the tests
+# assert on it via isinstance.  These are the ONLY alpaca imports in this file.
+from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
 
 # The class under test.  We import it through the package so the module
 # boundary is exercised (src.brokers.base is imported inside alpaca_broker).
 from src.brokers.alpaca_broker import AlpacaBroker
 
 # Also import our base types so we can assert on the returned dataclasses
-# without needing alpaca-py types in this test file.
-from src.brokers.base import AccountSnapshot, OrderResult, PositionSnapshot
+# without needing alpaca-py types in this test file.  OrderRequest is what the
+# submit tests build; OrderSide/OrderType/TimeInForce are the enums they use.
+from src.brokers.base import (
+    AccountSnapshot,
+    OrderRequest,
+    OrderResult,
+    OrderSide,
+    OrderType,
+    PositionSnapshot,
+    TimeInForce,
+)
 
 
 @pytest.mark.integration
@@ -198,6 +216,52 @@ class _FakePosition:
         self.unrealized_pl = unrealized_pl
 
 
+class _FakeOrder:
+    """Minimal stand-in for an alpaca-py Order model returned by submit_order().
+
+    Alpaca returns id as a UUID and every numeric field (qty, filled_qty,
+    filled_avg_price, limit_price) as a STRING or None; side/order_type/status are
+    str-Enums exposing .value. We mirror all of that here so the test genuinely
+    exercises AlpacaBroker._to_order_result's str->int/float and .value extractions.
+    """
+
+    # __init__ stores exactly the attributes _to_order_result reads off an Order.
+    def __init__(
+        self,
+        order_id: str,               # str or UUID; _to_order_result does str(id)
+        symbol: str,                 # plain str ticker, passed through unchanged
+        qty: str,                    # shares as a string (e.g. "10"); int(order.qty) parses it
+        side: str,                   # "buy"/"sell"; wrapped in _FakeSide for .value
+        order_type: str,             # "market"/"limit"; wrapped in _FakeSide for .value
+        status: str,                 # "new"/"accepted"/...; wrapped in _FakeSide for .value
+        submitted_at: datetime,      # tz-aware datetime, passed through as-is
+        filled_qty: "str | None" = None,        # None until (partially) filled
+        filled_avg_price: "str | None" = None,  # None until (partially) filled
+        limit_price: "str | None" = None,       # None for market; string for limit
+    ) -> None:
+        # Save the id verbatim; _to_order_result calls str() on it.
+        self.id = order_id
+        # Save the symbol verbatim (passed through unchanged by the conversion).
+        self.symbol = symbol
+        # Save qty as a string; _to_order_result will int() it.
+        self.qty = qty
+        # Wrap the side string so order.side.value works like the real str-Enum.
+        self.side = _FakeSide(side)
+        # Wrap the order_type string so order.order_type.value works (NOTE: the
+        # conversion reads order_type, NOT type — mirror that attribute name here).
+        self.order_type = _FakeSide(order_type)
+        # Wrap the status string so order.status.value works like the real str-Enum.
+        self.status = _FakeSide(status)
+        # Save the timezone-aware datetime; the conversion passes it through as-is.
+        self.submitted_at = submitted_at
+        # Save filled_qty as a string or None; converted to int only when present.
+        self.filled_qty = filled_qty
+        # Save filled_avg_price as a string or None; converted to float when present.
+        self.filled_avg_price = filled_avg_price
+        # Save limit_price as a string or None; converted to float when present.
+        self.limit_price = limit_price
+
+
 class _FakeTradingClient:
     """Fake TradingClient: accepts the real constructor args, makes no network call.
 
@@ -214,6 +278,15 @@ class _FakeTradingClient:
     # empty state; each position test sets it explicitly to avoid cross-test leakage.
     positions: "list[_FakePosition]" = []
 
+    # Class-level slot capturing the alpaca request object submit_order was handed,
+    # so a test can assert the OrderRequest->alpaca mapping. None until a submit runs;
+    # each submit test resets it explicitly to avoid cross-test leakage.
+    captured_order_request: object = None
+
+    # Class-level slot for the fake Order submit_order should return, standing in for
+    # the alpaca Order that POST /v2/orders yields. Set by each submit test.
+    order_to_return: object = None
+
     # __init__ mirrors the real signature (api_key, api_secret, paper=...) and
     # ignores every argument — no client is created, no endpoint is contacted.
     def __init__(self, api_key: str, api_secret: str, paper: bool = True) -> None:
@@ -229,6 +302,15 @@ class _FakeTradingClient:
     def get_all_positions(self) -> "list[_FakePosition]":
         # Hand back whatever positions the test assigned to the class attribute.
         return type(self).positions
+
+    # submit_order() stands in for POST /v2/orders: it receives the REAL alpaca
+    # Market/LimitOrderRequest that AlpacaBroker.submit_order built, captures it for
+    # mapping assertions, and returns the pre-set fake Order for parse assertions.
+    def submit_order(self, order_data: object) -> object:
+        # Capture the genuine alpaca request instance so the test can inspect it.
+        type(self).captured_order_request = order_data
+        # Hand back whatever fake Order the test assigned — no network involved.
+        return type(self).order_to_return
 
 
 class _FakeDataClient:
@@ -431,3 +513,170 @@ def test_get_positions_empty_account_returns_empty_list_hermetic(monkeypatch) ->
     # Must be an actual empty list — not None, no exception.
     assert positions == []
     assert isinstance(positions, list)
+
+
+def test_submit_market_order_maps_and_parses_hermetic(monkeypatch) -> None:
+    """submit_order maps a MARKET OrderRequest to a MarketOrderRequest and parses back.
+
+    Pins BOTH halves offline: (1) the mapping — our OrderRequest becomes a
+    MarketOrderRequest with the right symbol/qty/side/TIF and NO limit_price field;
+    (2) the parse — the returned fake Order becomes an OrderResult with typed fields.
+    No network call, no credentials.
+    """
+    # Reset both submit-related class attrs so no prior test's values leak in.
+    _FakeTradingClient.captured_order_request = None
+    _FakeTradingClient.order_to_return = None
+
+    # A minimal paper account so _build_broker_with_fake_account can construct cleanly;
+    # submit_order never reads it, but the builder sets the account class attr.
+    account = _FakeAccount(
+        account_number="PA3XYZABC",   # paper account, irrelevant to submit_order
+        buying_power="94321.50",      # unused by submit_order
+        cash="88000.00",             # unused by submit_order
+        portfolio_value="102345.67",  # unused by submit_order
+    )
+
+    # The order we want to place: buy 10 SPY at market, good for the day.
+    request = OrderRequest(
+        symbol="SPY",                    # ticker to trade
+        qty=10,                          # whole shares (an int on our side)
+        side=OrderSide.BUY,              # buying to open a long
+        order_type=OrderType.MARKET,     # market => builds MarketOrderRequest
+        time_in_force=TimeInForce.DAY,   # cancel at close if unfilled
+    )
+
+    # The fake Order the broker's submit_order call should return, in its initial
+    # "new" state with no fills yet — string qty, None fill fields, None limit_price.
+    _FakeTradingClient.order_to_return = _FakeOrder(
+        order_id="abc-123",                          # UUID-like id; str() leaves it unchanged
+        symbol="SPY",                                # echoes the requested symbol
+        qty="10",                                    # STRING, mirroring the real API
+        side="buy",                                  # str-Enum value the API returns
+        order_type="market",                         # str-Enum value (read via .order_type)
+        status="new",                                # initial broker status
+        submitted_at=datetime(2026, 7, 20, 14, 30, tzinfo=timezone.utc),  # fixed tz-aware time
+        filled_qty=None,                             # not filled yet
+        filled_avg_price=None,                       # not filled yet
+        limit_price=None,                            # market order => no limit price
+    )
+
+    # Build the broker with faked SDK clients (also sets the account class attr).
+    broker = _build_broker_with_fake_account(monkeypatch, account)
+    # Exercise submit_order — this calls the fake TradingClient.submit_order().
+    result = broker.submit_order(request)
+
+    # --- Assert the MAPPING: our OrderRequest became the right alpaca request. ---
+    captured = _FakeTradingClient.captured_order_request
+    # A market order must build a MarketOrderRequest, not a LimitOrderRequest.
+    assert isinstance(captured, MarketOrderRequest)
+    # The symbol is forwarded verbatim.
+    assert captured.symbol == "SPY"
+    # qty round-trips by value; it is a float on the request (pydantic coerces int 10).
+    assert captured.qty == 10
+    # side maps via .value — the captured request holds alpaca's "buy" side.
+    assert captured.side.value == "buy"
+    # time_in_force maps via .value — "day".
+    assert captured.time_in_force.value == "day"
+    # MarketOrderRequest has NO limit_price field at all — accessing it would raise
+    # AttributeError, so assert its ABSENCE rather than that it is None.
+    assert not hasattr(captured, "limit_price")
+
+    # --- Assert the PARSE: the fake Order became a correct OrderResult. ---
+    # The return type must be our dataclass, not a raw alpaca object.
+    assert isinstance(result, OrderResult)
+    # order_id is str() of the fake id — unchanged here.
+    assert result.order_id == "abc-123"
+    # symbol is passed through verbatim.
+    assert result.symbol == "SPY"
+    # qty is the string "10" converted to a genuine int 10.
+    assert result.qty == 10
+    assert type(result.qty) is int
+    # side round-trips through our enum via order.side.value.
+    assert result.side == OrderSide.BUY
+    # order_type round-trips through our enum via order.order_type.value.
+    assert result.order_type == OrderType.MARKET
+    # status is stored as the plain string from order.status.value.
+    assert result.status == "new"
+    # An unfilled market order has no fill fields and no limit price.
+    assert result.filled_qty is None
+    assert result.filled_avg_price is None
+    assert result.limit_price is None
+
+
+def test_submit_limit_order_maps_and_parses_hermetic(monkeypatch) -> None:
+    """submit_order maps a LIMIT OrderRequest to a LimitOrderRequest (WITH limit_price).
+
+    Mirror of the market test for the limit branch: the mapping must carry the
+    limit_price, and the returned Order must parse into an OrderResult whose
+    limit_price is a genuine float. No network call, no credentials.
+    """
+    # Reset both submit-related class attrs so no prior test's values leak in.
+    _FakeTradingClient.captured_order_request = None
+    _FakeTradingClient.order_to_return = None
+
+    # A minimal paper account so the builder can construct the broker.
+    account = _FakeAccount(
+        account_number="PA3XYZABC",   # paper account, irrelevant to submit_order
+        buying_power="94321.50",      # unused
+        cash="88000.00",             # unused
+        portfolio_value="102345.67",  # unused
+    )
+
+    # The order we want to place: sell 5 TLT at a limit of 88.50, good till cancelled.
+    request = OrderRequest(
+        symbol="TLT",                    # ticker to trade
+        qty=5,                           # whole shares (an int on our side)
+        side=OrderSide.SELL,             # selling to open a short / exit a long
+        order_type=OrderType.LIMIT,      # limit => builds LimitOrderRequest
+        time_in_force=TimeInForce.GTC,   # stays open across sessions until filled
+        limit_price=88.50,               # only fill at 88.50 or better
+    )
+
+    # The fake Order the broker's submit_order call should return — string fields,
+    # including the echoed limit_price as a string, exactly as the real API sends it.
+    _FakeTradingClient.order_to_return = _FakeOrder(
+        order_id="def-456",                          # UUID-like id
+        symbol="TLT",                                # echoes the requested symbol
+        qty="5",                                     # STRING, mirroring the real API
+        side="sell",                                 # str-Enum value the API returns
+        order_type="limit",                          # str-Enum value (read via .order_type)
+        status="new",                                # initial broker status
+        submitted_at=datetime(2026, 7, 20, 14, 30, tzinfo=timezone.utc),  # fixed tz-aware time
+        limit_price="88.50",                         # limit order => echoed limit price string
+    )
+
+    # Build the broker with faked SDK clients (also sets the account class attr).
+    broker = _build_broker_with_fake_account(monkeypatch, account)
+    # Exercise submit_order — this calls the fake TradingClient.submit_order().
+    result = broker.submit_order(request)
+
+    # --- Assert the MAPPING: our OrderRequest became the right alpaca request. ---
+    captured = _FakeTradingClient.captured_order_request
+    # A limit order must build a LimitOrderRequest, not a MarketOrderRequest.
+    assert isinstance(captured, LimitOrderRequest)
+    # The symbol is forwarded verbatim.
+    assert captured.symbol == "TLT"
+    # qty round-trips by value; it is a float on the request (pydantic coerces int 5).
+    assert captured.qty == 5
+    # side maps via .value — "sell".
+    assert captured.side.value == "sell"
+    # time_in_force maps via .value — "gtc".
+    assert captured.time_in_force.value == "gtc"
+    # LimitOrderRequest DOES carry limit_price — assert the value forwarded correctly.
+    assert captured.limit_price == 88.50
+
+    # --- Assert the PARSE: the fake Order became a correct OrderResult. ---
+    # The return type must be our dataclass, not a raw alpaca object.
+    assert isinstance(result, OrderResult)
+    # order_type round-trips through our enum via order.order_type.value.
+    assert result.order_type == OrderType.LIMIT
+    # side round-trips through our enum via order.side.value.
+    assert result.side == OrderSide.SELL
+    # limit_price is the string "88.50" converted to a genuine float 88.50.
+    assert result.limit_price == 88.50
+    assert type(result.limit_price) is float
+    # qty is the string "5" converted to a genuine int 5.
+    assert result.qty == 5
+    assert type(result.qty) is int
+    # status is stored as the plain string from order.status.value.
+    assert result.status == "new"
