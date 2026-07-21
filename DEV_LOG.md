@@ -4,6 +4,68 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 57
+
+**Worked on:**
+- Added the daily runner src/execution/daily_runner.py: a PURE decision core
+  decide_rebalance(today, reference_bars, last_acted_month_end, is_market_open) ->
+  RebalanceDecision, and a thin IO shell run_daily(broker, bars_by_symbol, today,
+  reference_symbol="SPY", state_path=logs/rebalance_state.json, config=LIVE_CONFIG,
+  is_open_fn=None) (commit "Add daily runner: idempotent decide_rebalance + run_daily
+  orchestration"). [+10 tests]
+- decide_rebalance applies two independent gates: GATE 2 (market open, checked first) and
+  GATE 1 (a new completed month-end since last_acted, via most_recent_completed_month_end).
+  It returns a frozen RebalanceDecision(should_act, as_of_month_end, reason).  run_daily
+  orchestrates only: it reads state, evaluates the injected is_open_fn (default
+  broker.is_market_open()), calls decide_rebalance, and on should_act calls
+  live_target_weights then run_rebalance - reimplementing no weight or order logic.
+- The market-open gate is an INJECTED callable (is_open_fn) defaulting to
+  broker.is_market_open(), so a trading-day calendar check can later replace it without
+  touching the pure decide_rebalance.  State is a small JSON file
+  {"last_acted_month_end": iso}, read at the top of each run and written ONLY after
+  run_rebalance returns without raising (reusing the logs/ Path pattern from
+  scripts/limit_order.py).
+
+**Why it matters:**
+- This is the autonomous entry point - the piece that makes the bot a bot.  It is
+  idempotent (safe to run every day; acts at most once per new completed month-end),
+  no-ops cleanly on a closed market or an already-acted month-end, and catches up exactly
+  once if the host was down across a month-end.  Ten hermetic tests (broker and clock
+  injected, no live account, no real DuckDB) pin these properties, including the two that
+  protect an unattended run: STATE IS NOT WRITTEN ON A FAILED REBALANCE (a mid-rebalance
+  broker rejection propagates and the state file is never created, so the month is retried)
+  and HOST-DOWN-CATCHES-UP (a stale last_acted resolves to the later month-end and acts
+  once).
+
+**Architectural note:**
+- Pure/IO split mirrors live_target_weights (pure) vs run_rebalance (IO): decide_rebalance
+  touches no clock, broker, or filesystem; run_daily is the only I/O.  Placement in
+  src/execution/ beside runner.py/rebalance.py (the orchestration layer).  Verified by
+  grep: no weight/order logic duplicated, no cost_rate in code (only a docstring noting its
+  deliberate absence), no datetime.now/utcnow (today is passed in).
+- HONEST SUCCESS BAR: "success" = run_rebalance returns without raising, i.e. the broker
+  ACCEPTED all orders ("new" status) - NOT that they filled.  Fill confirmation is a
+  documented later refinement (the same deferred fill-confirmation sequencing noted Day
+  53).  This is stated in the module docstring rather than hidden.
+
+**Verification:**
+- uv run pytest -q -m "not integration": 302 passed, 4 deselected (was 292; +10).  New fake
+  _RunnerFakeBroker closes the two Day-57 inspection gaps (canned is_market_open,
+  raise_on_nth submit failure).  git status --porcelain: only the two new files.
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- Logging + trade notifications so an unattended run leaves an auditable record and reports
+  what it did (or why it no-oped).  Any live performance report must use cost_rate=0.0010 to
+  stay comparable to the validated verdict.
+- A scheduler on an always-on host firing run_daily each market day.  Operational note: the
+  runner loads bars from DuckDB, so the scheduler must run the ingest through today BEFORE
+  run_daily each day, or the resolver sees stale bars.
+- Deferred: fill-confirmation sequencing (confirm sell fills before submitting buys, and
+  confirm all fills before writing state) - the more-robust success bar.
+
 ## Day 56
 
 **Worked on:**
