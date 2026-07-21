@@ -4,6 +4,88 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 47
+
+**Worked on:**
+- Added get_positions to the broker (commit "Add get_positions to broker contract and
+  AlpacaBroker"): a new PositionSnapshot dataclass + a new abstract method on the Broker
+  ABC in src/brokers/base.py, the AlpacaBroker implementation (a _to_position_snapshot
+  helper + get_positions) in src/brokers/alpaca_broker.py, and 2 hermetic tests in
+  tests/test_alpaca_broker.py.  All read-only - no order submission. [+2 tests]
+- 262 non-integration tests + 2 new = 264 passing under the CI selection (uv run pytest -q
+  -m "not integration"), 4 integration tests deselected.  Additions-only where it counts:
+  base.py 28/0, alpaca_broker.py 73/0 (zero deletions - no existing method/dataclass
+  removed); the test file's single deletion is the import line rewritten in place (added
+  PositionSnapshot), not a touched test body.
+
+**Why it matters:**
+- This is the first order-path increment and the first execution-arc change to touch the
+  broker ABC (base.py), which is shared contract code - so backward compatibility was the
+  live risk.  Adding an abstract method to an ABC is NOT silently backward-compatible:
+  every concrete Broker subclass must implement it or raise TypeError at instantiation.
+  Read-only inspection confirmed AlpacaBroker is the ONLY concrete Broker subclass in the
+  repo (the test fakes are fakes of the Alpaca SDK clients, not Broker subclasses), so
+  adding the abstract method AND implementing it in AlpacaBroker in the same commit keeps
+  instantiation working.  The green suite is the proof: the hermetic tests construct
+  AlpacaBroker and pass, which they could not do if the enlarged abstract contract were
+  unsatisfied.  This completes the READ surface of the broker (account balances via
+  get_account, open positions via get_positions) - the full "observe account state" half
+  of execution, built and hermetically tested before any "act on it" code.
+
+**Architectural note:**
+- THE POSITIONSNAPSHOT SHAPE + qty CONVENTION (a locked decision): PositionSnapshot carries
+  symbol, qty (int), side (str), market_value, avg_entry_price, unrealized_pl.  Alpaca's
+  Position reports a POSITIVE qty plus a separate side ("long"/"short"), so the convention
+  was locked as positive whole-share qty + a side string carrying direction - mirroring
+  OrderResult's positive-qty + side convention, so downstream code reads ONE mental model,
+  not two.  qty is int (int(float(position.qty)) - float-parse first so "10.0" parses, then
+  int) under the whole-shares assumption this codebase already uses (it never places
+  fractional orders).  market_value and unrealized_pl are Optional[str] on Alpaca and are
+  guarded (float(x) if x is not None else 0.0) so downstream risk code never sees None;
+  avg_entry_price is always present.
+- THE CONVERSION + EMPTY CASE: _to_position_snapshot mirrors _to_order_result exactly (call
+  the SDK, convert Alpaca's string fields, return our dataclass, no alpaca types leaking
+  out), and get_positions mirrors list_recent_orders (a list comprehension over the SDK
+  list).  The empty-account case is the one explicitly tested correctness point: a
+  flat/new paper account has NO positions, so get_all_positions() returns [] and
+  get_positions() surfaces [] cleanly (never None, no crash) - and this is the COMMON real
+  state, since the paper account is currently flat, so every get_positions call before any
+  order will return [].
+- HERMETIC MOCKING (same pattern, extended): the tests extend the Day-46 fake - a
+  _FakePosition with STRING money/qty fields (mirroring the real API so the str->int/float
+  conversions are genuinely exercised) and a _FakeSide exposing .value (mirroring the
+  PositionSide str-Enum), plus a get_all_positions() on _FakeTradingClient returning a
+  class-attr list.  Both tests set that class attr EXPLICITLY (to [spy, tlt] and to []) to
+  prevent class-attribute leakage between tests.
+
+**Verification:**
+- uv run pytest -q -m "not integration": 264 passed, 4 deselected (262 baseline unchanged
+  + 2 new).  No network, no credentials.  git status --porcelain: only the three permitted
+  files.  git diff --numstat: base.py 28/0, alpaca_broker.py 73/0, test file 154/1 (the 1
+  deletion is the rewritten import line).  AlpacaBroker still instantiates (the passing
+  hermetic tests prove the enlarged ABC contract is satisfied).
+- The 2 tests: get_positions parses two faked holdings into a list[PositionSnapshot]
+  (str->int qty, str->float money, side.value extraction, a negative unrealized_pl);
+  get_positions returns [] on a flat account.
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- The write path, first increment: a hermetic mocked test of submit_order (mapping our
+  OrderRequest -> the alpaca MarketOrderRequest/LimitOrderRequest, parsing the returned
+  Order via _to_order_result) with NO live submission in CI.  This is the increment where
+  the mocking discipline is most load-bearing - a real submit_order places an actual paper
+  order, so the fake must intercept it completely.
+- Then: wiring strategy target positions to orders behind the paper-only guard (its own
+  increment).
+- Then the writeup/polish arc: a README presenting the TSMOM and rotation verdicts and the
+  overfitting-tax methodology as the project's distinctive contribution.
+- Housekeeping (non-urgent): backfill the [fill in] time-spent placeholders in the
+  Day 29-39 entries.
+
+**Time spent:** 20 minutes
+
 ## Day 46
 
 **Worked on:**
