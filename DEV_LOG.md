@@ -4,6 +4,74 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 59
+
+**Worked on:**
+- Added the autonomous entry point scripts/run_daily.py (a thin assembler), the pure
+  stale-bars freshness gate src/data/freshness.py, and the operator runbook
+  docs/AUTOPILOT.md (commit "Add autonomous entry point: run_daily.py assembler +
+  stale-bars freshness gate + autopilot runbook"). [+6 tests]
+- src/data/freshness.py: pure stale_symbols(last_bar_dates, today, max_staleness_days) and
+  all_current(...) - strictly-greater-than staleness, sorted most-stale first,
+  (today - last).days matching data_health.days_since (inlined, not imported, to avoid a
+  src->scripts layering violation).  6 hermetic tests (all-fresh, one-stale,
+  boundary-not-stale, sort order, weekend-gap realism, empty-input).  This is the one piece
+  of real logic today; the script stays thin.
+- scripts/run_daily.py: builds AlpacaBroker.from_env() (paper-only via three guards),
+  verifies the paper account, resolves SPY + etf_basket, loads bars through date.today(),
+  runs the freshness gate and REFUSES to trade (exit 1) if any symbol is stale, reads the
+  only clock (datetime.now(timezone.utc)) at this impure edge, then calls run_daily with a
+  logging-only _log_notifier wired into the Day-58 notify_fn seam.  Exit 0 on a clean run
+  including a no-op; exit 1 on bad keys, empty/missing symbols, stale bars, or a failed
+  rebalance.
+
+**Why it matters:**
+- This is the LAST piece of the autopilot arc: the bot can now run unattended.  A scheduler
+  invokes update_universe.py then run_daily.py each market day; run_daily is idempotent and
+  the freshness gate guarantees it never ranks or trades on bars that are behind (the
+  ingest-then-run ordering is enforced by the gate, not just documented).  Meaningful exit
+  codes let a scheduler surface failures.
+- All decision/weight/order logic stays in tested src/ modules; the script is a pure
+  assembler (verified by grep - no ranking/weighting/reconcile logic in it) and secrets come
+  from .env only (verified - no hard-coded keys; .env is git-ignored, only .env.example is
+  tracked).
+
+**Architectural note:**
+- The freshness gate lives in src/ (pure, tested) rather than the script so the
+  safety-critical staleness logic is unit-tested without a DB or clock; the script only
+  sequences it.  Logging handlers are configured at the entry point (basicConfig + a
+  logs/daily_runner.log file handler); library modules keep bare getLogger.  The notifier is
+  logging-only today (no new dependency - neither requests nor httpx is a direct
+  dependency); a real Slack/email backend via stdlib urllib behind the same notify_fn seam
+  is a documented future option in docs/AUTOPILOT.md.
+- The live script is INTEGRATION-only (it touches the real broker + DuckDB) and is not a CI
+  test; its logic-bearing dependency (freshness) is fully hermetic.  A true end-to-end check
+  is a manual dry-run against paper (the Day-51 rebalance_smoke.py pattern).
+- HONEST NOTE (recorded in docs/AUTOPILOT.md): the bot runs the validated rotation config
+  (lookback=3, top_n=1), whose OOS Sharpe +0.44 LOSES to buy-and-hold +0.59 after costs.  It
+  is a demonstration of a complete research-to-unattended-execution pipeline, not a
+  profitable strategy.
+
+**Verification:**
+- uv run pytest -q -m "not integration": 320 passed, 4 deselected (was 314; +6 freshness).
+  run_daily.py import-checks clean (has main + _log_notifier).  Greps confirm no
+  decision/weight logic and no hard-coded secrets in the script.  git status --porcelain
+  before staging: docs/, scripts/run_daily.py, src/data/freshness.py, tests/test_freshness.py.
+
+**Blocked on:**
+- Nothing.  The autopilot arc is COMPLETE: live-target (56), daily runner (57),
+  logging+notify (58), entry point + freshness gate + runbook (59).
+
+**Next up:**
+- Install the scheduler on an always-on host per docs/AUTOPILOT.md (cron or systemd running
+  update_universe.py && run_daily.py on weekdays after US close) - an ops step, not code.
+- Optional: a real notifier (stdlib urllib webhook) into the notify_fn seam; a manual paper
+  dry-run of run_daily.py end-to-end.
+- Then the writeup/polish arc (the README already presents the honest verdicts) and the
+  disciplined edge search (new hypotheses one at a time through the overfitting-tax harness).
+- Deferred: fill-confirmation sequencing (confirm fills before writing state) - the
+  more-robust success bar.
+
 ## Day 58
 
 **Worked on:**
