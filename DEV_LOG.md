@@ -4,6 +4,66 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 58
+
+**Worked on:**
+- Added src/execution/notify.py (frozen Notification payload, NotifyPolicy enum with pure
+  should_notify, and format_notification one-line renderer) and wired stdlib logging plus
+  an injected notifier into run_daily (commit "Add run_daily logging and injected notifier
+  seam (fire-before-raise, no masking)"). [+12 tests]
+- run_daily gained two appended params: notify_fn (Callable[[Notification], None] | None,
+  default None) and notify_policy (default ACTED_AND_FAILED).  A private _emit(...) logs
+  every outcome (acted=INFO, no-op=INFO, failed=log.exception at ERROR with traceback) and
+  fires the notifier only when injected AND should_notify(outcome, policy).  notify.py has
+  NO delivery backend: no HTTP, no secrets, no env reads, no print (verified by grep) - the
+  real notifier is the caller's injected callable, mirroring the is_open_fn seam.
+
+**Why it matters:**
+- An unattended run is now observable: each day emits a structured one-line record of what
+  it did (acted with the submitted orders and target, or which no-op reason, or a failure),
+  and by default the notifier fires only on acted + failed so ~20 monthly no-op days do not
+  spam.  This is the auditable trail an unsupervised bot needs.
+- Three properties protect the operator, each pinned by a test: a FAILED rebalance is logged
+  (with traceback) and notified BEFORE the exception propagates (an unattended failure is
+  visible); a RAISING notifier on an acted run cannot break the trade (the rebalance result
+  stands, state is written, the delivery failure is logged separately as "notifier failed");
+  and a raising notifier on the failed path does not mask the ORIGINAL rebalance error (the
+  propagated exception is the real one, not the notifier's).
+
+**Architectural note:**
+- decide_rebalance stays BYTE-FOR-BYTE unchanged (verified: the diff shows no lines inside
+  its body) - logging/notification is strictly an IO-shell concern in run_daily.  The Day-57
+  crux is preserved: the failure path logs+notifies then bare-raises, and _write_state still
+  runs strictly AFTER a successful run_rebalance return, so state is never written on a
+  failed rebalance.
+- The notifier delivery is wrapped in its own try/except inside _emit: a raising notifier is
+  caught, logged as a separate ERROR, and swallowed - it can never propagate or mask the
+  caller's result or exception.  A notification-channel outage must not affect trading.
+- HONEST NOTE: on the failure path the Notification.reason renders str(exception) (so the
+  line reads "FAILED: "), a deliberate reconciliation so the human-facing summary carries the
+  failure detail rather than the stale decision reason.  logging configures no handlers (the
+  caller/scheduler owns that), matching cli_common's idiom.
+
+**Verification:**
+- uv run pytest -q -m "not integration": 314 passed, 4 deselected (was 302; +6 notify unit
+  tests, +6 run_daily observability tests).  Greps confirm no print and no network/secrets
+  code in notify.py (only a docstring noting their absence), and decide_rebalance unchanged.
+  git status --porcelain: two modified (daily_runner.py, test_daily_runner.py) + two new
+  (notify.py, test_notify.py).
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- The scheduler on an always-on host firing run_daily each market day, wiring the real
+  notifier (env-configured Slack/email) into the notify_fn seam.  OPERATIONAL ORDER: the
+  scheduler must run the ingest through today BEFORE run_daily each day, or the resolver
+  ranks on stale bars.  Any live performance report must use cost_rate=0.0010 to match the
+  validated verdict.
+- Deferred: fill-confirmation sequencing (confirm sell fills before buys, and confirm all
+  fills before writing state) - the more-robust success bar than "run_rebalance returned
+  without raising".
+
 ## Day 57
 
 **Worked on:**
