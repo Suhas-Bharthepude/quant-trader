@@ -4,6 +4,87 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 48
+
+**Worked on:**
+- Added 2 hermetic, mocked tests to tests/test_alpaca_broker.py (commit "Add hermetic
+  mocked tests for AlpacaBroker submit_order mapping and parse"): a market-order test and a
+  limit-order test.  Each proves BOTH directions of the translation - our OrderRequest maps
+  to the correct alpaca request object (MarketOrderRequest / LimitOrderRequest), and the
+  returned alpaca Order parses back through _to_order_result into a correct OrderResult -
+  with NO live submission, NO network, NO credentials. [+2 tests]
+- Test-only, additions-heavy: 251 insertions / 2 deletions in tests/test_alpaca_broker.py
+  (the 2 deletions are the in-place import-block rewrite; no existing test body changed).
+  No src/ file touched - submit_order was already correct (inspection found no bug).
+- 264 non-integration tests + 2 new = 266 passing under the CI selection (uv run pytest -q
+  -m "not integration"), 4 integration tests deselected.
+
+**Why it matters:**
+- This was the highest-stakes mocking day of the arc.  Every prior hermetic test called
+  READ methods, where a mock leak would at worst be a harmless read; submit_order is the
+  first method whose real invocation PLACES AN ORDER (POST /v2/orders).  The safety rests
+  on the same namespace monkeypatch used all arc: _build_broker_with_fake_account patches
+  src.brokers.alpaca_broker.TradingClient BEFORE __init__, so self._trading is the fake and
+  submit_order CANNOT reach the network - a real submission was never possible in these
+  tests.  With this, the broker's ENTIRE surface is now hermetically covered: the read side
+  (get_account, get_positions) and the write TRANSLATION side (submit_order's request
+  mapping + response parse), all offline in CI.  What remains deliberately untested-in-CI
+  is a live submission itself (that is the integration path's job, plus eventual manual
+  paper checks).
+
+**Architectural note:**
+- THE CAPTURE TECHNIQUE (the new wrinkle vs the read-path tests): the read tests only faked
+  a RETURN value; the write test must also assert the OUTBOUND mapping.  The fake
+  _FakeTradingClient.submit_order stores the alpaca request it is handed
+  (captured_order_request) and returns a pre-set fake Order (order_to_return).  Because
+  AlpacaBroker.submit_order builds a REAL MarketOrderRequest/LimitOrderRequest before the
+  intercepted call, the captured object is a genuine alpaca request instance - so the test
+  asserts isinstance(captured, MarketOrderRequest/LimitOrderRequest) and reads its fields to
+  prove the mapping (symbol, qty, side.value, time_in_force.value, and the limit price on
+  the limit branch).  Both submit tests reset captured_order_request and order_to_return
+  explicitly to prevent class-attribute leakage.
+- TWO SDK ASSERTION TRAPS (documented so they are not re-hit): (1) MarketOrderRequest has NO
+  limit_price field at all - accessing it raises AttributeError, not None - so the market
+  test asserts `not hasattr(captured, "limit_price")`, never `is None`.  (2) The captured
+  request's .qty is a FLOAT (pydantic coerces our int 10 -> 10.0, since alpaca
+  OrderRequest.qty is Optional[float]) - so the mapping asserts qty by VALUE equality
+  (captured.qty == 10), while our RETURNED OrderResult.qty is a genuine int (via
+  int(order.qty)) and asserts type is int.  The two qty checks are deliberately different
+  because they are on two different objects (alpaca's request vs our dataclass).
+- WHAT THE PARSE PROVES: the fake Order carries string fields and .value-bearing enum
+  stand-ins (reusing _FakeSide), with order_type NOT type (since _to_order_result reads
+  order.order_type.value).  The parse asserts status == "new" and
+  filled_qty/filled_avg_price == None - the real async-fill behavior, since a market order
+  is not filled the instant it is accepted.
+
+**Verification:**
+- uv run pytest -q -m "not integration": 266 passed, 4 deselected (264 baseline unchanged +
+  2 new).  No network, no credentials.  git diff --numstat tests/test_alpaca_broker.py:
+  251/2 (the 2 deletions are the in-place import rewrite; grep of deleted lines confirms
+  only the import block changed, no test body).  No src/ file in the diff.
+- The 2 tests: market OrderRequest -> MarketOrderRequest (right fields, no limit_price attr)
+  parsing to an OrderResult (qty int, status "new", fills None); limit OrderRequest ->
+  LimitOrderRequest (WITH limit_price) parsing to an OrderResult (limit_price float,
+  order_type LIMIT).
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- The increment that turns the tested toolkit into a bot: wire the strategy's target
+  positions into submit_order calls behind the paper-only guard - a rebalance step combining
+  get_positions (where am I?), the strategy signal (where do I want to be?), and
+  submit_order (how do I get there?), gated by verify_paper_account() so it can only ever
+  act on paper.  This is where the paper guard stops being a tested-in-isolation property
+  and becomes a load-bearing gate at a real call site, so it wants the same care: guard
+  called before any order, wiring tested hermetically before anything runs live.
+- Then the writeup/polish arc: a README presenting the TSMOM and rotation verdicts and the
+  overfitting-tax methodology as the project's distinctive contribution.
+- Housekeeping (non-urgent): backfill the [fill in] time-spent placeholders in the
+  Day 29-39 entries.
+
+**Time spent:** 20 minutes
+
 ## Day 47
 
 **Worked on:**
