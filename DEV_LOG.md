@@ -4,6 +4,56 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 60
+
+**Worked on:**
+- Added src/execution/email_notify.py: a stdlib SMTP (Gmail, smtp.gmail.com:587, STARTTLS)
+  email notifier wired into the Day-58 notify_fn seam, and composed it into
+  scripts/run_daily.py alongside the existing logging notifier (commit "Add stdlib email
+  notifier (Gmail SMTP) behind injectable transport; wire into run_daily"). [+6 tests]
+- build_email(notification, sender, recipient) builds a plain-text EmailMessage with an
+  outcome-encoding subject ("[quant-trader] ACTED <month-end>" / FAILED / NO-OP) and a body
+  reusing format_notification.  read_smtp_config(env) reads SMTP_USER / SMTP_APP_PASSWORD /
+  ALERT_EMAIL_TO and returns None if any is missing.  make_email_notifier(transport_factory)
+  returns a notify_fn: unconfigured env degrades to a warn-once logging-only path, and the
+  entire send is wrapped so any failure is logged "email notifier failed: %s" and swallowed.
+  run_daily now passes a composed _notify that calls _log_notifier then the email notifier.
+- Added the three SMTP keys to .env.example as commented placeholders (SMTP_APP_PASSWORD
+  noted as a Gmail app password, 16 chars, no spaces, never the account password).
+
+**Why it matters:**
+- An unattended run now reaches my inbox on acted + failed (the ACTED_AND_FAILED policy), so
+  I learn about a trade or a failure without watching the log.  The notifier is degrade-safe
+  and non-raising: no SMTP config -> logging-only, and a broken email channel (auth/network)
+  is caught and swallowed - it can never break or mask a trade (the Day-58 invariant).
+  Confirmed with a manual one-off live send to the real inbox (a clean 16-char Gmail app
+  password), which no hermetic test can prove.
+
+**Architectural note:**
+- stdlib only (smtplib, email.message) - no new dependency.  The SMTP call sits behind an
+  injectable transport_factory so the send logic is hermetically tested with a fake transport
+  and never touches the network in CI; the real Gmail factory is the default only in
+  production.  Secrets come from env only and are never logged - verified the only two log
+  calls are a static degrade warning and log.error("email notifier failed: %s", exc), neither
+  interpolating the password.  All logic lives in src/ (tested); run_daily.py only wires.
+
+**Verification:**
+- uv run pytest -q -m "not integration": 326 passed, 4 deselected (was 320; +6).  The 6 email
+  tests cover build_email headers/subject/body, read_smtp_config complete + each-missing-key,
+  a configured send via a fake transport (starttls -> login -> send_message order), the
+  unconfigured degrade (warns, no transport constructed, no raise), and a raising transport
+  (caught, logged, no propagation).  Manual live send to the real inbox confirmed delivery.
+  .env stays untracked; only .env.example (no secrets) is committed.
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- Install the scheduler on an always-on host (or GitHub Actions) per docs/AUTOPILOT.md so
+  update_universe.py then run_daily.py fire each weekday - the notifier now makes an
+  unattended run observable by email.
+- Deferred: fill-confirmation sequencing (confirm fills before writing state).
+
 ## Day 59
 
 **Worked on:**
