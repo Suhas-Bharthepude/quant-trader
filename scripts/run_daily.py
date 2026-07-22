@@ -57,6 +57,10 @@ from src.data.freshness import stale_symbols
 from src.execution.daily_runner import run_daily
 from src.execution.notify import Notification, format_notification
 
+# make_email_notifier builds the stdlib-SMTP email notify_fn.  It self-degrades to a logged
+# warning when the SMTP env is unset, so constructing it is always safe.
+from src.execution.email_notify import make_email_notifier
+
 
 # ---------------------------------------------------------------------------
 # Logging configuration — this entry point owns the handlers.
@@ -123,6 +127,24 @@ def _log_notifier(n: Notification) -> None:
         log.error(line)
     else:
         log.info(line)
+
+
+# The stdlib-SMTP email notifier, built once.  If the SMTP env is unset it self-degrades to a
+# one-time logged warning, so constructing it here is always safe (no keys required to import).
+_email_notifier = make_email_notifier()
+
+
+def _notify(n: Notification) -> None:
+    """Composed notify_fn: keep the existing logging path AND send the email.
+
+    Both delegates are individually non-raising (_log_notifier only logs; _email_notifier
+    catches/swallows all send errors), and run_daily wraps notify_fn in its own try/except,
+    so composing them cannot break or mask the trade.
+    """
+    # First the existing logging-only record (unchanged behaviour).
+    _log_notifier(n)
+    # Then the email delivery (degrades or swallows failures on its own).
+    _email_notifier(n)
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +231,7 @@ def main() -> int:
             bars_by_symbol,
             today,
             reference_symbol=_REFERENCE,
-            notify_fn=_log_notifier,
+            notify_fn=_notify,
         )
     except Exception:  # noqa: BLE001 - already logged+notified inside run_daily; exit non-zero
         log.error("run_daily failed, see traceback above")
