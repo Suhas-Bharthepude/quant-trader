@@ -13,7 +13,7 @@ clean run - including a no-op - and 1 on any failure.
 The scheduler MUST run the ingest BEFORE the runner each day, or the runner
 refuses to trade on stale bars (exit 1). In order:
 
-    uv run python scripts/update_universe.py
+    uv run python scripts/update_universe.py --universe etf_basket
     uv run python scripts/run_daily.py
 
 Why: `run_daily` loads bars from DuckDB and gates on freshness (`stale_symbols`);
@@ -22,7 +22,7 @@ Why: `run_daily` loads bars from DuckDB and gates on freshness (`stale_symbols`)
 ## 3. Cron example
 
     # weekdays 21:30 UTC (after US close): ingest then run the bot
-    30 21 * * 1-5 cd /path/to/quant-trader && uv run python scripts/update_universe.py && uv run python scripts/run_daily.py >> logs/cron.log 2>&1
+    30 21 * * 1-5 cd /path/to/quant-trader && uv run python scripts/update_universe.py --universe etf_basket && uv run python scripts/run_daily.py >> logs/cron.log 2>&1
 
 The time is the HOST's timezone - pick a time comfortably after 16:00 ET (21:30
 UTC is well after close). The `&&` chaining means a failed ingest aborts before
