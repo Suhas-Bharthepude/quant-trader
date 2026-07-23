@@ -52,6 +52,11 @@ from src.research.cli_common import build_symbol_list, load_bars_for_symbols
 # current through today.  All the staleness arithmetic lives in the tested src/ module.
 from src.data.freshness import stale_symbols
 
+# live_history_start turns a calendar-month depth into a rolling first-of-month start date
+# (pure: today is injected).  It replaces the old fixed 2000-01-01 start so the daily fetch
+# reads only the ~1 year the rotation ranking actually needs, not ~26 years.
+from src.data.history_window import live_history_start
+
 # run_daily is the tested IO shell (decide -> live_target_weights -> run_rebalance ->
 # state write), and the notify seam types the injected _log_notifier below.
 from src.execution.daily_runner import run_daily
@@ -99,8 +104,12 @@ _UNIVERSE = "etf_basket"
 # The reference spine whose month-ends define the rebalance schedule.
 _REFERENCE = "SPY"
 
-# Load-window start; the deep backfill runs 2008->present, this captures all of it.
-_START = "2000-01-01"
+# Live read-window depth in calendar months. The daily decision needs a minimum of ~5
+# month-ends (lookback+1 for the trailing return, +1 for the dropped incomplete current
+# month); 12 is ~2.4x that floor, absorbing partial months and holidays while keeping the
+# scheduled fetch light (~1 year instead of ~26). Pairs with the scheduled ingest keeping
+# >= this many months current.
+_LIVE_HISTORY_MONTHS = 12
 
 # Staleness threshold in CALENDAR days.  Must be generous enough to span a normal
 # non-trading gap (a Fri->Mon weekend is 3 days; a long holiday weekend up to 4), or a
@@ -192,7 +201,13 @@ def main() -> int:
 
     # STEP 4 — LOAD BARS through today (end = today's date so the window includes today's
     # bar once ingest has stored it).  Reads DuckDB; the runner never ingests.
-    bars_by_symbol = load_bars_for_symbols(symbols, _START, date.today().isoformat())
+    # Compute the rolling read-window start: the first of the month _LIVE_HISTORY_MONTHS
+    # months back from today (pure helper, clock injected here at the impure edge).  This
+    # replaces the fixed "2000-01-01" so the fetch reads ~1 year, not ~26.
+    start = live_history_start(date.today(), _LIVE_HISTORY_MONTHS).isoformat()
+    # Load bars from the rolling `start` through today (end = today's date so the window
+    # includes today's bar once ingest has stored it).  Reads DuckDB; the runner never ingests.
+    bars_by_symbol = load_bars_for_symbols(symbols, start, date.today().isoformat())
     # Guard: no bars at all means ingest never ran -> fail non-zero.
     if not bars_by_symbol:
         log.error("no bars loaded for any symbol (run the ingest first)")
