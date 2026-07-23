@@ -56,6 +56,7 @@ from src.backtest import metrics
 from src.data.schema import OHLCVBar
 from src.intraday.orb_strategy import EntryEvent, IntradayStrategy, OpeningRangeBreakoutConfig
 from src.intraday.obsp_strategy import OpenBuySellProfitConfig
+from src.intraday.ocm_strategy import OpeningCandleMomentumConfig
 from src.intraday.session import PrimarySession, build_sessions, AlignedSession
 
 
@@ -239,6 +240,20 @@ def resolve_exit_profit_target(
             return j, target_price, "target"
 
     # Never reached the target → sell at the last bar's close (flat by close).
+    last_index = len(trading_bars) - 1
+    return last_index, trading_bars[last_index].close, "eod"
+
+
+def resolve_exit_at_close(
+    trading_bars: list[OHLCVBar],
+    entry_index: int,
+) -> tuple[int, float, str]:
+    """Hold from entry to the session close — exit at the last bar's close ("eod").
+
+    The degenerate exit for a "buy and hold the day" mode (OCM's exit_mode="close").
+    ADDITIVE sibling of the other resolvers; entry_index is accepted for a uniform
+    resolver signature though the exit is always the last bar.
+    """
     last_index = len(trading_bars) - 1
     return last_index, trading_bars[last_index].close, "eod"
 
@@ -592,3 +607,245 @@ def run_obsp_backtest(
     )
 
 
+# ---------------------------------------------------------------------------
+# OCM (Opening-Candle Momentum) — result types + train/test runner.
+#
+# OCM is a momentum-continuation claim, so its runner front-loads two anti-fooling
+# guards the ORB/OBSP runners don't have: a chronological TRAIN/TEST split (an edge
+# must appear in BOTH halves) and a BUY-OPEN BASELINE on the same fired days (the
+# rule must beat simply riding intraday drift).  It REUSES build_sessions,
+# resolve_exit (bracket) / resolve_exit_at_close (close), the Trade record, and the
+# pure metrics.  The ORB/OBSP runners above are untouched.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class OCMOutcome:
+    """One fired session: strategy gross/net AND the buy-open baseline gross/net.
+
+    Only sessions where the signal fired produce an OCMOutcome (no-trade days are
+    simply absent), so the strategy and baseline are compared on the SAME day set.
+    """
+
+    date_et: date
+    exit_reason: str
+    gross_log: float          # strategy: log(exit/entry) before costs
+    net_log: float            # strategy: net of round-trip cost
+    baseline_gross_log: float  # buy 09:30 open, sell close, before costs
+    baseline_net_log: float    # baseline net of the same round-trip cost
+    trade: Trade | None
+
+
+@dataclass(frozen=True)
+class OCMWindowStats:
+    """Aggregated OCM stats over one window (full / in-sample / out-of-sample)."""
+
+    label: str
+    start_date: datetime | None
+    end_date: datetime | None
+    n_sessions: int          # sessions in this window (fired + not)
+    n_signals: int           # sessions where the signal fired (== n_trades)
+    signal_rate: float
+    win_rate: float          # fraction of trades with GROSS return > 0
+    avg_gross_win: float
+    avg_gross_loss: float
+    avg_net_win: float
+    avg_net_loss: float
+    total_return_pct: float           # NET compounded over fired days
+    gross_total_return_pct: float
+    sharpe_ratio: float               # NET, over fired-day returns
+    max_drawdown_pct: float
+    total_cost_pct: float
+    baseline_net_return_pct: float    # buy-open→close on the SAME fired days, net
+    baseline_gross_return_pct: float
+    edge_net_pct: float               # total_return_pct - baseline_net_return_pct
+
+
+@dataclass(frozen=True)
+class OCMResult:
+    """OCM backtest output: full period plus the mandatory train/test split."""
+
+    strategy_name: str
+    primary_symbol: str
+    full: OCMWindowStats
+    in_sample: OCMWindowStats
+    out_of_sample: OCMWindowStats
+    exit_reason_counts: dict[str, int]
+    outcomes: list[OCMOutcome]
+
+
+def split_chronological(items: list) -> tuple[list, list]:
+    """Split a date-ascending list into (first_half, second_half) chronologically.
+
+    mid = (n + 1) // 2 puts the extra element (for odd n) in the FIRST half, so the
+    in-sample window is never smaller than out-of-sample.  build_sessions returns
+    sessions in ascending date order, so a plain list split IS a chronological split.
+    """
+    mid = (len(items) + 1) // 2
+    return items[:mid], items[mid:]
+
+
+def _ocm_window_stats(
+    label: str,
+    outcomes: list[OCMOutcome],
+    n_sessions: int,
+    round_trip_cost: float,
+    initial_capital: float,
+    annualization_factor: int,
+) -> OCMWindowStats:
+    """Aggregate one window's OCM outcomes into an OCMWindowStats.
+
+    `outcomes` are the FIRED sessions in this window; `n_sessions` is the total
+    sessions in the window (fired + not) for the signal-rate denominator.
+    """
+    n_signals = len(outcomes)
+    signal_rate = (n_signals / n_sessions) if n_sessions else 0.0
+
+    # Empty window (no signals) → all-zero stats (avoids div-by-zero / empty arrays).
+    if n_signals == 0:
+        return OCMWindowStats(
+            label=label, start_date=None, end_date=None, n_sessions=n_sessions,
+            n_signals=0, signal_rate=0.0, win_rate=0.0, avg_gross_win=0.0,
+            avg_gross_loss=0.0, avg_net_win=0.0, avg_net_loss=0.0,
+            total_return_pct=0.0, gross_total_return_pct=0.0, sharpe_ratio=0.0,
+            max_drawdown_pct=0.0, total_cost_pct=0.0, baseline_net_return_pct=0.0,
+            baseline_gross_return_pct=0.0, edge_net_pct=0.0,
+        )
+
+    net_logs = np.array([o.net_log for o in outcomes], dtype=np.float64)
+    equity_curve = initial_capital * np.exp(np.cumsum(net_logs))
+
+    # Win/loss buckets by GROSS sign (mode-agnostic "green trade").
+    win_gross = [o.gross_log for o in outcomes if o.gross_log > 0]
+    loss_gross = [o.gross_log for o in outcomes if o.gross_log <= 0]
+    win_net = [o.net_log for o in outcomes if o.gross_log > 0]
+    loss_net = [o.net_log for o in outcomes if o.gross_log <= 0]
+
+    total_return_pct = float(metrics.total_return(equity_curve, initial_capital))
+    gross_total_return_pct = float(np.expm1(np.sum([o.gross_log for o in outcomes])))
+    baseline_net = float(np.expm1(np.sum([o.baseline_net_log for o in outcomes])))
+    baseline_gross = float(np.expm1(np.sum([o.baseline_gross_log for o in outcomes])))
+
+    return OCMWindowStats(
+        label=label,
+        start_date=datetime(outcomes[0].date_et.year, outcomes[0].date_et.month, outcomes[0].date_et.day),
+        end_date=datetime(outcomes[-1].date_et.year, outcomes[-1].date_et.month, outcomes[-1].date_et.day),
+        n_sessions=n_sessions,
+        n_signals=n_signals,
+        signal_rate=signal_rate,
+        win_rate=len(win_gross) / n_signals,
+        avg_gross_win=_mean_simple_pct(win_gross),
+        avg_gross_loss=_mean_simple_pct(loss_gross),
+        avg_net_win=_mean_simple_pct(win_net),
+        avg_net_loss=_mean_simple_pct(loss_net),
+        total_return_pct=total_return_pct,
+        gross_total_return_pct=gross_total_return_pct,
+        sharpe_ratio=metrics.sharpe_ratio(net_logs, annualization_factor),
+        max_drawdown_pct=metrics.max_drawdown(equity_curve),
+        total_cost_pct=float(n_signals * round_trip_cost),
+        baseline_net_return_pct=baseline_net,
+        baseline_gross_return_pct=baseline_gross,
+        edge_net_pct=total_return_pct - baseline_net,
+    )
+
+
+def run_ocm_backtest(
+    bars_by_symbol: dict[str, list[OHLCVBar]],
+    strategy: IntradayStrategy,
+    config: OpeningCandleMomentumConfig,
+    initial_capital: float = 1.0,
+    annualization_factor: int = 252,
+) -> OCMResult:
+    """Run OCM across sessions; report full + chronological train/test + baseline.
+
+    Sessions are built with or_minutes=0 / no confirmation, so trading_bars is the
+    FULL regular session from 09:30.  For every FIRED session we record the strategy
+    gross/net and a buy-open baseline (buy bars[0].open at 09:30, sell bars[-1].close,
+    same round-trip cost) so the momentum rule is measured against pure drift on the
+    same days.  Fired outcomes are then split chronologically in half.
+    """
+    if initial_capital <= 0:
+        raise ValueError(f"initial_capital must be > 0, got {initial_capital}")
+
+    aligned: list[AlignedSession] = build_sessions(
+        bars_by_symbol, config.primary_symbol, confirmation_symbols=[], or_minutes=0
+    )
+
+    cost_rate = (config.fee_bps + config.slippage_bps) / 10000.0
+    round_trip_cost = 2.0 * cost_rate
+
+    # Per-session: None on no-trade days; an OCMOutcome on fired days.  We keep a
+    # parallel "fired flag per session" so the train/test split (which splits ALL
+    # sessions chronologically) can count sessions correctly per window.
+    fired_by_session: list[OCMOutcome | None] = []
+    for session in aligned:
+        primary = session.primary
+        entry = strategy.find_entry(session)
+        if entry is None:
+            fired_by_session.append(None)
+            continue
+
+        bars = primary.trading_bars
+        if config.exit_mode == "bracket":
+            # Reuse the existing stop-first bracket resolver; independent target/stop
+            # % map to R via target_r = profit_target / stop_pct.
+            exit_index, exit_price, reason = resolve_exit(
+                bars, entry.entry_index, entry.entry_price,
+                config.stop_pct, config.profit_target / config.stop_pct,
+            )
+        else:  # "close"
+            exit_index, exit_price, reason = resolve_exit_at_close(bars, entry.entry_index)
+        exit_bar = bars[exit_index]
+
+        gross_log = math.log(exit_price / entry.entry_price)
+        net_log = gross_log - round_trip_cost
+
+        # Buy-open baseline on this SAME day: buy the 09:30 open, sell the close.
+        baseline_gross_log = math.log(bars[-1].close / bars[0].open)
+        baseline_net_log = baseline_gross_log - round_trip_cost
+
+        trade = Trade(
+            entry_time=entry.entry_time,
+            exit_time=exit_bar.timestamp,
+            entry_price=entry.entry_price,
+            exit_price=exit_price,
+            direction=1,
+            return_pct=net_log,
+            bars_held=exit_index - entry.entry_index,
+        )
+        fired_by_session.append(
+            OCMOutcome(primary.date_et, reason, gross_log, net_log,
+                       baseline_gross_log, baseline_net_log, trade)
+        )
+
+    # Chronological train/test split over ALL sessions, so each window's signal_rate
+    # is honest (fired / total in that window).
+    first_flags, second_flags = split_chronological(fired_by_session)
+    all_outcomes = [o for o in fired_by_session if o is not None]
+    in_outcomes = [o for o in first_flags if o is not None]
+    oos_outcomes = [o for o in second_flags if o is not None]
+
+    full = _ocm_window_stats(
+        "full", all_outcomes, len(aligned), round_trip_cost, initial_capital, annualization_factor
+    )
+    in_sample = _ocm_window_stats(
+        "in-sample", in_outcomes, len(first_flags), round_trip_cost, initial_capital, annualization_factor
+    )
+    out_of_sample = _ocm_window_stats(
+        "out-of-sample", oos_outcomes, len(second_flags), round_trip_cost, initial_capital, annualization_factor
+    )
+
+    reason_counts: dict[str, int] = {"target": 0, "stop": 0, "eod": 0}
+    for o in all_outcomes:
+        if o.exit_reason in reason_counts:
+            reason_counts[o.exit_reason] += 1
+
+    return OCMResult(
+        strategy_name=strategy.name,
+        primary_symbol=config.primary_symbol,
+        full=full,
+        in_sample=in_sample,
+        out_of_sample=out_of_sample,
+        exit_reason_counts=reason_counts,
+        outcomes=all_outcomes,
+    )
