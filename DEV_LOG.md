@@ -4,6 +4,54 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 64
+
+**Worked on:**
+- Added OCM (Opening-Candle Momentum): src/intraday/ocm_strategy.py, the resolve_exit_at_close
+  + split_chronological + run_ocm_backtest + OCMResult additions to sim.py, and
+  scripts/ocm_sweep.py (commit "Add OCM (opening-candle momentum) intraday strategy + sim
+  mode"). [+18 tests]
+- Rule: if the first N 1m candles are all green (close>open), buy at candle N+1's OPEN; any
+  red -> no trade. Exit modes: hold-to-close, or a bracket (fixed target + stop) that REUSES
+  resolve_exit. Two anti-fooling guards baked into the runner: a mandatory chronological
+  train/test split, and a buy-the-open baseline computed on the same fired days.
+
+**Why it matters:**
+- Momentum-continuation is the claim you're most likely to fool yourself on by remembering the
+  mornings it worked. A full-period backtest alone is not evidence. The split (edge must appear
+  in BOTH halves) and the baseline (must beat just buying the open) are what separate a real
+  edge from riding drift or fitting to remembered days.
+
+**Result (a CAUGHT false positive — the guards did their job):**
+- SOXL 1m, 2025-07-01..2026-07-22. Full-period looks like a winner: N=2 close +65.5% net
+  (Sharpe +2.24), N=3 close +58.2% (+5.30). It is NOT an edge: (1) it LOSES to the buy-open
+  baseline in every single config — on the same fired days, buying the 09:30 open and holding
+  to close returns +200% to +303%, so edge-vs-baseline is -80% to -338%; the rule captures LESS
+  of the drift than doing nothing. (2) The train/test split shows no stability: N=2 close swings
+  -33% net (Sharpe -3.66) in-sample -> +147% (+8.95) out-of-sample; a sign-flipping Sharpe is
+  noise. (3) Bracket mode (1%/1%) collapses returns to ~0/negative. The apparent profit is
+  inferior drift-capture on a leveraged ETF that happened to rise, not predictive momentum.
+
+**Architectural note:**
+- Additive: resolve_exit / run_orb_backtest / run_obsp_backtest untouched; bracket mode reuses
+  resolve_exit (target_r = profit_target/stop_pct). Reuses build_sessions, Trade, metrics.
+  OCMResult carries full/in-sample/out-of-sample stat blocks plus the baseline and the
+  edge-vs-baseline number, so the verdict is legible without re-running.
+
+**Verification:**
+- uv run pytest tests/test_ocm_strategy.py: 18 passed (green/red signal, entry at candle N+1's
+  OPEN, no-lookahead, split_chronological even/odd, baseline == open-to-close, gross-vs-net,
+  symbol-agnostic). Full suite: 423 passed. Real numbers above from scripts/ocm_sweep.py.
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- The three intraday hypotheses (trailing, OBSP, OCM) all came back negative/honest; the ORB
+  engine and data feed are the durable deliverable. A proper intraday walk-forward validator
+  (parallel to the daily one, not reusing it) is the natural next step if any intraday idea
+  ever looks worth validating.
+
 ## Day 63
 
 **Worked on:**
