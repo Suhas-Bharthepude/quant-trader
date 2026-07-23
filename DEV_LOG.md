@@ -4,6 +4,42 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 61
+
+**Worked on:**
+- Added AlpacaBroker.get_minute_bars(symbol, start, end) -> list[OHLCVBar] (commit "Add
+  Alpaca 1-minute bar history (get_minute_bars); additive"). Wraps the already-constructed
+  StockHistoricalDataClient via a StockBarsRequest at TimeFrame.Minute, maps each Alpaca Bar
+  to an OHLCVBar with timeframe="1m", source="alpaca", adj_close mirroring close (no intraday
+  split/dividend), and returns them ascending by timestamp. [+5 tests]
+- This is the data foundation for the whole new intraday track (Days 62-64): a source of
+  minute bars that flows into the SAME DuckDBStore the daily stack uses (timeframe="1m").
+
+**Why it matters:**
+- The daily/swing system fetches only daily bars via yfinance. An intraday opening-range /
+  momentum strategy needs 1-minute data, and using Alpaca (the same broker we trade through)
+  means backtest and live share one feed — no source drift.
+
+**Architectural note:**
+- PURELY ADDITIVE. No existing broker method signature changed, and NO abstractmethod was
+  added to the Broker ABC — get_minute_bars is Alpaca-specific market-data access, so intraday
+  code depends on the concrete AlpacaBroker, not the order-execution interface. tests/
+  test_alpaca_broker.py is untouched (its no-op fake data client is never exercised by the
+  existing tests); new coverage lives in a separate tests/test_alpaca_intraday.py with its own
+  extended fake. The daily Backtester, walk-forward, and rotation track are untouched (Scope).
+
+**Verification:**
+- uv run pytest tests/test_alpaca_intraday.py: 5 passed (field mapping incl. adj_close==close,
+  ascending sort, absent-symbol -> empty list, request wires symbol + 1Min timeframe, naive
+  timestamp normalised to UTC). Full suite green at end of the Day 64 work (423).
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- Build the intraday session engine + event-driven simulator + first strategy (ORB) on top of
+  this feed (Day 62).
+
 ## Day 60
 
 **Worked on:**
