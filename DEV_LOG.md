@@ -4,6 +4,48 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 63
+
+**Worked on:**
+- Added OBSP (Open-Buy, Sell-at-Profit): src/intraday/obsp_strategy.py, the
+  resolve_exit_profit_target + run_obsp_backtest + OBSPResult additions to sim.py, and
+  scripts/obsp_sweep.py (commit "Add OBSP (open-buy, sell-at-profit) intraday strategy + sim
+  mode"). [+16 tests]
+- Rule: buy at the 09:30 open, sell at the first bar reaching +profit_target (filled at the
+  target, a favorable gap not credited), else force-flat at the close. Sessions built with
+  or_minutes=0 so trading_bars is the full session from the open. Long-only, flat by close.
+
+**Why it matters:**
+- Tests a specific, seductive claim ("just sell the moment you're green"). The trap is
+  conflating "hit the profit target" (a GROSS win) with "made money after costs". OBSP's
+  result type reports BOTH, separately, so the illusion can't hide.
+
+**Result (a NEGATIVE result — verified on real data):**
+- SOXL 1m, 2025-07-01..2026-07-22, 265 sessions, 1+5 bps/side. Target-hit rate is high
+  (94.7% at 0.3%, 93.2% at 0.5%) but every target is NET-NEGATIVE: 0.3% -> -23.3%, 0.5% ->
+  -2.6%, 1% -> -22.2%, 2% -> -52.2%. The shape is small capped wins vs large losses on days
+  price fell from the open and never recovered: avg gross win +0.3-2.0% vs avg gross loss
+  -3.5 to -5.1%, win/loss size ratio 0.06-0.58. The 0.5% config is +33.9% GROSS but -2.6%
+  NET — costs on 265 round trips erase it. "Pick up pennies in front of a steamroller,"
+  quantified.
+
+**Architectural note:**
+- Additive: resolve_exit / resolve_exit_trailing / run_orb_backtest untouched; OBSP adds sibling
+  functions. Reuses build_sessions, the Trade record, and metrics. Trade.return_pct stays NET
+  (intraday convention), and OBSPResult carries gross AND net win/loss buckets so win rate
+  (target-reached) and profitability are never conflated.
+
+**Verification:**
+- uv run pytest tests/test_obsp_strategy.py: 16 passed (incl. same-bar/gap fill at target,
+  no-lookahead, and the explicit gross-win-yet-net-loss accounting test). Real numbers above
+  from scripts/obsp_sweep.py.
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- OCM (Day 64): opening-candle momentum, with a mandatory train/test split + buy-open baseline.
+
 ## Day 62
 
 **Worked on:**
