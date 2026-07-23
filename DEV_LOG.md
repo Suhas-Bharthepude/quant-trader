@@ -4,6 +4,52 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 62
+
+**Worked on:**
+- Built the intraday track: src/intraday/session.py, orb_strategy.py, sim.py, plus
+  scripts/intraday_orb_smoke.py (commit "Add intraday ORB track: session engine,
+  event-driven sim, ORB strategy + trailing exit"). [+~130 tests across the 5 intraday
+  test files]
+- session.py groups 1m bars into ET sessions (DST via zoneinfo), computes the opening-range
+  window, and provides a backward-only as-of sampler. orb_strategy.py defines a new
+  multi-symbol IntradayStrategy ABC + OpeningRangeBreakout (09:45 OR-high breakout, SPY/QQQ
+  confirming, 6% stop, 2R target). sim.py is an event-driven bar-by-bar simulator: resolve_exit
+  is stop-first on same-bar stop+target conflicts and conservative on gaps, with a forced
+  EOD-flat (never overnight). Added a trailing-stop exit mode (resolve_exit_trailing, config
+  trail_pct) as an additive alternative — same conservative within-bar ordering.
+
+**Why it matters:**
+- The daily vectorized Backtester models close-to-close over full bars and structurally cannot
+  represent an intrabar stop/target or an EOD-flat — the mechanics an intraday strategy lives
+  or dies on. This parallel event-driven engine can, without touching or weakening the daily
+  engine or its load-bearing test_no_lookahead_bias (Scope). It gets its OWN load-bearing
+  test_intraday_no_lookahead guarding the intraday invariant.
+
+**Result (trailing stop — a NEGATIVE result, verified on real data):**
+- ORB on stored SOXL 1m, 2024-01-02..2026-07-21, 196 trades, 6 bps/side. FIXED (6% stop / 2R):
+  +43.1% net, Sharpe +0.66, win 53%. TRAILING degraded at EVERY width tested: 3% -> +10.6%
+  net, Sharpe +0.27; 5% -> +8.2%, +0.17; 8% -> +3.4%, +0.06. The trail converts almost every
+  exit into a trailing stop (101/49/18 trailing vs 3 targets under fixed), cutting winners
+  short and bleeding return + Sharpe. Trailing is retained as an option but is not an
+  improvement here. (Full-sample/in-sample only — ORB has no OOS split; not validated.)
+
+**Architectural note:**
+- Reuses OHLCVBar, DuckDBStore (timeframe="1m"), the Trade record, and metrics read-only.
+  Trailing was added additively: resolve_exit is byte-for-byte unchanged; the trailing path is
+  a separate resolver selected by trail_pct (None -> original behaviour). A strategy decides
+  ENTRY; the sim owns EXITS.
+
+**Verification:**
+- The 5 intraday test files (session/ORB/sim/no-lookahead/trailing) pass; the trailing numbers
+  above are from scripts/intraday_orb_smoke.py runs (--trail-pct vs fixed), not asserted.
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- Two more intraday hypotheses to test honestly: OBSP (Day 63) and OCM (Day 64).
+
 ## Day 61
 
 **Worked on:**
