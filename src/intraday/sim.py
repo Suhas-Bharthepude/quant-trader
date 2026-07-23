@@ -55,6 +55,7 @@ from src.backtest import metrics
 
 from src.data.schema import OHLCVBar
 from src.intraday.orb_strategy import EntryEvent, IntradayStrategy, OpeningRangeBreakoutConfig
+from src.intraday.obsp_strategy import OpenBuySellProfitConfig
 from src.intraday.session import PrimarySession, build_sessions, AlignedSession
 
 
@@ -205,6 +206,39 @@ def resolve_exit_trailing(
             peak = bar.high
 
     # EOD-flat: never breached → exit at the last bar's close (no overnight hold).
+    last_index = len(trading_bars) - 1
+    return last_index, trading_bars[last_index].close, "eod"
+
+
+def resolve_exit_profit_target(
+    trading_bars: list[OHLCVBar],
+    entry_index: int,
+    entry_price: float,
+    profit_target: float,
+) -> tuple[int, float, str]:
+    """Profit-target exit (the OBSP "sell as soon as you're at a profit" rule).
+
+    ADDITIVE sibling of resolve_exit / resolve_exit_trailing; those are untouched.
+
+    Model:
+      * target_price = entry_price * (1 + profit_target).
+      * Walk bars from entry_index (INCLUSIVE, so the entry bar's own high can be a
+        valid SAME-BAR exit).  The FIRST bar with high >= target_price exits, filled
+        at EXACTLY target_price — a favorable gap that opens above the target is NOT
+        credited (conservative, matching resolve_exit's target handling).
+      * If the target is never reached, force-flat at the last bar's CLOSE ("eod").
+
+    No lookahead: the walk is strictly chronological and returns the FIRST touching
+    bar, so a later bar's high can never trigger an earlier exit.
+    """
+    target_price = entry_price * (1.0 + profit_target)
+
+    for j in range(entry_index, len(trading_bars)):
+        if trading_bars[j].high >= target_price:
+            # Fill at the target level, never the (possibly higher) gap-up price.
+            return j, target_price, "target"
+
+    # Never reached the target → sell at the last bar's close (flat by close).
     last_index = len(trading_bars) - 1
     return last_index, trading_bars[last_index].close, "eod"
 
@@ -360,6 +394,200 @@ def run_orb_backtest(
         max_drawdown_pct=max_dd,
         win_rate=win,
         total_cost_pct=total_cost,
+        exit_reason_counts=reason_counts,
+    )
+
+
+# ---------------------------------------------------------------------------
+# OBSP (Open-Buy, Sell-at-Profit) — its own result type and runner.
+#
+# OBSP needs HONEST gross-vs-net accounting that the ORB result does not carry:
+# "reached the profit target" (a GROSS win) must never be conflated with "net
+# positive after costs".  So OBSP gets a dedicated result type exposing BOTH, and
+# a dedicated runner — while REUSING build_sessions, resolve_exit_profit_target,
+# the Trade record, and the pure metrics.  run_orb_backtest above is untouched.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class OBSPOutcome:
+    """One session's OBSP result, carrying BOTH gross and net returns separately."""
+
+    date_et: date
+    exit_reason: str          # "target" (a win) or "eod" (never reached target)
+    gross_log: float          # log(exit/entry) BEFORE costs
+    net_log: float            # gross_log minus round-trip cost
+    trade: Trade | None
+
+
+@dataclass(frozen=True)
+class OBSPResult:
+    """OBSP backtest output with gross and net kept strictly separate.
+
+    The headline honesty guarantee: `win_rate` counts TARGET-REACHED sessions (a
+    gross win), independent of whether costs pushed that trade net-negative.  The
+    avg_*_win / avg_*_loss numbers report the target bucket vs the EOD bucket, in
+    both gross and net terms, as SIMPLE percentages (expm1 of the log return) so
+    they read naturally (+0.50%, -3.1%).  Equity/Sharpe/drawdown are NET.
+    """
+
+    strategy_name: str
+    primary_symbol: str
+    start_date: datetime | None
+    end_date: datetime | None
+    n_sessions: int
+    n_trades: int
+
+    # Distinct, non-conflated accounting (requirement 3).
+    win_rate: float               # fraction of trades that REACHED the target (gross win)
+    avg_gross_win: float          # mean simple-% return of target-reached trades
+    avg_gross_loss: float         # mean simple-% return of EOD (never-target) trades
+    avg_net_win: float            # same target bucket, net of costs
+    avg_net_loss: float           # same EOD bucket, net of costs
+    win_loss_size_ratio: float    # |avg_gross_win| / |avg_gross_loss| (0.0 if no losses)
+
+    total_return_pct: float       # NET compounded return over the curve
+    gross_total_return_pct: float  # GROSS compounded return (costs excluded)
+    sharpe_ratio: float           # NET, daily-frequency
+    max_drawdown_pct: float       # NET
+    total_cost_pct: float
+
+    equity_curve: np.ndarray
+    returns: np.ndarray           # per-session NET log returns
+    outcomes: list[OBSPOutcome]
+    exit_reason_counts: dict[str, int]
+
+    @property
+    def trades(self) -> list[Trade]:
+        return [o.trade for o in self.outcomes if o.trade is not None]
+
+
+def _mean_simple_pct(logs: list[float]) -> float:
+    """Mean of a list of log returns, expressed as a simple percent (expm1). 0.0 if empty."""
+    if not logs:
+        return 0.0
+    return float(np.expm1(np.mean(logs)))
+
+
+def run_obsp_backtest(
+    bars_by_symbol: dict[str, list[OHLCVBar]],
+    strategy: IntradayStrategy,
+    config: OpenBuySellProfitConfig,
+    initial_capital: float = 1.0,
+    annualization_factor: int = 252,
+) -> OBSPResult:
+    """Run OBSP across every session; report gross and net separately.
+
+    Sessions are built with or_minutes=0 and no confirmation symbols, so
+    primary.trading_bars is the FULL regular session starting at the 09:30 open —
+    exactly what "buy at the open" needs.  Reuses resolve_exit_profit_target for the
+    exit, the Trade record, and the pure metrics.
+    """
+    if initial_capital <= 0:
+        raise ValueError(f"initial_capital must be > 0, got {initial_capital}")
+
+    # or_minutes=0 → no opening-range strip (full session from 09:30); no confirmation
+    # symbols → OBSP has none.  Verified against session.build_sessions semantics.
+    aligned: list[AlignedSession] = build_sessions(
+        bars_by_symbol, config.primary_symbol, confirmation_symbols=[], or_minutes=0
+    )
+
+    cost_rate = (config.fee_bps + config.slippage_bps) / 10000.0
+    round_trip_cost = 2.0 * cost_rate
+
+    outcomes: list[OBSPOutcome] = []
+    for session in aligned:
+        primary = session.primary
+        entry = strategy.find_entry(session)
+        if entry is None:
+            outcomes.append(
+                OBSPOutcome(primary.date_et, "none", 0.0, 0.0, None)
+            )
+            continue
+
+        exit_index, exit_price, reason = resolve_exit_profit_target(
+            primary.trading_bars, entry.entry_index, entry.entry_price, config.profit_target
+        )
+        exit_bar = primary.trading_bars[exit_index]
+
+        gross_log = math.log(exit_price / entry.entry_price)
+        net_log = gross_log - round_trip_cost
+
+        trade = Trade(
+            entry_time=entry.entry_time,
+            exit_time=exit_bar.timestamp,
+            entry_price=entry.entry_price,
+            exit_price=exit_price,
+            direction=1,          # long-only
+            return_pct=net_log,   # NET, consistent with the ORB intraday convention
+            bars_held=exit_index - entry.entry_index,
+        )
+        outcomes.append(
+            OBSPOutcome(primary.date_et, reason, gross_log, net_log, trade)
+        )
+
+    # Per-session NET log returns → equity curve (cumsum/exp, matching the ORB sim).
+    net_logs = np.array([o.net_log for o in outcomes], dtype=np.float64)
+    equity_curve = initial_capital * np.exp(np.cumsum(net_logs))
+
+    trades = [o.trade for o in outcomes if o.trade is not None]
+    total_cost = float(len(trades) * round_trip_cost)
+
+    reason_counts: dict[str, int] = {"target": 0, "eod": 0}
+    for o in outcomes:
+        if o.exit_reason in reason_counts:
+            reason_counts[o.exit_reason] += 1
+
+    # Buckets: WIN = target reached; LOSS = EOD (never reached target).  Kept
+    # separate in BOTH gross and net terms — the crux of the honest accounting.
+    win_gross = [o.gross_log for o in outcomes if o.exit_reason == "target"]
+    loss_gross = [o.gross_log for o in outcomes if o.exit_reason == "eod"]
+    win_net = [o.net_log for o in outcomes if o.exit_reason == "target"]
+    loss_net = [o.net_log for o in outcomes if o.exit_reason == "eod"]
+
+    avg_gross_win = _mean_simple_pct(win_gross)
+    avg_gross_loss = _mean_simple_pct(loss_gross)
+    avg_net_win = _mean_simple_pct(win_net)
+    avg_net_loss = _mean_simple_pct(loss_net)
+    win_loss_size_ratio = (
+        abs(avg_gross_win) / abs(avg_gross_loss) if avg_gross_loss != 0.0 else 0.0
+    )
+
+    win_rate = (len(win_gross) / len(trades)) if trades else 0.0
+
+    # NET metrics via the reused pure functions; GROSS compounded return computed
+    # directly from the gross log sum so it is genuinely cost-free.
+    total_return_pct = (
+        metrics.total_return(equity_curve, initial_capital) if len(equity_curve) else 0.0
+    )
+    gross_total_return_pct = float(np.expm1(np.sum([o.gross_log for o in outcomes])))
+    sharpe = metrics.sharpe_ratio(net_logs, annualization_factor) if len(net_logs) else 0.0
+    max_dd = metrics.max_drawdown(equity_curve) if len(equity_curve) else 0.0
+
+    start_date = aligned[0].primary.date_et if aligned else None
+    end_date = aligned[-1].primary.date_et if aligned else None
+
+    return OBSPResult(
+        strategy_name=strategy.name,
+        primary_symbol=config.primary_symbol,
+        start_date=datetime(start_date.year, start_date.month, start_date.day) if start_date else None,
+        end_date=datetime(end_date.year, end_date.month, end_date.day) if end_date else None,
+        n_sessions=len(aligned),
+        n_trades=len(trades),
+        win_rate=win_rate,
+        avg_gross_win=avg_gross_win,
+        avg_gross_loss=avg_gross_loss,
+        avg_net_win=avg_net_win,
+        avg_net_loss=avg_net_loss,
+        win_loss_size_ratio=win_loss_size_ratio,
+        total_return_pct=float(total_return_pct),
+        gross_total_return_pct=gross_total_return_pct,
+        sharpe_ratio=sharpe,
+        max_drawdown_pct=max_dd,
+        total_cost_pct=total_cost,
+        equity_curve=equity_curve,
+        returns=net_logs,
+        outcomes=outcomes,
         exit_reason_counts=reason_counts,
     )
 
