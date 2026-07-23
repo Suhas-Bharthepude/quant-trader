@@ -14,8 +14,9 @@ from __future__ import annotations
 import os
 
 # datetime is needed when converting Alpaca's timezone-aware timestamps to
-# standard Python datetime objects for OrderResult.submitted_at.
-from datetime import datetime
+# standard Python datetime objects for OrderResult.submitted_at.  timezone.utc
+# normalizes bar timestamps to UTC in the additive get_minute_bars method.
+from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
 # Alpaca SDK imports — everything from alpaca stays inside this file.
@@ -24,7 +25,13 @@ from datetime import datetime
 from alpaca.data.historical import StockHistoricalDataClient
 
 # StockLatestTradeRequest wraps the symbol argument for get_stock_latest_trade().
-from alpaca.data.requests import StockLatestTradeRequest
+# StockBarsRequest wraps the symbol + timeframe + date range for get_stock_bars()
+# (the additive minute-bar history method below).
+from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest
+
+# TimeFrame.Minute is the 1-minute granularity selector for StockBarsRequest.
+# Imported alongside the request type so the minute-bar fetch stays self-contained.
+from alpaca.data.timeframe import TimeFrame
 
 # TradingClient handles all order management and account operations.
 from alpaca.trading.client import TradingClient
@@ -62,6 +69,11 @@ from src.brokers.base import (
     OrderType,  # our enum — values "market" / "limit"
     PositionSnapshot,  # our dataclass — one open position (symbol, qty, side, values)
 )
+
+# OHLCVBar is the project-wide bar schema.  get_minute_bars converts Alpaca's
+# Bar objects into OHLCVBar so intraday code consumes the SAME type the daily
+# stack does — no Alpaca types leak past this file.
+from src.data.schema import OHLCVBar
 
 
 class AlpacaBroker(Broker):
@@ -447,3 +459,99 @@ class AlpacaBroker(Broker):
 
         # .price is a Decimal-like string in alpaca-py; float() gives a usable number.
         return float(latest_trade[symbol].price)
+
+    # ------------------------------------------------------------------
+    # Additive intraday data method — 1-minute bar history.
+    #
+    # This method is PURELY ADDITIVE: it introduces no change to any existing
+    # method signature and is NOT part of the abstract Broker contract (no
+    # abstractmethod was added to src/brokers/base.py).  It is Alpaca-specific
+    # market-data access; intraday code that needs minute bars depends on the
+    # concrete AlpacaBroker, not the order-execution Broker interface.  No
+    # existing test exercises it, so nothing pre-existing changes behaviour.
+    # ------------------------------------------------------------------
+    def get_minute_bars(self, symbol: str, start: str, end: str) -> list[OHLCVBar]:
+        """Fetch 1-minute OHLCV bars for a symbol between start and end (inclusive).
+
+        Parameters
+        ----------
+        symbol : str
+            Ticker to fetch, e.g. "SOXL", "SPY", "QQQ".
+        start : str
+            ISO datetime/date string for the first bar (UTC), e.g. "2024-01-02"
+            or "2024-01-02T13:30:00Z".  Passed straight through to Alpaca.
+        end : str
+            ISO datetime/date string for the last bar (UTC), inclusive.
+
+        Returns
+        -------
+        list[OHLCVBar]
+            Bars sorted by timestamp ascending, timeframe="1m", source="alpaca".
+            timestamps are timezone-aware UTC.  adj_close is set equal to close:
+            Alpaca minute bars carry no separate adjusted-close field, and no
+            split/dividend occurs intraday, so close IS the adjusted close for a
+            1-minute bar.  Returns an empty list when Alpaca has no bars in range.
+
+        Notes
+        -----
+        adjustment defaults to Alpaca's RAW prices (no argument passed), matching
+        the "raw OHLC, adj_close mirrors close" convention above.  Pagination is
+        handled internally by alpaca-py's get_stock_bars.
+        """
+        # StockBarsRequest bundles the symbol, the 1-minute granularity, and the
+        # inclusive [start, end] window into the shape the SDK expects.  We pass a
+        # single symbol string (symbol_or_symbols also accepts a list, unused here).
+        request = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame.Minute,
+            start=start,
+            end=end,
+        )
+
+        # get_stock_bars returns a BarSet: a mapping of symbol -> list[Bar].
+        # .data is the underlying dict; an absent symbol key means "no bars in
+        # range", which we treat as an empty result rather than an error (unlike
+        # the daily fetcher — a minute-bar gap is normal, e.g. a market holiday).
+        barset = self._data.get_stock_bars(request)
+        alpaca_bars = barset.data.get(symbol, [])
+
+        # Convert each Alpaca Bar into our OHLCVBar.  _minute_bar_to_ohlcv is a
+        # pure per-bar mapper, kept separate so it is unit-testable in isolation.
+        bars = [self._minute_bar_to_ohlcv(symbol, b) for b in alpaca_bars]
+
+        # Alpaca returns bars chronologically already, but sort defensively so
+        # the ascending-timestamp contract is explicit (mirrors YFinanceFetcher).
+        return sorted(bars, key=lambda bar: bar.timestamp)
+
+    @staticmethod
+    def _minute_bar_to_ohlcv(symbol: str, bar: object) -> OHLCVBar:
+        """Convert one Alpaca Bar into an OHLCVBar (timeframe="1m", source="alpaca").
+
+        Pulled out of get_minute_bars so the field mapping is testable with a
+        plain stub Bar and no network.  bar is an alpaca.data.models.Bar with
+        .timestamp/.open/.high/.low/.close/.volume attributes.
+        """
+        # Alpaca timestamps are timezone-aware; normalise to UTC so every bar in
+        # the project carries UTC-aware timestamps (same contract as the store).
+        ts = bar.timestamp
+        if ts.tzinfo is None:
+            # Defensive: a naive timestamp is assumed UTC (Alpaca sends UTC).
+            ts = ts.replace(tzinfo=timezone.utc)
+        else:
+            ts = ts.astimezone(timezone.utc)
+
+        # float()/int() guard against Decimal or numpy scalar types the SDK may
+        # hand back; OHLCVBar fields are plain Python float/int.  adj_close mirrors
+        # close (see get_minute_bars docstring: no intraday split/dividend).
+        return OHLCVBar(
+            symbol=symbol,
+            timestamp=ts,
+            open=float(bar.open),
+            high=float(bar.high),
+            low=float(bar.low),
+            close=float(bar.close),
+            adj_close=float(bar.close),
+            volume=int(bar.volume),
+            timeframe="1m",
+            source="alpaca",
+        )
