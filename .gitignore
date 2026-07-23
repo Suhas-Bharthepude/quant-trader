@@ -70,3 +70,7 @@ ehthumbs.db
 
 daily_prompt.md
 trading_explained.md
+
+# Standalone one-off SOXL intraday analysis scripts — kept local (exploratory,
+# not part of the tested library), like trading_explained.md / daily_prompt.md.
+scripts/soxl_*.py
