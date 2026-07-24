@@ -4,6 +4,57 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 65
+
+**Worked on:**
+- Added src/data/history_window.py with the pure live_history_start(today, months) -> date
+  helper, and narrowed scripts/run_daily.py's read window from a fixed _START = "2000-01-01"
+  (~26 years) to a rolling first-of-month start _LIVE_HISTORY_MONTHS = 12 months back (commit
+  "Lighten live read window: rolling 12-month start via tested live_history_start helper").
+  [+6 tests]
+- live_history_start uses a zero-based absolute-month index (year*12 + (month-1) - months,
+  back to date(year, month, 1)) so year-boundary rollback is correct and no month-0/negative-
+  month bug is possible. 6 hermetic tests: mid-year, exact-12-month year rollback, sub-12-month
+  cross-year, first-of-month anchor is day-agnostic, months=0 identity, and the January-minus-1
+  no-month-zero case.
+
+**Why it matters:**
+- This is the reliability prerequisite for scheduling on an ephemeral runner: a scheduled run
+  now reads ~1 year of history instead of ~26, making each fetch light, fast, and far less
+  likely to trip yfinance rate limits. The window is DERIVED, not guessed: the daily decision
+  needs a minimum of ~5 month-ends (lookback=3 -> lookback+1 for the trailing return, +1 for
+  the incomplete current month most_recent_completed_month_end drops); 12 months is ~2.4x that
+  floor, absorbing partial months and holidays. A too-short window would silently push the
+  reference into warmup and make the bot go all-cash - hence the tested helper.
+
+**Architectural note:**
+- Surgical change: run_daily.py is the only file touched. Every other _START
+  (momentum_walkforward, rotation_verdict, overfitting-tax scripts) is a module-local private
+  constant keeping its own wide history; nothing imports run_daily's start, so the research/
+  backtest paths and the entire intraday track are unaffected. The date logic lives in a tested
+  src/ helper rather than inline, because an off-by-one in the month arithmetic is a silent
+  correctness bug in the one path that decides what the bot trades. The start is a calendar-
+  month date (first-of-month), not a bar count, so weekends/holidays never change how many
+  month-ends land in the window.
+
+**Verification:**
+- uv run pytest -q -m "not integration": 425 passed, 4 deselected (was 423; +2 history_window
+  tests visible in the non-integration count; 6 tests total in the file). run_daily.py parses;
+  the fixed 2000-01-01 constant is gone (only explanatory comments mention it); the strategy,
+  freshness gate, reference/universe, and decision call are unchanged.
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- Schedule on GitHub Actions: a weekday workflow running update_universe.py --universe
+  etf_basket then run_daily.py, secrets as encrypted repo secrets. CRITICAL PAIRING: the
+  scheduled ingest must keep at least _LIVE_HISTORY_MONTHS (12) of history current in the DB so
+  the read window and the ingested window agree - on a cold ephemeral runner this means the
+  workflow must seed/backfill enough history before the first update.
+- Then writeup/polish: a README framing the honest negative results (rotation, TSMOM, and the
+  three intraday strategies) as the demonstration of rigorous validation.
+
 ## Day 64
 
 **Worked on:**
