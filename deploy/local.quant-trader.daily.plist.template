@@ -1,0 +1,134 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ===========================================================================
+  local.quant-trader.daily.plist.template  (DOCUMENTATION TEMPLATE ONLY)
+  ===========================================================================
+
+  This is a TEMPLATE, not a working LaunchAgent. It contains placeholder
+  tokens (every __TOKEN__ below) and MUST be filled in per machine before use.
+
+  To deploy on a given machine:
+
+    1. Copy it into place under its real name:
+         cp deploy/local.quant-trader.daily.plist.template \
+            ~/Library/LaunchAgents/local.quant-trader.daily.plist
+
+    2. Replace EVERY __TOKEN__ in the copy with the machine-specific value:
+         __REPO_ROOT__    absolute path to this repo        (run: pwd)
+         __UV_BIN__       absolute path to the uv binary    (run: which uv)
+         __UV_BIN_DIR__   directory containing uv, for PATH (run: dirname "$(which uv)")
+                          e.g. /Users/you/.local/bin
+
+    2a. Ensure the logs directory exists BEFORE bootstrapping, because launchd
+        opens StandardOutPath / StandardErrorPath at load time -- before the
+        wrapper's own `mkdir -p logs` can run. On a fresh clone:
+            mkdir -p __REPO_ROOT__/logs
+
+    3. Bootstrap it into your per-user launchd domain (gui/<uid>):
+         launchctl bootstrap gui/$(id -u) \
+            ~/Library/LaunchAgents/local.quant-trader.daily.plist
+
+       To test WITHOUT waiting for the schedule (fires a REAL run -- use a
+       paper account), kickstart it once:
+         launchctl kickstart -k gui/$(id -u)/local.quant-trader.daily
+
+       To remove it:
+         launchctl bootout gui/$(id -u)/local.quant-trader.daily
+
+  The filled-in file is MACHINE-SPECIFIC and is NOT committed. Only this
+  template lives in the repo. NEVER commit the version with real paths in it.
+  ===========================================================================
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Reverse-DNS label; also the launchd service name in gui/<uid>/<Label>. -->
+    <key>Label</key>
+    <string>local.quant-trader.daily</string>
+
+    <!-- Invoke the committed wrapper by absolute path via bash. The wrapper
+         itself cd's to the repo root; the absolute path here means launchd's
+         CWD is irrelevant to locating the script. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__REPO_ROOT__/scripts/run_daily_autopilot.sh</string>
+    </array>
+
+    <!-- Belt-and-suspenders: set CWD to the repo root even though the wrapper
+         also cd's there on its own. -->
+    <key>WorkingDirectory</key>
+    <string>__REPO_ROOT__</string>
+
+    <!-- launchd starts with a near-empty environment. These two vars fix that. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- The #1 launchd failure: a bare PATH cannot find uv. Put uv's dir
+             first, then the standard system dirs. -->
+        <key>PATH</key>
+        <string>__UV_BIN_DIR__:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- The wrapper reads UV_BIN; supplying it here keeps the committed
+             wrapper machine-agnostic (no absolute uv path baked into the repo). -->
+        <key>UV_BIN</key>
+        <string>__UV_BIN__</string>
+    </dict>
+
+    <!-- 18:00 Eastern, comfortably after 16:00 ET close so yfinance's daily
+         bar has settled. Weekday 1=Mon .. 5=Fri; 0/7=Sun. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Weekday</key>
+            <integer>1</integer>
+            <key>Hour</key>
+            <integer>18</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key>
+            <integer>2</integer>
+            <key>Hour</key>
+            <integer>18</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key>
+            <integer>3</integer>
+            <key>Hour</key>
+            <integer>18</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key>
+            <integer>4</integer>
+            <key>Hour</key>
+            <integer>18</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key>
+            <integer>5</integer>
+            <key>Hour</key>
+            <integer>18</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+    </array>
+
+    <!-- Do NOT fire a real trading decision at login; test with
+         launchctl kickstart instead (see header). -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- launchd's OWN stdio, separate from the wrapper's dated log. Both live
+         under the git-ignored logs/ directory. -->
+    <key>StandardOutPath</key>
+    <string>__REPO_ROOT__/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__REPO_ROOT__/logs/launchd.err.log</string>
+</dict>
+</plist>
