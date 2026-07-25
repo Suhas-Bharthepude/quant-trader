@@ -5,7 +5,7 @@ A systematic swing-trading research and execution system for US equity ETFs, bui
 Most trading-strategy projects show an impressive backtest. This one shows why several reasonable strategies *do not* beat simply holding a basket of ETFs once you test them honestly - and it quantifies exactly how much a naively-tuned version would have fooled you. The honest negative result, measured with tooling built specifically to catch self-deception, is the point of the project.
 
 ![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
-![Tests](https://img.shields.io/badge/tests-278%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-425%20passing-brightgreen)
 
 ---
 
@@ -27,7 +27,7 @@ Three strategies were tested through the same harness. Every one of them, tested
 
 | Strategy | Out-of-sample Sharpe | Buy-and-hold Sharpe | Overfitting tax | Beat buy-and-hold on |
 |---|---|---|---|---|
-| SMA crossover (control) | +0.04 | +0.41 | +1.02 | 2 of 17 |
+| SMA crossover (control) | +0.04 | +0.41 | +1.03 | 2 of 17 |
 | Time-series momentum (fixed) | +0.43 | +0.52 | +0.51 | 4 of 17 |
 | Cross-sectional rotation | +0.44 | +0.59 | +0.72 | 0 of 1 (loses) |
 
@@ -35,7 +35,7 @@ Three strategies were tested through the same harness. Every one of them, tested
 
 Two things stand out, and both are the kind of finding this system exists to surface:
 
-- **The overfitting tax is consistently large and positive.** The SMA control looked like a +1.01 Sharpe strategy while being tuned and delivered roughly zero (in fact slightly negative, -0.02) out-of-sample - a +1.02 tax. Momentum and rotation show the same pattern (+0.51 and +0.72). This is the machinery catching optimism in the act: a backtest that looks good because it was fit to its own test data.
+- **The overfitting tax is consistently large and positive.** The SMA control looked like a +1.01 Sharpe strategy while being tuned and delivered roughly zero (in fact slightly negative, -0.03) out-of-sample - a +1.03 tax. Momentum and rotation show the same pattern (+0.51 and +0.72). This is the machinery catching optimism in the act: a backtest that looks good because it was fit to its own test data.
 - **Per-fold tuning did not rescue any of them.** Re-optimizing parameters on each fold made rotation *worse* than a fixed rule and barely moved momentum. More tuning bought more overfitting, not more edge.
 
 The one genuinely defensible positive: **fixed time-series momentum reduced maximum drawdown on 13 of 17 instruments** (mean 32.9% vs buy-and-hold's 38.4%). It does not beat the market on return, but it delivers the downside protection that absolute momentum is theorized to provide. Knowing the difference between "made money" and "reduced risk" is the whole point.
@@ -89,7 +89,7 @@ A fixed basket of 17 liquid, long-history ETFs, backfilled to January 2008 so ev
 
 ## Engineering rigor
 
-- **278 tests passing** (282 including live-API integration tests, which are gated out of continuous integration). Every test in CI is hermetic - no network, no credentials, no live data.
+- **425 tests passing** (429 including live-API integration tests, which are gated out of continuous integration). Every test in CI is hermetic - no network, no credentials, no live data.
 - **CI on every push** (GitHub Actions): `uv run pytest -q -m "not integration"` on a clean Ubuntu environment. The green check is machine truth, not a prose claim.
 - **Custom backtester, deliberately not a library.** Owning the engine keeps the execution model, cost model, and return accounting fully transparent and auditable.
 - **Paper-only safety, structurally enforced.** Three independent guards (a constructor assertion, a hardcoded paper flag, and an account-type check that runs before any order) make live trading impossible in the current codebase.
@@ -142,12 +142,14 @@ uv run python scripts/rotation_verdict.py         # rotation verdict
 
 ---
 
+## Since the initial verdict
+
+The execution arc has since been completed. The rebalance engine now emits orders sells-before-buys - all SELLs precede all BUYs so a rotation's funding sells clear before the buys they fund. An autonomous daily runner ingests, decides, and rebalances unattended on a paper account with logging and email notification, deployed via a macOS launchd LaunchAgent as best-effort local scheduling (it runs on time when the machine is awake and catches up a run missed during sleep on the next wake). This is paper-only and best-effort by design; the live acted-and-notify path awaits its first real weekday rebalance decision.
+
 ## What's next
 
-The research arc has delivered its honest verdict; the execution arc has been built and paper-tested. Planned work, scoped honestly as not-yet-built:
+The research arc has delivered its honest verdict. The one genuinely-open thread, scoped honestly:
 
-- **Sells-before-buys ordering** in the rebalance engine (so a rotation's funding sells clear before the buys they fund).
-- **Autonomous scheduling** - a runner that wakes each market day, checks whether it is a rebalance day, and rebalances unattended, with logging and trade notifications.
 - **Continued edge search** - new hypotheses (cross-asset signals, others) tested one at a time through the same harness, accepting each verdict. Most will fail; that is the nature of the search, and the tax is the referee.
 
 ---
