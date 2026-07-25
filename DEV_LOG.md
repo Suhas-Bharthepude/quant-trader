@@ -4,6 +4,71 @@ Running log of development work. Most recent entry first.
 
 ---
 
+## Day 66 - launchd local deployment (best-effort by design)
+
+**Worked on:**
+- Scheduled `run_daily` to run unattended on the MacBook Air via a macOS LaunchAgent
+  (label `local.quant-trader.daily`) - the chosen local deployment, deliberately not cron
+  or GitHub Actions.
+- Did a read-only inspection FIRST to settle the two things that silently break launchd
+  jobs: (1) the absolute `uv` path - a bare launchd environment does not load the shell
+  PATH, so `uv` cannot be found by name; (2) CWD-relative paths - `.env` (via `load_dotenv`
+  in alpaca_broker.py), `data/quant_trader.duckdb` (duckdb_store.py default), and `logs/`
+  including the idempotency state file `logs/rebalance_state.json` (daily_runner.py) are all
+  resolved against CWD with no `__file__` anchor. That is exactly why the wrapper cd's to the
+  repo root before doing anything.
+- Committed (code commit 921b314): `scripts/run_daily_autopilot.sh` - cd's to repo root,
+  runs the ingest `update_universe.py --universe etf_basket`, then `run_daily.py` with NO
+  universe flag (basket hardcoded), chained with an EXPLICIT skip-guard (ingest failure
+  aborts run_daily) and exit-code propagation, appending to a dated log
+  `logs/autopilot_YYYY-MM-DD.log`; and `deploy/local.quant-trader.daily.plist.template` -
+  placeholder tokens only (`__REPO_ROOT__` / `__UV_BIN__` / `__UV_BIN_DIR__`). The real
+  `~/Library/LaunchAgents` plist is machine-specific and UNCOMMITTED. `docs/AUTOPILOT.md`
+  updated: the cron example is now marked as the portable/always-on-host alternative, and a
+  new "Local scheduling on macOS (launchd)" section + SCOPE subsection was added.
+
+**Why it matters:**
+- launchd is chosen over cron specifically because launchd catches up a run missed while the
+  machine slept, on the next wake; cron silently drops missed runs. On a laptop that sleeps,
+  that catch-up is the whole point.
+- The plist supplies `PATH` and `UV_BIN` in `EnvironmentVariables` (the wrapper reads
+  `UV_BIN`), which keeps the committed wrapper machine-agnostic - no absolute uv path baked
+  into the repo - while fixing the single most common silent launchd failure.
+- Fire time is 18:00 Eastern on weekdays, comfortably after the 16:00 ET close so yfinance's
+  daily bar has settled. `RunAtLoad` is false so logging in never triggers a trade. A
+  `pmset repeat wakeorpoweron MTWRF 17:58:00` was registered so the Air self-wakes just
+  before the job when plugged in and left closed.
+
+**Architectural note:**
+- Scope is a deliberate design choice, stated as such and not apologized for: best-effort
+  local scheduling - on time whenever the machine is awake, catch-up on the next wake for
+  runs missed during sleep, and occasional fully-missed days (machine off, or on battery with
+  the lid closed while traveling) ACCEPTED for a swing system holding positions for days,
+  where a late or occasionally skipped decision costs essentially nothing. Market-closed days
+  are a clean no-op (exit 0); an ingest failure aborts run_daily with a visible nonzero exit
+  in the log. An always-on host (Mac mini, small Linux VM, or GitHub Actions) is noted only as
+  the path IF on-time daily execution ever proves to matter - explicitly not needed now.
+
+**Verification:**
+- Verified live via `launchctl kickstart` on a Friday evening: the ingest pulled all 17
+  etf_basket tickers, `run_daily` hit the market-closed no-op, the wrapper footer logged
+  `ingest_rc=0 run_daily_rc=0`, and the dated log `logs/autopilot_YYYY-MM-DD.log` was written.
+  `plutil -lint` passes on the template; the wrapper is `bash -n` clean and both files are
+  pure ASCII.
+- The acted+email path is unchanged from the Day-57/58 observability arc but has NOT yet been
+  observed live THROUGH the scheduler - it will be exercised on a real weekday decision.
+
+**Blocked on:**
+- Nothing.
+
+**Next up:**
+- Watch the first real scheduled weekday fire to confirm the acted+email path end-to-end
+  through launchd (not just the no-op path).
+- Then writeup/polish: the README framing the honest negative results as the demonstration of
+  rigorous validation.
+
+**Time spent:** ~2h.
+
 ## Day 65
 
 **Worked on:**
